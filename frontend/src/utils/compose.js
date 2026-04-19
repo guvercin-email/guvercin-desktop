@@ -111,7 +111,7 @@ export function normalizeComposeDraft(draft = {}) {
     return ''
   }
 
-  const forwardTargets = Array.isArray(draft?.forwardTargets)
+  const rawForwardTargets = Array.isArray(draft?.forwardTargets)
     ? draft.forwardTargets
       .map((target) => ({
         uid: normalizeUid(target?.uid),
@@ -122,6 +122,8 @@ export function normalizeComposeDraft(draft = {}) {
       }))
       .filter((target) => target.uid && target.mailbox)
     : []
+  // Forward All / multi-forward is not supported. Keep at most one forward target.
+  const forwardTargets = rawForwardTargets.slice(0, 1)
   const forwardOptions = forwardTargets.length > 0
     ? {
       subjectPrefix: typeof draft?.forwardOptions?.subjectPrefix === 'string' && draft.forwardOptions.subjectPrefix.trim()
@@ -130,8 +132,7 @@ export function normalizeComposeDraft(draft = {}) {
       forwardStyle: typeof draft?.forwardOptions?.forwardStyle === 'string'
         && ['copy', 'eml'].includes(draft.forwardOptions.forwardStyle.trim().toLowerCase())
         ? draft.forwardOptions.forwardStyle.trim().toLowerCase()
-        : (Boolean(draft?.forwardOptions?.bundle) && forwardTargets.length > 1 ? 'eml' : 'copy'),
-      bundle: Boolean(draft?.forwardOptions?.bundle),
+        : 'copy',
     }
     : null
 

@@ -38,7 +38,7 @@ test('normalizeComposeDraft preserves forward metadata', () => {
   })
 
   assert.deepEqual(draft.forwardTargets, [{ uid: '123', mailbox: 'INBOX', from: '', subject: '', date: '' }])
-  assert.deepEqual(draft.forwardOptions, { subjectPrefix: 'Fwd:', forwardStyle: 'copy', bundle: false })
+  assert.deepEqual(draft.forwardOptions, { subjectPrefix: 'Fwd:', forwardStyle: 'copy' })
 })
 
 test('normalizeComposeDraft coerces numeric uids for forward/bulk reply', () => {
@@ -50,7 +50,6 @@ test('normalizeComposeDraft coerces numeric uids for forward/bulk reply', () => 
 
   assert.deepEqual(draft.forwardTargets, [
     { uid: '101', mailbox: 'INBOX', from: '', subject: '', date: '' },
-    { uid: '102', mailbox: 'INBOX', from: '', subject: '', date: '' },
   ])
   assert.equal(draft.bulkReplyTargets[0].uid, '201')
   assert.equal(draft.replyContext.uid, '301')
@@ -219,29 +218,15 @@ test('queueComposeSend parses reply_all recipient strings for bulk replies', asy
   assert.deepEqual(payload.cc, ['cc@example.com', 'cc2@example.com'])
 })
 
-test('queueComposeSend asks for confirmation when forwarding many separately', async () => {
-  const calls = []
-  const confirmations = []
-
-  const ok = await queueComposeSend({
-    draft: {
-      format: 'plain',
-      plainBody: 'Intro',
-      toRecipients: ['to@example.com'],
-      forwardTargets: [
-        { uid: '1', mailbox: 'INBOX' },
-        { uid: '2', mailbox: 'INBOX' },
-      ],
-      forwardOptions: { subjectPrefix: 'Fwd:', forwardStyle: 'copy', bundle: false },
-    },
-    accountEmail: 'me@example.com',
-    queueAction: async (...args) => { calls.push(args) },
-    confirm: async (...args) => { confirmations.push(args); return false },
+test('normalizeComposeDraft truncates multi-forward targets to one', () => {
+  const draft = normalizeComposeDraft({
+    forwardTargets: [
+      { uid: '1', mailbox: 'INBOX' },
+      { uid: '2', mailbox: 'INBOX' },
+    ],
   })
 
-  assert.equal(ok, false)
-  assert.equal(calls.length, 0)
-  assert.equal(confirmations.length, 1)
-  assert.equal(confirmations[0][1].type, 'forward_many')
-  assert.equal(confirmations[0][1].count, 2)
+  assert.equal(draft.forwardTargets.length, 1)
+  assert.equal(draft.forwardTargets[0].uid, '1')
+  assert.equal(draft.forwardTargets[0].mailbox, 'INBOX')
 })

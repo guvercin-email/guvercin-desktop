@@ -1257,6 +1257,28 @@ const DashboardPage = () => {
     const [actionNotices, setActionNotices] = useState([])
     const [noticeNow, setNoticeNow] = useState(Date.now())
 
+    const accountIdRef = useRef(accountId)
+    const selectedFolderRef = useRef(selectedFolder)
+    const listModeRef = useRef(listMode)
+    const mailsRef = useRef(mails)
+    const mailLoadRequestIdRef = useRef(0)
+
+    useEffect(() => {
+        accountIdRef.current = accountId
+    }, [accountId])
+
+    useEffect(() => {
+        selectedFolderRef.current = selectedFolder
+    }, [selectedFolder])
+
+    useEffect(() => {
+        listModeRef.current = listMode
+    }, [listMode])
+
+    useEffect(() => {
+        mailsRef.current = mails
+    }, [mails])
+
     const accountButtonRef = useRef(null)
     const accountMenuRef = useRef(null)
     const accountWrapperRef = useRef(null)
@@ -1552,38 +1574,49 @@ const DashboardPage = () => {
     }, [accountId, backendReachable, connecting, ensureImapConnected, loadFolders, networkOnline, refreshStatus])
 
     const loadMailsFromCache = useCallback(async (folder) => {
-        if (listMode === 'search') return false
-        if (!accountId || !backendReachable) return
+        if (listModeRef.current === 'search') return 0
+        if (!accountId || !backendReachable) return 0
+        const mailbox = (folder || '').toString().trim()
+        if (!mailbox) return 0
         try {
             const pageSize = 250
             const allMails = []
-            let totalCount = null
             let nextPage = 1
 
             while (true) {
                 const res = await fetch(
-                    apiUrl(`/api/offline/${accountId}/local-list?mailbox=${encodeURIComponent(folder)}&page=${nextPage}&per_page=${pageSize}`),
+                    apiUrl(`/api/offline/${accountId}/local-list?mailbox=${encodeURIComponent(mailbox)}&page=${nextPage}&per_page=${pageSize}`),
                     { cache: 'no-store' },
                 )
                 if (!res.ok) break
 
                 const data = await res.json()
                 const chunk = Array.isArray(data.mails) ? data.mails : []
-                const chunkWithMailbox = chunk.map(m => ({ ...m, mailbox: folder }))
+                const chunkWithMailbox = chunk.map(m => ({ ...m, mailbox }))
                 allMails.push(...chunkWithMailbox)
                 
-                if (typeof data.total_count === 'number') totalCount = data.total_count
                 if (chunk.length < pageSize) break
                 nextPage++
             }
             
-            setMails(allMails)
-            return true
+            const currentAccountId = accountIdRef.current
+            const currentSelectedFolder = (selectedFolderRef.current || '').toString().trim()
+
+            if (
+                currentAccountId === accountId
+                && listModeRef.current !== 'search'
+                && currentSelectedFolder
+                && currentSelectedFolder.toLowerCase() === mailbox.toLowerCase()
+            ) {
+                setMails(allMails)
+            }
+
+            return allMails.length
         } catch (err) {
             console.error('Error loading mails from cache:', err)
-            return false
+            return 0
         }
-    }, [accountId, backendReachable, listMode])
+    }, [accountId, backendReachable])
 
     const syncMailsFromRemote = useCallback(async (targetFolder) => {
         const folder = targetFolder || selectedFolder
@@ -1598,26 +1631,55 @@ const DashboardPage = () => {
     }, [accountId, remoteMailAvailable, listMode, selectedFolder])
 
     const loadMails = useCallback(async (options = {}) => {
-        const { forceRemote = false, allowCache = true } = options
+        const { forceRemote = false, allowCache = true, background = false } = options
         if (!accountId || !backendReachable) return
-        
-        if (allowCache) {
-            await loadMailsFromCache(selectedFolder)
-        }
+        if (listModeRef.current === 'search') return
 
-        if (forceRemote || remoteMailAvailable) {
-            const ok = await syncMailsFromRemote(selectedFolder)
-            if (ok) {
-                await loadMailsFromCache(selectedFolder)
-                void fetchMailboxCounts()
+        const currentMails = Array.isArray(mailsRef.current) ? mailsRef.current : []
+        const currentMailbox = (currentMails?.[0]?.mailbox || '').toString().trim()
+        const selectedMailbox = (selectedFolder || '').toString().trim()
+        const mailboxMismatch = (
+            currentMailbox
+            && selectedMailbox
+            && currentMailbox.toLowerCase() !== selectedMailbox.toLowerCase()
+        )
+        const shouldShowLoading = !background && (currentMails.length === 0 || mailboxMismatch)
+        const requestId = shouldShowLoading ? (mailLoadRequestIdRef.current + 1) : mailLoadRequestIdRef.current
+        if (shouldShowLoading) {
+            mailLoadRequestIdRef.current = requestId
+            setLoadingMails(true)
+        }
+        
+        try {
+            let cachedCount = 0
+            if (allowCache) {
+                cachedCount = await loadMailsFromCache(selectedFolder)
+                if (shouldShowLoading && cachedCount > 0 && mailLoadRequestIdRef.current === requestId) {
+                    setLoadingMails(false)
+                }
+            }
+
+            if (forceRemote || remoteMailAvailable) {
+                const ok = await syncMailsFromRemote(selectedFolder)
+                if (ok) {
+                    cachedCount = await loadMailsFromCache(selectedFolder)
+                    void fetchMailboxCounts()
+                    if (shouldShowLoading && cachedCount > 0 && mailLoadRequestIdRef.current === requestId) {
+                        setLoadingMails(false)
+                    }
+                }
+            }
+        } finally {
+            if (shouldShowLoading && mailLoadRequestIdRef.current === requestId) {
+                setLoadingMails(false)
             }
         }
     }, [accountId, backendReachable, remoteMailAvailable, selectedFolder, loadMailsFromCache, syncMailsFromRemote, fetchMailboxCounts])
 
     useEffect(() => {
-        if (!accountId || !backendReachable) return
+        if (!accountId || !backendReachable || listMode === 'search') return
         loadMails({ allowCache: true, forceRemote: false })
-    }, [accountId, backendReachable, selectedFolder, loadMails])
+    }, [accountId, backendReachable, listMode, selectedFolder, loadMails])
 
     const prevRemoteMailAvailableRef = useRef(false)
     useEffect(() => {
@@ -1638,9 +1700,19 @@ const DashboardPage = () => {
     }, [accountId, activeSection, backendReachable, loadFolders])
 
     useEffect(() => {
-        if (folders.length > 0 && !folders.find(f => f.name === selectedFolder)) {
-            setSelectedFolder(folders[0].name)
-        }
+        if (!Array.isArray(folders) || folders.length === 0) return
+        const hasSelected = folders.some((entry) => {
+            if (typeof entry === 'string') return entry === selectedFolder
+            if (entry && typeof entry === 'object') return entry.name === selectedFolder
+            return false
+        })
+        if (hasSelected) return
+
+        const first = folders[0]
+        const fallback = typeof first === 'string'
+            ? first
+            : (first && typeof first === 'object' ? first.name : '')
+        if (fallback) setSelectedFolder(fallback)
     }, [folders, selectedFolder])
 
     useEffect(() => {
@@ -1659,13 +1731,13 @@ const DashboardPage = () => {
             if (cancelled) return
             if (autoRefreshInFlightRef.current) return
             autoRefreshInFlightRef.current = true
-            try {
-                await loadMails({ allowCache: true, forceRemote: false })
-                if (cancelled) return
-                void fetchMailboxCounts()
-            } finally {
-                autoRefreshInFlightRef.current = false
-            }
+	            try {
+	                await loadMails({ allowCache: true, forceRemote: false, background: true })
+	                if (cancelled) return
+	                void fetchMailboxCounts()
+	            } finally {
+	                autoRefreshInFlightRef.current = false
+	            }
         }
 
         const timer = window.setInterval(tick, MAIL_AUTO_REFRESH_INTERVAL_MS)
@@ -3202,9 +3274,9 @@ function MailSection({
     const actionableMailIds = actionableMails.map((mail) => mail.id)
     const hasAnyActionMail = actionableMails.length > 0
     const hasMultipleActionMails = actionableMails.length > 1
+    const canForwardActionMail = actionableMails.length === 1
     const allActionMailsSeen = hasAnyActionMail && actionableMails.every((mail) => mail.seen === true)
     const homeReplyLabel = hasMultipleActionMails ? 'Bulk Reply' : 'Reply'
-    const homeForwardLabel = hasMultipleActionMails ? 'Forward All' : 'Forward'
     const readToggleLabel = allActionMailsSeen ? 'Unread' : 'Read'
     const moveFolderOptions = useMemo(() => folders.filter(isMoveTargetMailbox), [folders])
     const labelOptions = useMemo(() => {
@@ -3232,6 +3304,7 @@ function MailSection({
         [labels],
     )
     const selectionRequiredTitle = hasAnyActionMail ? undefined : 'Select a mail first'
+    const forwardSelectionTitle = canForwardActionMail ? undefined : (hasAnyActionMail ? 'Select a single mail to forward' : selectionRequiredTitle)
 
     const formatMailDateLong = (dateValue) => {
         if (!dateValue) return ''
@@ -5244,37 +5317,29 @@ function MailSection({
     const composeForwardDraft = async (mailList) => {
         const forwardMails = Array.from(new Set((mailList || []).filter(Boolean)))
         if (forwardMails.length === 0) return
+        if (forwardMails.length > 1) return
         const sourceFolder = selectedFolder || 'INBOX'
-        const seenTargets = new Set()
-        const forwardTargets = []
-        forwardMails.forEach((mail) => {
-            const uid = mail?.id
-            const mailbox = mail?.mailbox || sourceFolder
-            const key = `${uid || ''}@@${mailbox || ''}`
-            if (!uid || !mailbox || seenTargets.has(key)) return
-            seenTargets.add(key)
-            const from = mail?.name
-                ? `${mail.name} <${mail.address || ''}>`.trim()
-                : `${mail?.address || ''}`.trim()
-            forwardTargets.push({
-                uid,
-                mailbox,
-                from,
-                subject: mail?.subject || '',
-                date: mail?.date || '',
-            })
-        })
-
-        const count = forwardTargets.length
-        const defaultOptions = count > 1
-            ? { subjectPrefix: 'Fwd:', forwardStyle: 'eml', bundle: true }
-            : { subjectPrefix: 'Fwd:', forwardStyle: 'copy', bundle: false }
+        const mail = forwardMails[0]
+        const uid = mail?.id
+        const mailbox = mail?.mailbox || sourceFolder
+        if (!uid || !mailbox) return
+        const from = mail?.name
+            ? `${mail.name} <${mail.address || ''}>`.trim()
+            : `${mail?.address || ''}`.trim()
+        const forwardTargets = [{
+            uid,
+            mailbox,
+            from,
+            subject: mail?.subject || '',
+            date: mail?.date || '',
+        }]
+        const defaultOptions = { subjectPrefix: 'Fwd:', forwardStyle: 'copy' }
 
         composeDraft({
             to: '',
             cc: '',
             bcc: '',
-            subject: count > 1 ? `Fwd: ${count} emails` : '',
+            subject: '',
             plainBody: '',
             htmlBody: '',
             format: 'plain',
@@ -5295,7 +5360,7 @@ function MailSection({
     }
 
     const handleForwardAction = async () => {
-        if (!hasAnyActionMail) return
+        if (!hasAnyActionMail || hasMultipleActionMails) return
         await composeForwardDraft(actionableMails)
     }
 
@@ -5691,7 +5756,16 @@ function MailSection({
                                 {!hasMultipleActionMails && (
                                     <li><button className="db-submenu-main-btn" disabled={!hasAnyActionMail} onClick={handleReplyAllAction}>{toolbarMainButtonContent(<img src="/img/icons/reply-all.svg" className="svg-icon-inline" />, 'Reply All')}</button></li>
                                 )}
-                                <li><button className="db-submenu-main-btn" disabled={!hasAnyActionMail} onClick={handleForwardAction}>{toolbarMainButtonContent(hasMultipleActionMails ? <img src="/img/icons/forward-all.svg" className="svg-icon-inline" /> : <img src="/img/icons/forward.svg" className="svg-icon-inline" />, homeForwardLabel)}</button></li>
+                                <li>
+                                    <button
+                                        className="db-submenu-main-btn"
+                                        disabled={!canForwardActionMail}
+                                        title={forwardSelectionTitle}
+                                        onClick={handleForwardAction}
+                                    >
+                                        {toolbarMainButtonContent(<img src="/img/icons/forward.svg" className="svg-icon-inline" />, 'Forward')}
+                                    </button>
+                                </li>
                                 <li className="db-submenu-menu-wrap" ref={moveMenuRef}>
                                     <button
                                         disabled={!hasAnyActionMail}

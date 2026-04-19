@@ -293,7 +293,7 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
     }, [draft, onDraftChange, patchDraft])
 
     const patchForwardOptions = useCallback((patch) => {
-        const current = draft?.forwardOptions || { subjectPrefix: 'Fwd:', forwardStyle: 'copy', bundle: false }
+        const current = draft?.forwardOptions || { subjectPrefix: 'Fwd:', forwardStyle: 'copy' }
         patchDraft({ forwardOptions: { ...current, ...patch } })
     }, [draft?.forwardOptions, patchDraft])
 
@@ -432,41 +432,8 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
 
             {isForwardMode && (
                 <div className="cv-banner">
-                    <div className="cv-banner__title">Forwarding {forwardCount} message{forwardCount === 1 ? '' : 's'}</div>
+                    <div className="cv-banner__title">Forwarding message</div>
                     <div className="cv-banner__row">
-                        {forwardCount > 1 && (
-                            <label className="cv-banner__label cv-banner__checkbox">
-                                <input
-                                    type="checkbox"
-                                    checked={Boolean(draft?.forwardOptions?.bundle)}
-                                    onChange={(e) => {
-                                        const checked = Boolean(e.target.checked)
-                                        const autoSubject = `Fwd: ${forwardCount} emails`
-                                        patchDraft((currentDraft) => {
-                                            const currentOptions = currentDraft?.forwardOptions || { subjectPrefix: 'Fwd:', forwardStyle: 'copy', bundle: false }
-                                            const nextOptions = {
-                                                ...currentOptions,
-                                                bundle: checked,
-                                                ...(checked ? { forwardStyle: 'eml' } : null),
-                                            }
-                                            const next = { ...(currentDraft || {}), forwardOptions: nextOptions }
-                                            if (!checked && `${currentDraft?.subject || ''}`.trim() === autoSubject) {
-                                                next.subject = ''
-                                            }
-                                            return next
-                                        })
-                                    }}
-                                />
-                                Send as one email
-                            </label>
-                        )}
-                        {forwardCount > 1 && (
-                            <div className="cv-banner__hint cv-banner__hint--inline">
-                                {Boolean(draft?.forwardOptions?.bundle)
-                                    ? 'Selected emails will be attached automatically.'
-                                    : `You are about to send ${forwardCount} separate forwards.`}
-                            </div>
-                        )}
                         <button
                             type="button"
                             className="cv-toggle-btn"
@@ -475,38 +442,6 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                             {showForwardAdvanced ? 'Hide advanced' : 'Advanced'}
                         </button>
                     </div>
-                    {forwardCount > 1 && Array.isArray(draft?.forwardTargets) && draft.forwardTargets.length > 0 && (
-                        <div className="cv-forward-targets">
-                            {draft.forwardTargets.map((target) => (
-                                <div key={`${target.uid}@@${target.mailbox}`} className="cv-forward-target">
-                                    <div className="cv-forward-target__meta">
-                                        <div className="cv-forward-target__from">{(target.from || '').trim() || '(Unknown sender)'}</div>
-                                        <div className="cv-forward-target__subject">{(target.subject || '').trim() || '(No Subject)'}</div>
-                                        <div className="cv-forward-target__date">{(target.date || '').trim() || ''}</div>
-                                    </div>
-                                    <button
-                                        type="button"
-                                        className="cv-toggle-btn"
-                                        onClick={() => {
-                                            patchDraft((currentDraft) => {
-                                                const currentTargets = Array.isArray(currentDraft?.forwardTargets) ? currentDraft.forwardTargets : []
-                                                const nextTargets = currentTargets.filter((item) => (
-                                                    `${item?.uid || ''}` !== `${target.uid || ''}` || `${item?.mailbox || ''}` !== `${target.mailbox || ''}`
-                                                ))
-                                                const next = { ...currentDraft, forwardTargets: nextTargets }
-                                                if (nextTargets.length === 0) {
-                                                    next.forwardOptions = null
-                                                }
-                                                return next
-                                            })
-                                        }}
-                                    >
-                                        Remove
-                                    </button>
-                                </div>
-                            ))}
-                        </div>
-                    )}
                     {showForwardAdvanced && (
                         <div className="cv-forward-advanced">
                             <label className="cv-banner__label">
@@ -514,7 +449,6 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                                 <select
                                     className="cv-input"
                                     value={draft?.forwardOptions?.forwardStyle || 'copy'}
-                                    disabled={forwardCount > 1 && Boolean(draft?.forwardOptions?.bundle)}
                                     onChange={(e) => patchForwardOptions({ forwardStyle: e.target.value })}
                                 >
                                     <option value="copy">Inline (body + attachments)</option>
@@ -530,17 +464,10 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                                     onChange={(e) => patchForwardOptions({ subjectPrefix: e.target.value })}
                                 />
                             </label>
-                            {forwardCount > 1 && Boolean(draft?.forwardOptions?.bundle) && (
-                                <div className="cv-banner__hint">
-                                    When sending as one email, originals are attached automatically.
-                                </div>
-                            )}
                         </div>
                     )}
                     <div className="cv-banner__hint">
-                        {forwardCount > 1 && !Boolean(draft?.forwardOptions?.bundle) && `${(draft?.subject || '').trim() ? 'Subject overrides all forwarded subjects.' : 'Leave Subject empty to keep each original subject.'}`}
-                        {forwardCount > 1 && Boolean(draft?.forwardOptions?.bundle) && `${(draft?.subject || '').trim() ? 'Subject sets the combined email subject.' : 'Leave Subject empty for an automatic subject.'}`}
-                        {forwardCount === 1 && `${(draft?.subject || '').trim() ? 'Subject overrides the original subject.' : 'Leave Subject empty to keep the original subject.'}`}
+                        {`${(draft?.subject || '').trim() ? 'Subject overrides the original subject.' : 'Leave Subject empty to keep the original subject.'}`}
                     </div>
                 </div>
             )}

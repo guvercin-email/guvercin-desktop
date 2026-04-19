@@ -251,10 +251,6 @@ fn apply_subject_prefix(prefix: &str, subject: &str) -> String {
     format!("{prefix} {subject}").trim().to_string()
 }
 
-fn build_forward_bundle_default_subject(subject_prefix: &str, count: usize) -> String {
-    apply_subject_prefix(subject_prefix, &format!("{} messages", count))
-}
-
 fn sanitize_filename_component(raw: &str, max_len: usize) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
@@ -2451,6 +2447,8 @@ pub async fn process_queue_once(
 	                    }
 	                }
 	                "forward_bundle" => {
+	                    Err("Forward bundle is no longer supported".to_string())
+	                    /*
 	                    let account_row = sqlx::query(
 	                        "SELECT email_address, auth_token, smtp_host, smtp_port, ssl_mode FROM accounts WHERE account_id = ?",
 	                    )
@@ -2691,6 +2689,7 @@ pub async fn process_queue_once(
 	                    } else {
 	                        Err("Account not found".to_string())
 	                    }
+	                    */
 	                }
 	                _ => Err(format!("Unsupported action type: {action_type}")),
 	            }
@@ -4109,18 +4108,6 @@ mod tests {
         assert_eq!(apply_subject_prefix("Fwd:", "fwd: Hello"), "fwd: Hello");
         assert_eq!(apply_subject_prefix("Fwd:", ""), "Fwd:");
         assert_eq!(apply_subject_prefix("", "Hello"), "Hello");
-    }
-
-    #[test]
-    fn build_forward_bundle_default_subject_applies_prefix() {
-        assert_eq!(
-            build_forward_bundle_default_subject("Fwd:", 5),
-            "Fwd: 5 messages"
-        );
-        assert_eq!(
-            build_forward_bundle_default_subject("FW:", 1),
-            "FW: 1 messages"
-        );
     }
 
     #[test]

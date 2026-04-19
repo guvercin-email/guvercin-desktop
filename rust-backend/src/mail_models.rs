@@ -112,7 +112,8 @@ pub struct ConnectImapBody {
     pub email: String,
     pub password: String,
     pub imap_host: String,
-    pub imap_port: u16,
+    #[serde(deserialize_with = "crate::models::resilient_i64", default)]
+    pub imap_port: Option<i64>,
     pub ssl_mode: String,
 }
 

@@ -221,18 +221,9 @@ pub async fn finalize_account(
         .as_deref()
         .map(|s| s.trim().to_string());
     let imap_server = account.imap_server.as_deref().map(|s| s.trim().to_string());
-    let imap_port: i64 = account
-        .imap_port
-        .as_deref()
-        .map(|s| s.trim())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(143);
+    let imap_port = account.imap_port.unwrap_or(143);
     let smtp_server = account.smtp_server.as_deref().map(|s| s.trim().to_string());
-    let smtp_port: Option<i64> = account
-        .smtp_port
-        .as_deref()
-        .map(|s| s.trim())
-        .and_then(|p| p.parse().ok());
+    let smtp_port = account.smtp_port;
     let password = account.password.as_deref().map(|s| s.trim().to_string());
     let ssl_mode = account
         .ssl_mode
@@ -532,8 +523,6 @@ pub async fn update_account_settings(
         .or_else(|| row.try_get::<Option<String>, _>("imap_host").ok().flatten())
         .unwrap_or_default();
     let imap_port: i64 = payload.imap_port
-        .as_deref().map(str::trim)
-        .and_then(|s| s.parse().ok())
         .or_else(|| row.try_get::<Option<i64>, _>("imap_port").ok().flatten())
         .unwrap_or(143);
     let smtp_server = payload.smtp_server
@@ -541,8 +530,6 @@ pub async fn update_account_settings(
         .or_else(|| row.try_get::<Option<String>, _>("smtp_host").ok().flatten())
         .unwrap_or_default();
     let smtp_port: Option<i64> = payload.smtp_port
-        .as_deref().map(str::trim)
-        .and_then(|s| s.parse().ok())
         .or_else(|| row.try_get::<Option<i64>, _>("smtp_port").ok().flatten());
     let ssl_mode = payload.ssl_mode
         .as_deref().map(str::trim).map(str::to_string)

@@ -299,7 +299,7 @@ pub async fn connect_imap(
         let email = body.email.clone();
         let password = body.password.clone();
         let host = body.imap_host.clone();
-        let port = body.imap_port;
+        let port = body.imap_port.unwrap_or(143) as u16;
         let ssl = body.ssl_mode.clone();
         let id = body.account_id;
         move || {

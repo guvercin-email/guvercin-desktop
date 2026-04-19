@@ -1,5 +1,25 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use sqlx::FromRow;
+
+pub fn resilient_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Value::deserialize(deserializer)?;
+    match v {
+        Value::Number(n) => Ok(n.as_i64()),
+        Value::String(s) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(s.trim().parse::<i64>().ok())
+            }
+        }
+        Value::Null => Ok(None),
+        _ => Ok(None),
+    }
+}
 
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct AccountSummary {
@@ -8,8 +28,10 @@ pub struct AccountSummary {
     pub display_name: Option<String>,
     pub provider_type: String,
     pub imap_host: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
     pub imap_port: Option<i64>,
     pub smtp_host: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
     pub smtp_port: Option<i64>,
     pub sync_status: Option<i64>,
     pub last_sync_time: Option<String>,
@@ -110,9 +132,11 @@ pub struct FinalizeAccountData {
     pub email: String,
     pub display_name: Option<String>,
     pub imap_server: Option<String>,
-    pub imap_port: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
+    pub imap_port: Option<i64>,
     pub smtp_server: Option<String>,
-    pub smtp_port: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
+    pub smtp_port: Option<i64>,
     pub password: Option<String>,
     pub ssl_mode: Option<String>,
 }
@@ -153,9 +177,11 @@ pub struct SetOrderBody {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAccountSettingsBody {
     pub imap_server: Option<String>,
-    pub imap_port: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
+    pub imap_port: Option<i64>,
     pub smtp_server: Option<String>,
-    pub smtp_port: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
+    pub smtp_port: Option<i64>,
     pub password: Option<String>,
     pub ssl_mode: Option<String>,
 }
@@ -167,8 +193,10 @@ pub struct AccountSettingsResponse {
     pub email_address: Option<String>,
     pub display_name: Option<String>,
     pub imap_server: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
     pub imap_port: Option<i64>,
     pub smtp_server: Option<String>,
+    #[serde(deserialize_with = "resilient_i64", default)]
     pub smtp_port: Option<i64>,
     pub ssl_mode: Option<String>,
     pub font: Option<String>,
@@ -205,6 +233,7 @@ pub struct DownloadRuleInput {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct InitialSyncPolicyInput {
     pub mode: String,
+    #[serde(deserialize_with = "resilient_i64", default)]
     pub value: Option<i64>,
 }
 
