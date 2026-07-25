@@ -412,7 +412,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                         onDraftChange={setDraft}
                         onSend={handleSend}
                         onDiscard={handleDiscard}
-                    showTopDiscard={false}
+                    showTopDiscard={true}
                     accountEmail={accountEmail}
                         sending={sending}
                     />
