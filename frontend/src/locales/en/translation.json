@@ -1,6 +1,7 @@
 {
   "All processes completed successfully, account settings saved!": "All processes completed successfully, account settings saved!",
   "An error occurred during saving.": "An error occurred during saving.",
+  "Write": "Write",
   "An error occurred while creating the account.": "An error occurred while creating the account.",
   "An unknown error occurred. Please check the console logs.": "An unknown error occurred. Please check the console logs.",
   "Authorization failed.": "Authorization failed.",

@@ -1,0 +1,89 @@
+/* ─── ComposeFormatTools.css ─── */
+/* The formatting toolbar when embedded in the ribbon / detached top bar.
+   Single row (like the other ribbon tabs) with a "⋯" overflow menu on the
+   right for tools that don't fit — never wraps, never scrolls. */
+
+.cf-tools-bar {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: visible;
+    min-width: 0;
+}
+
+/* Reset the shared .ce-toolbar chrome for the ribbon context */
+.cf-tools {
+    flex-wrap: nowrap;
+    border-bottom: none;
+    background: transparent;
+    padding: 0 4px;
+    user-select: none;
+}
+
+/* Visible single row: clips anything past the measured cutoff. */
+.cf-tools--visible {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.cf-tools .ce-toolbar-group {
+    flex: 0 0 auto;
+}
+
+.cf-tools .ce-toolbar button svg {
+    display: block;
+    pointer-events: none;
+}
+
+.cf-tools--disabled {
+    opacity: 0.55;
+}
+
+/* Hidden width measurer — off-screen, never interactive. */
+.cf-measure {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    visibility: hidden;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+/* Overflow "⋯" button + menu */
+.cf-more {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+}
+
+.cf-overflow-menu {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    min-width: 0;
+    width: max-content;
+}
+
+.cf-overflow-row {
+    display: flex;
+    align-items: center;
+}
+
+/* The tool buttons keep their .ce-toolbar look inside the overflow menu too. */
+.cf-overflow-row .ce-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+}
+
+/* Fixed-positioned popups anchored to their trigger button so the ribbon row
+   never clips them. Position is supplied inline (top/left). */
+.cf-popup {
+    position: fixed;
+    z-index: 6000;
+}

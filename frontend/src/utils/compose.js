@@ -100,7 +100,10 @@ export function normalizeComposeDraft(draft = {}) {
   const plainBody = typeof draft?.plainBody === 'string' ? draft.plainBody : legacyBody
   const htmlBody = typeof draft?.htmlBody === 'string' ? draft.htmlBody : ''
   const format = draft?.format === 'html' ? 'html' : 'plain'
-  const htmlMode = draft?.htmlMode === 'preview' ? 'preview' : 'edit'
+  // 'rich' = WYSIWYG surface, 'edit' = raw HTML source, 'preview' = rendered.
+  // Preserve 'rich' so a formatting action in the WYSIWYG editor doesn't get
+  // rewritten to the source view on the next draft normalization.
+  const htmlMode = draft?.htmlMode === 'preview' || draft?.htmlMode === 'rich' ? draft.htmlMode : 'edit'
   const toRecipients = normalizeComposeRecipients(draft?.toRecipients ?? draft?.to)
   const ccRecipients = normalizeComposeRecipients(draft?.ccRecipients ?? draft?.cc)
   const bccRecipients = normalizeComposeRecipients(draft?.bccRecipients ?? draft?.bcc)

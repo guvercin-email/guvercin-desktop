@@ -12,6 +12,8 @@ import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
 import { useTheme } from '../context/ThemeContext.jsx'
 import Avatar from '../components/Avatar.jsx'
 import ComposeMailContent from '../components/ComposeMailContent.jsx'
+import ComposeFormatTools from '../components/ComposeFormatTools.jsx'
+import { ComposeEditorProvider } from '../context/ComposeEditorContext.jsx'
 import MailHeadersPanel from '../components/MailHeadersPanel.jsx'
 import ContactsSection from '../components/ContactsSection.jsx'
 import CalendarSection from '../components/CalendarSection.jsx'
@@ -3470,6 +3472,16 @@ function MailSection({
     const safeToolbarStyle = normalizeToolbarStyle(toolbarStyle)
     const [isManualRefreshing, setIsManualRefreshing] = useState(false)
     const [activeRibbonTab, setActiveRibbonTab] = useState('home')
+    // Auto-focus the "Format" ribbon tab while composing inline; fall back to
+    // "Home" once composing ends so the Format-only submenu never lingers empty.
+    const inlineComposeActive = !activeTabId && !!inlineComposeSession
+    useEffect(() => {
+        if (inlineComposeActive) {
+            setActiveRibbonTab('format')
+        } else {
+            setActiveRibbonTab((prev) => (prev === 'format' ? 'home' : prev))
+        }
+    }, [inlineComposeActive])
     const [expandedFolders, setExpandedFolders] = useState(['INBOX'])
     const [folderWidth, setFolderWidth] = useState(240)
     const [listWidth, setListWidth] = useState(360)
@@ -4048,15 +4060,24 @@ function MailSection({
             const normalizedDraft = createEmptyComposeDraft(sessionOrDraft?.draft || sessionOrDraft)
             const draft = { ...normalizedDraft, composeSurface: 'window' }
 
+            const composeDataObj = {
+                accountId,
+                accountEmail,
+                source,
+                draft,
+                baselineDraft: sessionOrDraft?.baselineDraft || normalizedDraft,
+            }
+            const composeDataJson = JSON.stringify(composeDataObj)
+
+            try {
+                localStorage.setItem(`compose_data_${label}`, composeDataJson)
+            } catch {
+                /* ignore storage quota error */
+            }
+
             await invoke('open_compose_window', {
                 label,
-                composeDataJson: JSON.stringify({
-                    accountId,
-                    accountEmail,
-                    source,
-                    draft,
-                    baselineDraft: sessionOrDraft?.baselineDraft || normalizedDraft,
-                }),
+                composeDataJson,
             })
 
             if (sessionOrDraft?.id && inlineComposeSession?.id === sessionOrDraft.id) {
@@ -6289,6 +6310,10 @@ function MailSection({
         ? (mails.find((mail) => mail.id === activeTab.mail.id) || activeTab.mail)
         : null
     const activeComposeTab = activeTab?.kind === 'compose' ? activeTab : null
+    // Rich-text formatting toolbar visibility: shown for compose tabs directly,
+    // and for inline compose only when the "Format" ribbon tab is selected.
+    const isComposingInline = !activeTabId && !!inlineComposeSession
+    const showComposeFormatTools = !!activeComposeTab || (isComposingInline && activeRibbonTab === 'format')
     const activeTabReadLabel = activeTabMail?.seen === true ? 'Unread' : 'Read'
     const fileActionsDisabled = !selectedMail || loadingContent || fileActionLoading !== ''
     const mailItemMenuMail = mailItemMenu?.mail
@@ -6600,10 +6625,18 @@ function MailSection({
                         <li className={activeRibbonTab === 'help' ? 'active' : ''}>
                             <button onClick={() => setActiveRibbonTab('help')}>{t('Help')}</button>
                         </li>
+                        {isComposingInline && (
+                            <li className={`db-main-menu__compose-tab ${activeRibbonTab === 'format' ? 'active' : ''}`}>
+                                <button onClick={() => setActiveRibbonTab('format')}>{t('Write')}</button>
+                            </li>
+                        )}
                     </ul>
                 </div>
             )}
-            <div className={`db-submenu db-submenu--${safeToolbarStyle}`}>
+            <div className={`db-submenu db-submenu--${safeToolbarStyle} ${showComposeFormatTools ? 'db-submenu--format' : ''}`}>
+                {showComposeFormatTools ? (
+                    <ComposeFormatTools />
+                ) : (
                 <SubmenuBar
                     submenuScrollRef={submenuScrollRef}
                     submenuMoreRef={submenuMoreRef}
@@ -6977,6 +7010,7 @@ function MailSection({
                             </ul>
                         )}
                 </SubmenuBar>
+                )}
             </div>
         </div>
     )
@@ -8299,6 +8333,7 @@ function MailSection({
     );
 
     return (
+        <ComposeEditorProvider>
         <React.Fragment>
             <LayoutFrame region={mainBarRegion} bar={injectedMainBar}>
                 <LayoutFrame region={appsBarRegion} bar={injectedAppsBar}>
@@ -8446,6 +8481,7 @@ function MailSection({
                 </div>
             )}
         </React.Fragment>
+        </ComposeEditorProvider>
     )
 }
 

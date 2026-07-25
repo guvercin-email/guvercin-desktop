@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import Editor from '@monaco-editor/react'
-import { buildComposePreviewDocument, escapeHtml } from '../utils/composeHtml.js'
+import ComposeEditor from './ComposeEditor.jsx'
+import { buildComposePreviewDocument, escapeHtml, seedHtmlFromPlainText } from '../utils/composeHtml.js'
 import { composeRecipientsToString, ensureHtmlDraftSeed } from '../utils/compose.js'
 import './ComposeView.css'
 
@@ -248,19 +249,43 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
         [draft?.htmlBody],
     )
 
-    const handleFormatChange = useCallback((nextFormat) => {
-        if (nextFormat === 'html') {
+    // The normal writing surface ("rich") is a WYSIWYG editor that sends HTML,
+    // Gmail/Outlook-style. The "html" view is the raw HTML source editor.
+    const bodyView = (draft?.format === 'html' && (draft?.htmlMode === 'edit' || draft?.htmlMode === 'preview'))
+        ? 'html'
+        : 'rich'
+
+    const richInitialContent = useMemo(() => {
+        const html = `${draft?.htmlBody || ''}`
+        if (html.trim()) return html
+        return seedHtmlFromPlainText(draft?.plainBody || '')
+    }, [draft?.htmlBody, draft?.plainBody])
+
+    const handleRichChange = useCallback((html) => {
+        // Rich edits promote the draft to HTML so formatting survives sending.
+        patchDraft({ htmlBody: html, format: 'html', htmlMode: 'rich' })
+    }, [patchDraft])
+
+    const handleBodyViewChange = useCallback((nextView) => {
+        if (nextView === 'html') {
             const seeded = ensureHtmlDraftSeed(draft)
             onDraftChange?.({
                 ...seeded,
                 format: 'html',
-                htmlMode: seeded.htmlMode || 'edit',
+                htmlMode: 'edit',
             })
             return
         }
 
-        patchDraft({ format: 'plain' })
-    }, [draft, onDraftChange, patchDraft])
+        // Switch to the rich WYSIWYG surface. Seed HTML from plain text if the
+        // draft has no HTML body yet so nothing the user typed is lost.
+        const seeded = ensureHtmlDraftSeed(draft)
+        onDraftChange?.({
+            ...seeded,
+            format: 'html',
+            htmlMode: 'rich',
+        })
+    }, [draft, onDraftChange])
 
     const patchForwardOptions = useCallback((patch) => {
         const current = draft?.forwardOptions || { subjectPrefix: 'Fwd:', forwardStyle: 'copy' }
@@ -362,14 +387,14 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
             <div className="cv-toolbar">
                 <div className="cv-toolbar__left">
                     <SegmentSwitch
-                        value={draft?.format || 'plain'}
-                        onChange={handleFormatChange}
+                        value={bodyView}
+                        onChange={handleBodyViewChange}
                         options={[
-                            { value: 'plain', label: 'Plain Text' },
+                            { value: 'rich', label: 'Text' },
                             { value: 'html', label: 'HTML' },
                         ]}
                     />
-                    {draft?.format === 'html' && (
+                    {bodyView === 'html' && (
                         <SegmentSwitch
                             value={draft?.htmlMode || 'edit'}
                             onChange={(value) => patchDraft({ htmlMode: value })}
@@ -388,7 +413,7 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                     >
                         Add attachment
                     </button>
-                    {draft?.format === 'html' && draft?.htmlMode === 'edit' && (
+                    {bodyView === 'html' && draft?.htmlMode === 'edit' && (
                         <button
                             type="button"
                             className="cv-toolbar-btn"
@@ -527,12 +552,11 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
             </div>
 
             <div className="cv-editor-wrap">
-                {draft?.format === 'plain' ? (
-                    <textarea
-                        className="cv-plain-editor"
-                        value={draft?.plainBody || ''}
-                        onChange={(event) => patchDraft({ plainBody: event.target.value })}
-                        placeholder={isForwardMode ? 'Write an intro message (optional)...' : 'Write your message...'}
+                {bodyView === 'rich' ? (
+                    <ComposeEditor
+                        initialContent={richInitialContent}
+                        onChange={handleRichChange}
+                        toolbarVisible={false}
                     />
                 ) : draft?.htmlMode === 'preview' ? (
                     <iframe

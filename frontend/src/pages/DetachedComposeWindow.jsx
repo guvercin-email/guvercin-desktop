@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiUrl } from '../utils/api'
 import ComposeMailContent from '../components/ComposeMailContent.jsx'
+import ComposeFormatTools from '../components/ComposeFormatTools.jsx'
+import { ComposeEditorProvider } from '../context/ComposeEditorContext.jsx'
 import {
     buildDraftSavePayload,
     isComposeDraftDirty,
@@ -150,18 +152,38 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         if (!windowLabel) return
         let active = true
         const load = async () => {
+            let composeData = null
             try {
                 const { invoke } = await import('@tauri-apps/api/core')
                 const json = await invoke('get_compose_window_data', { label: windowLabel })
-                if (active && json) {
-                    setData(safeParse(json))
+                if (json) {
+                    composeData = safeParse(json)
                 }
             } catch {
-                /* fallback: try localStorage */
+                /* IPC error fallback */
+            }
+
+            if (!composeData) {
                 const stored = localStorage.getItem(`compose_data_${windowLabel}`)
-                if (active && stored) {
-                    setData(safeParse(stored))
+                if (stored) {
+                    composeData = safeParse(stored)
                 }
+            }
+
+            if (!composeData) {
+                const saved = getSavedAccount()
+                const defaultDraft = normalizeComposeDraft({ from: saved.email || '' })
+                composeData = {
+                    accountId: saved.id,
+                    accountEmail: saved.email,
+                    source: 'new',
+                    draft: defaultDraft,
+                    baselineDraft: defaultDraft,
+                }
+            }
+
+            if (active && composeData) {
+                setData(composeData)
             }
         }
         load()
@@ -397,7 +419,15 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }
 
     return (
+        <ComposeEditorProvider>
         <div className="dashboard-page" style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
+            {!pendingSend && (
+                <div className="db-tools-bar db-detached-format-bar">
+                    <div className="db-submenu db-submenu--format">
+                        <ComposeFormatTools />
+                    </div>
+                </div>
+            )}
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                 {pendingSend ? (
                     <div className="db-section-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -494,5 +524,6 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 </div>
             )}
         </div>
+        </ComposeEditorProvider>
     )
 }

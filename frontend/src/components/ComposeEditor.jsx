@@ -10,6 +10,7 @@ import { history, undo, redo } from 'prosemirror-history'
 import { inputRules, wrappingInputRule, smartQuotes, emDash, ellipsis } from 'prosemirror-inputrules'
 import { gapCursor } from 'prosemirror-gapcursor'
 import { wrapInList, splitListItem, liftListItem, sinkListItem } from 'prosemirror-schema-list'
+import { useComposeEditorContext } from '../context/ComposeEditorContext.jsx'
 import './ComposeEditor.css'
 
 /* ─── Emoji palette ─── */
@@ -205,24 +206,13 @@ function setLineSpacing(state, dispatch, lineHeight) {
     return true
 }
 
-function insertImageFromFile(view) {
-    const input = document.createElement('input')
-    input.type = 'file'
-    input.accept = 'image/*'
-    input.onchange = () => {
-        const file = input.files?.[0]
-        if (!file) return
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
         const reader = new FileReader()
-        reader.onload = () => {
-            const src = reader.result
-            const node = view.state.schema.nodes.image.create({ src, alt: file.name })
-            const tr = view.state.tr.replaceSelectionWith(node)
-            view.dispatch(tr)
-            view.focus()
-        }
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+        reader.onerror = () => reject(reader.error || new Error('File could not be read'))
         reader.readAsDataURL(file)
-    }
-    input.click()
+    })
 }
 
 function clearFormatting(state, dispatch) {
@@ -290,7 +280,13 @@ function parseFromHtml(schema, html) {
 }
 
 /* ─── Component ─── */
-export default function ComposeEditor({ initialContent, onChange, lineSpacing = '1.6' }) {
+export default function ComposeEditor({
+    initialContent,
+    onChange,
+    lineSpacing = '1.6',
+    toolbarVisible = true,
+    onInlineImageFilesSelected,
+}) {
     const editorRef = useRef(null)
     const viewRef = useRef(null)
     const [editorState, setEditorState] = useState(null)
@@ -324,6 +320,9 @@ export default function ComposeEditor({ initialContent, onChange, lineSpacing = 
     const lineSpacingRef = useRef(null)
 
     const schema = useMemo(() => buildSchema(), [])
+
+    /* Bridge to an external toolbar (app ribbon / detached window top bar) */
+    const editorCtx = useComposeEditorContext()
 
     /* Create editor view */
     useEffect(() => {
@@ -527,8 +526,44 @@ export default function ComposeEditor({ initialContent, onChange, lineSpacing = 
     }, [exec])
 
     const handleInsertImage = useCallback(() => {
-        if (viewRef.current) insertImageFromFile(viewRef.current)
-    }, [])
+        const view = viewRef.current
+        if (!view) return
+
+        const input = document.createElement('input')
+        input.type = 'file'
+        input.accept = 'image/*'
+        input.multiple = true
+        input.onchange = async () => {
+            const files = Array.from(input.files || [])
+            if (files.length === 0) return
+
+            const inlineImages = onInlineImageFilesSelected
+                ? await onInlineImageFilesSelected(files)
+                : await Promise.all(files.map(async (file) => ({
+                    src: await readFileAsDataUrl(file),
+                    alt: file.name || null,
+                })))
+
+            const validImages = (inlineImages || []).filter((image) => image?.src)
+            if (validImages.length === 0) return
+
+            validImages.forEach((image, index) => {
+                const node = view.state.schema.nodes.image.create({
+                    src: image.src,
+                    alt: image.alt || null,
+                    title: image.title || null,
+                    width: image.width || null,
+                    height: image.height || null,
+                })
+                view.dispatch(view.state.tr.replaceSelectionWith(node))
+                if (index < validImages.length - 1) {
+                    view.dispatch(view.state.tr.insertText('\n'))
+                }
+            })
+            view.focus()
+        }
+        input.click()
+    }, [onInlineImageFilesSelected])
 
     /* Public method for parent components */
     const getHtml = useCallback(() => {
@@ -549,9 +584,98 @@ export default function ComposeEditor({ initialContent, onChange, lineSpacing = 
     const currentHighlight = editorState ? (getMarkAttr(editorState, schema.marks.highlight, 'color') || '#ffff00') : '#ffff00'
     const currentLineSpacing = editorState ? (getParagraphAttr(editorState, 'lineHeight') || lineSpacing) : lineSpacing
 
+    /* ── External controller: imperative command API for a detached toolbar ── */
+    const controller = useMemo(() => ({
+        focus: () => viewRef.current?.focus(),
+        undo: () => exec(undo),
+        redo: () => exec(redo),
+        setFontFamily: (family) => applyMark(schema.marks.fontFamily, { family }),
+        setFontSize: (size) => applyMark(schema.marks.fontSize, { size }),
+        setTextColor: (color) => applyMark(schema.marks.textColor, { color }),
+        setHighlight: (color) => applyMark(schema.marks.highlight, { color }),
+        toggleBold: () => toggleMarkCmd(schema.marks.strong),
+        toggleItalic: () => toggleMarkCmd(schema.marks.em),
+        toggleUnderline: () => toggleMarkCmd(schema.marks.underline),
+        toggleStrike: () => toggleMarkCmd(schema.marks.strikethrough),
+        toggleSubscript: () => toggleMarkCmd(schema.marks.subscript),
+        toggleSuperscript: () => toggleMarkCmd(schema.marks.superscript),
+        align: (value) => handleAlignment(value),
+        orderedList: () => exec(wrapInList(schema.nodes.ordered_list)),
+        bulletList: () => exec(wrapInList(schema.nodes.bullet_list)),
+        outdent: () => exec(liftListItem(schema.nodes.list_item)),
+        indent: () => exec(sinkListItem(schema.nodes.list_item)),
+        blockquote: () => exec(wrapIn(schema.nodes.blockquote)),
+        isLinkActive: () => {
+            const view = viewRef.current
+            return view ? markActive(view.state, schema.marks.link) : false
+        },
+        removeLink: () => exec(toggleMark(schema.marks.link)),
+        insertLink: (url, title) => {
+            if (!viewRef.current || !url?.trim()) return
+            const view = viewRef.current
+            const { from, to, empty } = view.state.selection
+            const mark = schema.marks.link.create({ href: url, title: title || null })
+            if (empty) {
+                const node = schema.text(title || url, [mark])
+                view.dispatch(view.state.tr.replaceSelectionWith(node, false))
+            } else {
+                view.dispatch(view.state.tr.addMark(from, to, mark))
+            }
+            view.focus()
+        },
+        insertEmoji: (emoji) => {
+            if (!viewRef.current) return
+            const view = viewRef.current
+            view.dispatch(view.state.tr.insertText(emoji))
+            view.focus()
+        },
+        clearFormatting: () => exec(clearFormatting),
+        changeCase: () => exec(changeCaseCommand),
+        setLineSpacing: (value) => exec((state, dispatch) => setLineSpacing(state, dispatch, value)),
+        insertImage: () => handleInsertImage(),
+    }), [applyMark, exec, handleAlignment, handleInsertImage, schema, toggleMarkCmd])
+
+    /* Snapshot of the current formatting state for external toolbar rendering */
+    const snapshot = useMemo(() => ({
+        fontFamily: currentFontFamily,
+        fontSize: currentFontSize,
+        textColor: currentTextColor,
+        highlight: currentHighlight,
+        lineSpacing: currentLineSpacing,
+        active: {
+            strong: isMarkActive(schema.marks.strong),
+            em: isMarkActive(schema.marks.em),
+            underline: isMarkActive(schema.marks.underline),
+            strikethrough: isMarkActive(schema.marks.strikethrough),
+            subscript: isMarkActive(schema.marks.subscript),
+            superscript: isMarkActive(schema.marks.superscript),
+            link: isMarkActive(schema.marks.link),
+        },
+    }), [currentFontFamily, currentFontSize, currentTextColor, currentHighlight, currentLineSpacing, isMarkActive, schema])
+
+    // Pull the stable callbacks out so these effects don't re-run every time the
+    // context value changes (it changes on every snapshot push).
+    const registerController = editorCtx?.registerController
+    const unregisterController = editorCtx?.unregisterController
+    const updateSnapshot = editorCtx?.updateSnapshot
+
+    /* Register/unregister the controller with the shared context */
+    useEffect(() => {
+        if (!registerController || !unregisterController) return undefined
+        registerController(controller)
+        return () => unregisterController(controller)
+    }, [registerController, unregisterController, controller])
+
+    /* Keep the external toolbar's snapshot in sync with the editor state */
+    useEffect(() => {
+        if (!updateSnapshot) return
+        updateSnapshot(snapshot)
+    }, [updateSnapshot, snapshot])
+
     return (
         <div className="compose-editor">
-            <div className="ce-toolbar">
+            {toolbarVisible && (
+                <div className="ce-toolbar">
                 {/* Undo / Redo */}
                 <div className="ce-toolbar-group">
                     <button type="button" onClick={() => exec(undo)} title="Geri Al">↩</button>
@@ -794,7 +918,8 @@ export default function ComposeEditor({ initialContent, onChange, lineSpacing = 
                         title="Görsel Ekle"
                     >🖼️</button>
                 </div>
-            </div>
+                </div>
+            )}
 
             {/* Editor area */}
             <div
