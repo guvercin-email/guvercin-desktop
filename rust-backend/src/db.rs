@@ -578,13 +578,31 @@ async fn init_general_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let _ = sqlx::query(col).execute(pool).await;
     }
 
-    // Which calendar backend the user chose for this account (see calendar_routes
-    // `get/set_calendar_backend`). One of '', 'google', 'caldav', 'local'. Empty
-    // ⇒ not yet chosen: the Calendar tab prompts on first open. 'local' opts out of
-    // all cloud sync. The choice is single-select — only the named backend syncs.
-    let _ = sqlx::query("ALTER TABLE accounts ADD COLUMN calendar_backend TEXT")
-        .execute(pool)
-        .await;
+    // CardDAV contacts sync config (see carddav_sync.rs). Same shape as the CalDAV
+    // block above, but kept separate because providers often serve contacts from a
+    // different host (contacts.icloud.com vs caldav.icloud.com) — and a user may
+    // well sync a calendar with one server and an address book with another.
+    for col in [
+        "ALTER TABLE accounts ADD COLUMN carddav_url TEXT",
+        "ALTER TABLE accounts ADD COLUMN carddav_username TEXT",
+        "ALTER TABLE accounts ADD COLUMN carddav_password TEXT",
+    ] {
+        let _ = sqlx::query(col).execute(pool).await;
+    }
+
+    // Which sync backend the user chose per store (see `get/set_calendar_backend`
+    // in calendar_routes, and the twins in contacts_routes/todo_routes). One of
+    // '', 'google', 'caldav'/'carddav', 'local'. Empty ⇒ not yet chosen: the tab
+    // prompts on first open. 'local' opts out of all cloud sync. The choice is
+    // single-select — only the named backend syncs, so two backends can never
+    // fight over the same rows.
+    for col in [
+        "ALTER TABLE accounts ADD COLUMN calendar_backend TEXT",
+        "ALTER TABLE accounts ADD COLUMN contacts_backend TEXT",
+        "ALTER TABLE accounts ADD COLUMN tasks_backend TEXT",
+    ] {
+        let _ = sqlx::query(col).execute(pool).await;
+    }
 
     sqlx::query(
         r#"
@@ -1207,4 +1225,65 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     Ok(())
+}
+
+// ─────────────────────────── sync backend preference ───────────────────────────
+//
+// Each syncable store (calendar, contacts, tasks) remembers which backend the user
+// picked for the account: "google", a DAV server ("caldav"/"carddav"), "local" for
+// no cloud at all, or "" for "not asked yet" — the tab prompts on first open. The
+// choice is stored on the account row in the general DB rather than the per-user
+// store, so it survives an empty calendar/address book and can be read before any
+// user data exists. It is single-select on purpose: only the named backend syncs,
+// so two backends can never fight over the same rows.
+
+/// Clamp a client-supplied backend name to the values a store accepts. `remote` is
+/// the store's DAV flavour — "caldav" for the calendar and tasks, "carddav" for
+/// contacts.
+pub fn normalize_backend(raw: &str, remote: &str) -> String {
+    let value = raw.trim().to_lowercase();
+    if value == "google" || value == "local" || value == remote {
+        value
+    } else {
+        String::new()
+    }
+}
+
+/// Read the stored backend choice from `column` (a literal column name from one of
+/// the route modules — never user input).
+pub async fn get_backend_pref(
+    state: &Arc<AppState>,
+    account_id: i64,
+    column: &str,
+    remote: &str,
+) -> Result<String, AppError> {
+    let general = state.ensure_ready(false).await?.general_pool.clone();
+    let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT {column} FROM accounts WHERE account_id = ?"
+    ))
+    .bind(account_id)
+    .fetch_optional(&general)
+    .await?
+    .flatten();
+    Ok(stored.map(|s| normalize_backend(&s, remote)).unwrap_or_default())
+}
+
+/// Persist a backend choice, returning the normalized value actually stored.
+pub async fn set_backend_pref(
+    state: &Arc<AppState>,
+    account_id: i64,
+    column: &str,
+    remote: &str,
+    raw: &str,
+) -> Result<String, AppError> {
+    let general = state.ensure_ready(false).await?.general_pool.clone();
+    let backend = normalize_backend(raw, remote);
+    sqlx::query(&format!(
+        "UPDATE accounts SET {column} = ? WHERE account_id = ?"
+    ))
+    .bind(&backend)
+    .bind(account_id)
+    .execute(&general)
+    .await?;
+    Ok(backend)
 }

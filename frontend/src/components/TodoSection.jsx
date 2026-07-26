@@ -6,10 +6,13 @@ import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
 import { notifyReminder } from '../utils/notifications.js'
 import { getNotificationSettings, isWithinQuietHours } from '../utils/notificationSettings.js'
 import {
-  clearCompleted, createTask, createTaskList, deleteTask, deleteTaskList, emptyTask,
-  fetchTaskLists, fetchTasks, googleStatus, googleSyncTasks, normalizeTask, updateTask,
-  updateTaskList,
+  caldavGetConfig, caldavSetConfig, caldavStatus, caldavSyncTasks, clearCompleted,
+  createTask, createTaskList, deleteTask, deleteTaskList, emptyTask, fetchTaskLists,
+  fetchTasks, getTasksBackend, googleSyncTasks, googleTasksAccess, normalizeTask,
+  setTasksBackend, updateTask, updateTaskList,
 } from '../utils/todoApi.js'
+import { googleReconnect } from '../utils/calendarApi.js'
+import { DavAccountModal, SyncChoiceModal, syncLabel } from './SyncSetup.jsx'
 import './TodoSection.css'
 
 const LIST_COLORS = [
@@ -67,7 +70,14 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
   const [showCompleted, setShowCompleted] = useState(false)
   const [creatingList, setCreatingList] = useState(false)
   const [renamingId, setRenamingId] = useState(null)
-  const [googleAvailable, setGoogleAvailable] = useState(false)
+  // Tasks sync backend: '', 'google', 'caldav' (VTODO) or 'local' (single-choice).
+  const [backend, setBackend] = useState('')
+  const [googleGmail, setGoogleGmail] = useState(false) // account is a Google account
+  const [googleGranted, setGoogleGranted] = useState(false) // token actually grants Tasks
+  const [caldavAvailable, setCaldavAvailable] = useState(false)
+  const [caldavOpen, setCaldavOpen] = useState(false)
+  const [cloudOpen, setCloudOpen] = useState(false) // choice modal (onboarding + settings)
+  const [reconnecting, setReconnecting] = useState(false)
   const [toasts, setToasts] = useState([])
   const syncBusy = useRef(false)
   const firedReminders = useRef(new Set())
@@ -110,10 +120,35 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
     const id = setTimeout(() => reload(), search ? 220 : 0)
     return () => clearTimeout(id)
   }, [reload, search])
+  // Load the sync backend choice + backend availability for this account, then
+  // silently adopt an already-working backend when nothing has been chosen yet.
+  // Anything else leaves the choice unmade, so the toolbar offers "Set up sync".
+  // Mirrors the Calendar tab; CalDAV tasks reuse the calendar's CalDAV account.
   useEffect(() => {
-    if (!accountId) { setGoogleAvailable(false); return }
+    if (!accountId) {
+      setBackend(''); setGoogleGmail(false); setGoogleGranted(false); setCaldavAvailable(false)
+      return undefined
+    }
     let alive = true
-    googleStatus(accountId).then((s) => { if (alive) setGoogleAvailable(!!s.available) }).catch(() => {})
+    ;(async () => {
+      const [pref, access, caldav] = await Promise.all([
+        getTasksBackend(accountId).catch(() => ({ backend: '' })),
+        googleTasksAccess(accountId).catch(() => ({ gmail: false, granted: false })),
+        caldavStatus(accountId).catch(() => ({ available: false })),
+      ])
+      if (!alive) return
+      const chosen = pref.backend || ''
+      setBackend(chosen)
+      setGoogleGmail(!!access.gmail)
+      setGoogleGranted(!!access.granted)
+      setCaldavAvailable(!!caldav.available)
+      if (chosen) return
+      if (access.gmail && access.granted) {
+        setTasksBackend(accountId, 'google').catch(() => {}); setBackend('google')
+      } else if (caldav.available) {
+        setTasksBackend(accountId, 'caldav').catch(() => {}); setBackend('caldav')
+      }
+    })()
     return () => { alive = false }
   }, [accountId])
 
@@ -129,15 +164,20 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
     return () => clearInterval(id)
   }, [accountId])
 
-  // ── Google sync (always on, no button) ──
-  // Runs quietly in the background: on every change (debounced), periodically,
-  // and once Google becomes available.
+  // ── Two-way sync (always on for the chosen backend, no button) ──
+  // Runs quietly in the background: on every change (debounced), periodically, and
+  // as soon as a backend becomes available. Only the single chosen backend syncs;
+  // 'local' (or an unmade choice) syncs nothing.
+  const syncEnabled = (backend === 'google' && googleGranted) || (backend === 'caldav' && caldavAvailable)
   const runSyncRef = useRef(async () => {})
   runSyncRef.current = async () => {
-    if (!googleAvailable || !networkOnline || syncBusy.current) return
+    // Cloud sync only runs while online — no point hammering Google/CalDAV with
+    // failing requests offline. The local view keeps refreshing regardless.
+    if (!syncEnabled || !networkOnline || syncBusy.current) return
     syncBusy.current = true
     try {
-      await googleSyncTasks(accountId)
+      if (backend === 'google') await googleSyncTasks(accountId)
+      else await caldavSyncTasks(accountId)
       await refreshAll({ silent: true })
     } catch { /* transient network / auth issues are non-fatal */ } finally {
       syncBusy.current = false
@@ -146,18 +186,58 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
 
   const syncTimerRef = useRef(null)
   const syncSoon = useCallback(() => {
-    if (!googleAvailable) return
+    if (!syncEnabled) return
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
     syncTimerRef.current = setTimeout(() => runSyncRef.current(), 1200)
-  }, [googleAvailable])
+  }, [syncEnabled])
   useEffect(() => () => { if (syncTimerRef.current) clearTimeout(syncTimerRef.current) }, [])
 
   useEffect(() => {
-    if (!googleAvailable || !networkOnline) return undefined
+    if (!syncEnabled || !networkOnline) return undefined
     runSyncRef.current()
     const id = setInterval(() => runSyncRef.current(), 30000)
     return () => clearInterval(id)
-  }, [googleAvailable, networkOnline])
+  }, [syncEnabled, networkOnline])
+
+  // ── Sync-choice handlers (shared by onboarding + settings) ──
+  const chooseGoogle = useCallback(async () => {
+    if (reconnecting) return
+    setReconnecting(true)
+    try {
+      await googleReconnect(accountId, (p) => {
+        if (p === 'pending') pushToast(t('Complete sign-in in your browser, then return here…'), 'info')
+      })
+      await setTasksBackend(accountId, 'google').catch(() => {})
+      setBackend('google'); setGoogleGranted(true); setGoogleGmail(true)
+      setCloudOpen(false)
+      pushToast(t('Connected to Google Tasks.'), 'info')
+      setTimeout(() => runSyncRef.current(), 100)
+    } catch (e) {
+      pushToast(e.message || t('Google sign-in failed. Please try again.'), 'error')
+    } finally {
+      setReconnecting(false)
+    }
+  }, [accountId, reconnecting, pushToast, t])
+
+  const chooseCaldav = useCallback(() => { setCloudOpen(false); setCaldavOpen(true) }, [])
+
+  const chooseLocal = useCallback(async () => {
+    await setTasksBackend(accountId, 'local').catch(() => {})
+    setBackend('local'); setCloudOpen(false)
+    pushToast(t('Tasks will stay on this device only.'), 'info')
+  }, [accountId, pushToast, t])
+
+  // The CalDAV form and the API talk in the same shapes; bind the account id here so
+  // the shared modal stays store-agnostic. This is the *same* CalDAV account the
+  // Calendar tab configures — connecting here also connects the calendar.
+  const caldavGet = useCallback(() => caldavGetConfig(accountId), [accountId])
+  const caldavSet = useCallback((payload) => caldavSetConfig(accountId, payload), [accountId])
+  const describeCaldav = useCallback((res) => {
+    const n = res && typeof res.taskLists === 'number' ? res.taskLists : null
+    return n != null
+      ? t('Connected — {{count}} task list(s) found.', { count: n })
+      : t('CalDAV connected.')
+  }, [t])
 
   // ── Due-date reminders: fire an in-app toast + OS notification as tasks come
   // due (mirrors the calendar). Timed tasks fire at their due time; date-only
@@ -408,6 +488,11 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
         <ul>
           <li><button className="db-submenu-main-btn" onClick={openNew}>{btn(icon('plus'), t('New task'))}</button></li>
           <li><button className="db-submenu-main-btn" onClick={() => setCreatingList(true)}>{btn(icon('label'), t('New list'))}</button></li>
+          <li>
+            <button className="db-submenu-main-btn" onClick={() => setCloudOpen(true)} title={t('Tasks sync')}>
+              {btn(icon('settings'), syncLabel(t, backend, 'CalDAV'))}
+            </button>
+          </li>
         </ul>
       </div>
 
@@ -503,6 +588,55 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
           onCancel={() => { setDraft(null); setDraftId(null) }} onSave={handleSave}
           onAddToCalendar={() => addTaskToCalendar(draft)}
           onDelete={draftId ? () => handleDelete(null) : null} />
+      )}
+
+      {/* ── Sync-choice modal (first-run onboarding + settings) ── */}
+      {cloudOpen && (
+        <SyncChoiceModal
+          t={t}
+          title={t('Tasks sync')}
+          intro={t('Choose where your tasks live. You can change this anytime.')}
+          backend={backend}
+          davKey="caldav"
+          googleAvailable={googleGmail}
+          reconnecting={reconnecting}
+          googleTitle={t('Google Tasks')}
+          googleDesc={t('Two-way sync with your Google account.')}
+          davTitle={t('Another server (CalDAV)')}
+          davDesc={t('To-do lists on Nextcloud, iCloud Reminders, Fastmail, Radicale…')}
+          localTitle={t('This device only')}
+          localDesc={t('No cloud. Tasks stay local to this app.')}
+          onGoogle={chooseGoogle}
+          onDav={chooseCaldav}
+          onLocal={chooseLocal}
+          onClose={() => setCloudOpen(false)}
+        />
+      )}
+
+      {/* ── CalDAV account modal (shared with the Calendar tab) ── */}
+      {caldavOpen && (
+        <DavAccountModal
+          t={t}
+          title={t('CalDAV account')}
+          hint={t('Sync tasks two-way with any CalDAV server that stores to-dos (Nextcloud Tasks, iCloud Reminders, Fastmail, Radicale…). This is the same account the Calendar tab uses. Most providers need an app-specific password.')}
+          urlPlaceholder="https://caldav.example.com/"
+          getConfig={caldavGet}
+          setConfig={caldavSet}
+          describeResult={describeCaldav}
+          pushToast={pushToast}
+          onClose={() => setCaldavOpen(false)}
+          onChanged={async (available) => {
+            setCaldavAvailable(available)
+            if (available) {
+              await setTasksBackend(accountId, 'caldav').catch(() => {})
+              setBackend('caldav')
+              setTimeout(() => runSyncRef.current(), 100)
+            } else if (backend === 'caldav') {
+              await setTasksBackend(accountId, '').catch(() => {})
+              setBackend('')
+            }
+          }}
+        />
       )}
 
       <div className="td-toasts">

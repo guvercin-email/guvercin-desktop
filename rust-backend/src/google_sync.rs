@@ -186,17 +186,18 @@ pub async fn google_status(
     })))
 }
 
-/// Probe whether the stored Google token actually grants Calendar access.
+/// Probe whether the stored Google token actually grants access to one service.
 ///
 /// `google_status` only reports whether the account is Gmail and OAuth is built
-/// in; it can't tell whether the *calendar* scope was granted. Accounts that
-/// signed in before the calendar scope was added keep a mail-only refresh token,
-/// so a real API call is the only reliable signal. This does one cheap
-/// `calendarList` request (a 401/403 ⇒ not granted). Used by the Calendar tab to
-/// decide whether to prompt the user to reconnect.
-pub async fn calendar_access(
-    State(state): State<Arc<AppState>>,
-    Path(account_id): Path<i64>,
+/// in; it can't tell whether the *calendar* / *contacts* / *tasks* scope was
+/// granted. Accounts that signed in before a scope was added keep a token without
+/// it, so a real API call is the only reliable signal. Each probe is one cheap
+/// list request (a 401/403 ⇒ not granted). Used by the three tabs to decide whether
+/// to prompt the user to reconnect.
+async fn service_access(
+    state: &Arc<AppState>,
+    account_id: i64,
+    probe_url: &str,
 ) -> Result<Json<Value>, AppError> {
     let general = state.ensure_ready(false).await?.general_pool.clone();
     let provider: Option<String> =
@@ -213,12 +214,37 @@ pub async fn calendar_access(
     let granted = match oauth::access_token_for_account(&general, account_id).await {
         Ok(token) => {
             let http = reqwest::Client::new();
-            let url = format!("{CAL_LIST_URL}?maxResults=1&fields=kind");
-            google_get::<Value>(&http, &url, &token).await.is_ok()
+            google_get::<Value>(&http, probe_url, &token).await.is_ok()
         }
         Err(_) => false,
     };
     Ok(Json(json!({ "gmail": true, "configured": true, "granted": granted })))
+}
+
+pub async fn calendar_access(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    service_access(&state, account_id, &format!("{CAL_LIST_URL}?maxResults=1&fields=kind")).await
+}
+
+pub async fn contacts_access(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    service_access(
+        &state,
+        account_id,
+        &format!("{PEOPLE_URL}?pageSize=1&personFields=names"),
+    )
+    .await
+}
+
+pub async fn tasks_access(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    service_access(&state, account_id, &format!("{TASKLISTS_URL}?maxResults=1")).await
 }
 
 // ─────────────────────────── Calendar ───────────────────────────

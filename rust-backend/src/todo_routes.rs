@@ -359,6 +359,36 @@ fn new_uid() -> String {
     format!("guvercin-task-{}-{:08x}", chrono::Utc::now().timestamp_millis(), nanos)
 }
 
+// ─────────────────────────── Backend preference ───────────────────────────
+//
+// Which sync backend the account uses for its tasks: "", "google", "caldav"
+// (VTODO — see [`crate::caldav_tasks`]) or "local". Mirrors the calendar's pair of
+// routes — see [`crate::db::get_backend_pref`].
+
+#[derive(Deserialize)]
+pub struct BackendBody {
+    #[serde(default)]
+    pub backend: String,
+}
+
+pub async fn get_tasks_backend(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let backend = db::get_backend_pref(&state, account_id, "tasks_backend", "caldav").await?;
+    Ok(Json(json!({ "backend": backend })))
+}
+
+pub async fn set_tasks_backend(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+    Json(body): Json<BackendBody>,
+) -> Result<Json<Value>, AppError> {
+    let backend =
+        db::set_backend_pref(&state, account_id, "tasks_backend", "caldav", &body.backend).await?;
+    Ok(Json(json!({ "backend": backend })))
+}
+
 // ─────────────────────────── Task handlers ───────────────────────────
 
 #[derive(Deserialize)]

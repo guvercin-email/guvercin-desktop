@@ -894,35 +894,15 @@ pub async fn sync_write_event(
 
 // ─────────────────────────── Backend preference ───────────────────────────
 //
-// Which sync backend the account uses for the calendar. Stored on the account row
-// (general DB) rather than the per-user calendar DB so the choice survives even
-// when no events exist yet, and so the Calendar tab can decide on first open
-// whether to prompt. One of "", "google", "caldav", "local".
-
-fn normalize_backend(raw: &str) -> String {
-    match raw.trim().to_lowercase().as_str() {
-        "google" => "google",
-        "caldav" => "caldav",
-        "local" => "local",
-        _ => "",
-    }
-    .to_string()
-}
+// Which sync backend the account uses for the calendar: "", "google", "caldav" or
+// "local". See [`crate::db::get_backend_pref`] for how (and where) the choice is
+// stored; contacts and tasks have the same pair of routes.
 
 pub async fn get_calendar_backend(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let general = state.ensure_ready(false).await?.general_pool.clone();
-    let backend: String = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT calendar_backend FROM accounts WHERE account_id = ?",
-    )
-    .bind(account_id)
-    .fetch_optional(&general)
-    .await?
-    .flatten()
-    .map(|s| normalize_backend(&s))
-    .unwrap_or_default();
+    let backend = db::get_backend_pref(&state, account_id, "calendar_backend", "caldav").await?;
     Ok(Json(json!({ "backend": backend })))
 }
 
@@ -937,13 +917,9 @@ pub async fn set_calendar_backend(
     Path(account_id): Path<i64>,
     Json(body): Json<BackendBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let general = state.ensure_ready(false).await?.general_pool.clone();
-    let backend = normalize_backend(&body.backend);
-    sqlx::query("UPDATE accounts SET calendar_backend = ? WHERE account_id = ?")
-        .bind(&backend)
-        .bind(account_id)
-        .execute(&general)
-        .await?;
+    let backend =
+        db::set_backend_pref(&state, account_id, "calendar_backend", "caldav", &body.backend)
+            .await?;
     Ok(Json(json!({ "backend": backend })))
 }
 
@@ -1199,7 +1175,7 @@ pub fn build_ics(cards: &[EventCard]) -> String {
     let mut out = String::new();
     out.push_str("BEGIN:VCALENDAR\r\n");
     out.push_str("VERSION:2.0\r\n");
-    out.push_str("PRODID:-//Guvercin//Calendar//EN\r\n");
+    out.push_str("PRODID:-//guvercin//Calendar//EN\r\n");
     out.push_str("CALSCALE:GREGORIAN\r\n");
     for card in cards {
         push_vevent(&mut out, card);
@@ -1320,11 +1296,11 @@ fn ics_date(ms: i64) -> String {
 fn ics_datetime(ms: i64) -> String {
     dt_from_ms(ms).format("%Y%m%dT%H%M%S").to_string()
 }
-fn ics_utc_now() -> String {
+pub(crate) fn ics_utc_now() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-fn escape_text(s: &str) -> String {
+pub(crate) fn escape_text(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\r', "")
@@ -1332,7 +1308,7 @@ fn escape_text(s: &str) -> String {
         .replace(';', "\\;")
 }
 
-fn unescape_text(s: &str) -> String {
+pub(crate) fn unescape_text(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1350,7 +1326,7 @@ fn unescape_text(s: &str) -> String {
 }
 
 /// Fold a logical line at 74 octets per RFC 5545 (continuation lines start with a space).
-fn fold_line(out: &mut String, line: &str) {
+pub(crate) fn fold_line(out: &mut String, line: &str) {
     let bytes = line.as_bytes();
     if bytes.len() <= 74 {
         out.push_str(line);
@@ -1377,7 +1353,7 @@ fn fold_line(out: &mut String, line: &str) {
 
 // ── ICS parsing ──
 
-fn ics_unfold(input: &str) -> Vec<String> {
+pub(crate) fn ics_unfold(input: &str) -> Vec<String> {
     let mut logical: Vec<String> = Vec::new();
     for raw in input.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -1392,13 +1368,13 @@ fn ics_unfold(input: &str) -> Vec<String> {
     logical
 }
 
-struct IcsProp {
-    name: String,
-    params: Vec<(String, String)>,
-    value: String,
+pub(crate) struct IcsProp {
+    pub name: String,
+    pub params: Vec<(String, String)>,
+    pub value: String,
 }
 
-fn parse_prop(line: &str) -> Option<IcsProp> {
+pub(crate) fn parse_prop(line: &str) -> Option<IcsProp> {
     let colon = line.find(':')?;
     let (head, value) = line.split_at(colon);
     let value = &value[1..];
@@ -1420,7 +1396,7 @@ fn parse_prop(line: &str) -> Option<IcsProp> {
 }
 
 /// Convert an ICS DATE/DATE-TIME value into (iso_string, is_date_only).
-fn parse_ics_datetime(value: &str, is_date: bool) -> Option<(String, bool)> {
+pub(crate) fn parse_ics_datetime(value: &str, is_date: bool) -> Option<(String, bool)> {
     let v = value.trim().trim_end_matches('Z');
     if is_date || (v.len() == 8 && !v.contains('T')) {
         // YYYYMMDD

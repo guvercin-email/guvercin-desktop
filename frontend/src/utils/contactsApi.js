@@ -203,3 +203,74 @@ export async function googleSyncContacts(accountId) {
   const res = await fetch(apiUrl(`/api/contacts/${accountId}/google-sync`), { method: 'POST' })
   return jsonOrThrow(res)
 }
+
+// Whether the stored Google token actually grants Contacts (People) access — a real
+// probe, unlike googleStatus. Accounts signed in before the contacts scope existed
+// report gmail:true, granted:false until the user reconnects (googleReconnect in
+// calendarApi upgrades the scopes for the whole account).
+export async function googleContactsAccess(accountId) {
+  try {
+    const res = await fetch(apiUrl(`/api/google/${accountId}/contacts-access`))
+    if (!res.ok) return { gmail: false, configured: false, granted: false }
+    return res.json()
+  } catch {
+    return { gmail: false, configured: false, granted: false }
+  }
+}
+
+// ── Contacts sync backend preference ──
+// Which backend the account uses: '', 'google', 'carddav' or 'local'.
+export async function getContactsBackend(accountId) {
+  try {
+    const res = await fetch(apiUrl(`/api/contacts/${accountId}/backend`))
+    if (!res.ok) return { backend: '' }
+    return res.json()
+  } catch {
+    return { backend: '' }
+  }
+}
+
+export async function setContactsBackend(accountId, backend) {
+  const res = await fetch(apiUrl(`/api/contacts/${accountId}/backend`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backend }),
+  })
+  return jsonOrThrow(res)
+}
+
+// ── CardDAV ──
+
+// Whether the account has a working CardDAV connection configured.
+export async function carddavStatus(accountId) {
+  try {
+    const res = await fetch(apiUrl(`/api/carddav/${accountId}/status`))
+    if (!res.ok) return { available: false, configured: false }
+    return res.json()
+  } catch {
+    return { available: false, configured: false }
+  }
+}
+
+// Current CardDAV settings. Never returns the password — only hasPassword, plus a
+// suggestedUsername to pre-fill an empty form.
+export async function carddavGetConfig(accountId) {
+  const res = await fetch(apiUrl(`/api/carddav/${accountId}/config`))
+  return jsonOrThrow(res)
+}
+
+// Save connection settings. An empty url disconnects. Validated server-side against
+// the CardDAV server before it is persisted, so this throws on bad credentials/URL.
+export async function carddavSetConfig(accountId, { url, username, password }) {
+  const res = await fetch(apiUrl(`/api/carddav/${accountId}/config`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, username, password }),
+  })
+  return jsonOrThrow(res)
+}
+
+export async function carddavSyncContacts(accountId) {
+  const res = await fetch(apiUrl(`/api/contacts/${accountId}/carddav-sync`), { method: 'POST' })
+  return jsonOrThrow(res)
+}

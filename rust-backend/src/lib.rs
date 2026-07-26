@@ -1,9 +1,12 @@
 mod avatar;
 mod avatar_routes;
 mod caldav_sync;
+mod caldav_tasks;
 mod calendar_routes;
+mod carddav_sync;
 mod contacts_routes;
 mod crypto;
+mod dav;
 mod db;
 pub mod error;
 mod google_sync;
@@ -63,7 +66,7 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
     dotenvy::dotenv().ok();
 
     init_tracing();
-    tracing::info!("Guvercin backend starting");
+    tracing::info!("guvercin backend starting");
 
     let db_state = Arc::new(AppState::initialize(db_dir).await?);
     let imap_state = Arc::new(ImapState::new());
@@ -223,6 +226,23 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
             post(google_sync::sync_contacts),
         )
         .route(
+            "/api/contacts/:account_id/carddav-sync",
+            post(carddav_sync::sync_carddav),
+        )
+        .route(
+            "/api/contacts/:account_id/backend",
+            get(contacts_routes::get_contacts_backend)
+                .put(contacts_routes::set_contacts_backend),
+        )
+        .route(
+            "/api/carddav/:account_id/config",
+            get(carddav_sync::carddav_get_config).put(carddav_sync::carddav_put_config),
+        )
+        .route(
+            "/api/carddav/:account_id/status",
+            get(carddav_sync::carddav_status),
+        )
+        .route(
             "/api/tasks/:account_id",
             get(todo_routes::list_tasks).post(todo_routes::create_task),
         )
@@ -243,6 +263,14 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
             post(google_sync::sync_tasks),
         )
         .route(
+            "/api/tasks/:account_id/caldav-sync",
+            post(caldav_tasks::sync_caldav_tasks),
+        )
+        .route(
+            "/api/tasks/:account_id/backend",
+            get(todo_routes::get_tasks_backend).put(todo_routes::set_tasks_backend),
+        )
+        .route(
             "/api/tasks/:account_id/:task_id",
             get(todo_routes::get_task)
                 .put(todo_routes::update_task)
@@ -255,6 +283,14 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
         .route(
             "/api/google/:account_id/calendar-access",
             get(google_sync::calendar_access),
+        )
+        .route(
+            "/api/google/:account_id/contacts-access",
+            get(google_sync::contacts_access),
+        )
+        .route(
+            "/api/google/:account_id/tasks-access",
+            get(google_sync::tasks_access),
         )
         .route("/api/avatar/:account_id", get(avatar_routes::get_avatar))
         .route(

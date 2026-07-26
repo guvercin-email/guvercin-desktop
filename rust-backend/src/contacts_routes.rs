@@ -396,6 +396,37 @@ pub async fn upsert_contact_by_uid(pool: &SqlitePool, card: &ContactCard) -> Res
     Ok(id)
 }
 
+// ─────────────────────────── Backend preference ───────────────────────────
+//
+// Which sync backend the account uses for its address book: "", "google",
+// "carddav" or "local". Mirrors the calendar's pair of routes — see
+// [`crate::db::get_backend_pref`].
+
+#[derive(Deserialize)]
+pub struct BackendBody {
+    #[serde(default)]
+    pub backend: String,
+}
+
+pub async fn get_contacts_backend(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let backend = db::get_backend_pref(&state, account_id, "contacts_backend", "carddav").await?;
+    Ok(Json(json!({ "backend": backend })))
+}
+
+pub async fn set_contacts_backend(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+    Json(body): Json<BackendBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let backend =
+        db::set_backend_pref(&state, account_id, "contacts_backend", "carddav", &body.backend)
+            .await?;
+    Ok(Json(json!({ "backend": backend })))
+}
+
 // ─────────────────────────── Handlers ───────────────────────────
 
 #[derive(Deserialize)]
@@ -939,7 +970,7 @@ pub async fn delete_list(
 
 // ─────────────────────────── vCard support ───────────────────────────
 
-fn new_uid() -> String {
+pub(crate) fn new_uid() -> String {
     format!(
         "guvercin-{}-{}",
         chrono::Utc::now().timestamp_millis(),

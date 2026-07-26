@@ -1,0 +1,92 @@
+/* Sync-setup modals shared by the Contacts and Todo tabs (see SyncSetup.jsx).
+   Deliberately mirrors the Calendar tab's sync modals so all three read as one
+   feature; the overlay is fixed rather than absolute because these sections are not
+   positioning contexts of their own. */
+
+.sync-modal-overlay {
+  position: fixed; inset: 0; z-index: 120;
+  background: var(--overlay-1, rgba(0, 0, 0, 0.38));
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+
+.sync-modal {
+  width: 460px; max-width: 100%; max-height: 92%;
+  background: var(--c-surface-2); border-radius: 14px; overflow: hidden;
+  box-shadow: var(--shadow-3); display: flex; flex-direction: column;
+  animation: sync-pop 0.15s ease;
+}
+.sync-modal--choice { width: 440px; }
+.sync-modal--form { width: 460px; }
+
+@keyframes sync-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+.sync-modal-topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--c-border-1);
+}
+.sync-modal-title { font-size: 17px; font-weight: 700; color: var(--c-text-1); }
+.sync-modal-actions { display: flex; gap: 8px; }
+.sync-modal-body { padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.sync-modal-footer {
+  padding: 12px 18px; border-top: 1px solid var(--c-border-1);
+  display: flex; justify-content: flex-start; min-height: 20px;
+}
+
+/* ── Buttons ── */
+.sync-btn {
+  border: 1px solid var(--c-border-2);
+  background: var(--c-surface-2);
+  color: var(--c-text-1);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+  white-space: nowrap;
+}
+.sync-btn:hover { background: var(--c-surface-3); }
+.sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sync-btn--primary { background: var(--c-primary); color: var(--c-primary-contrast); border-color: var(--c-primary); }
+.sync-btn--primary:hover { background: var(--c-primary-hover); }
+.sync-btn--danger { color: var(--c-danger); border-color: color-mix(in srgb, var(--c-danger) 40%, transparent); }
+.sync-btn--danger:hover { background: var(--c-danger-bg); color: var(--c-danger-text); }
+
+/* ── Form ── */
+.sync-hint { margin: 0 0 4px; font-size: 12px; line-height: 1.5; color: var(--c-text-3); }
+.sync-field { display: flex; flex-direction: column; gap: 5px; }
+.sync-field > span { font-size: 12px; font-weight: 600; color: var(--c-text-2); }
+.sync-field-note { font-size: 11px; font-weight: 400; line-height: 1.4; color: var(--c-text-3); }
+.sync-input {
+  border: 1px solid var(--c-border-2);
+  background: var(--c-surface-2);
+  color: var(--c-text-1);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  font-family: inherit;
+}
+.sync-input:focus { border-color: var(--c-primary); }
+
+/* ── Choice list ── */
+.sync-opts { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.sync-opt {
+  display: flex; align-items: center; gap: 12px; text-align: left;
+  padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--c-border-2); background: var(--c-surface-2);
+  cursor: pointer; transition: border-color 0.12s, background 0.12s;
+}
+.sync-opt:hover:not(:disabled) { border-color: var(--c-accent, #246bce); background: var(--c-surface-1); }
+.sync-opt:disabled { opacity: 0.6; cursor: default; }
+.sync-opt.is-current { border-color: var(--c-accent, #246bce); box-shadow: 0 0 0 1px var(--c-accent, #246bce) inset; }
+.sync-opt-icon { display: flex; width: 26px; justify-content: center; flex-shrink: 0; }
+.sync-opt-icon img { display: block; }
+.sync-opt-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sync-opt-title { font-size: 14px; font-weight: 600; color: var(--c-text-1); }
+.sync-opt-desc { font-size: 12px; line-height: 1.4; color: var(--c-text-3); }

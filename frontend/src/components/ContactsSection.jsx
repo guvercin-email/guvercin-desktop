@@ -4,10 +4,14 @@ import { requestNewCompose } from '../utils/mailtoInbox.js'
 import { requestNewEvent, requestNewTask } from '../utils/crossLinks.js'
 import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
 import {
+  carddavGetConfig, carddavSetConfig, carddavStatus, carddavSyncContacts,
   createContact, createList, deleteContact, deleteList, displayNameOf, emptyCard,
-  exportVcf, fetchContacts, fetchLists, fetchSuggestions, googleStatus, googleSyncContacts,
-  importVcf, normalizeCard, primaryEmailOf, primaryPhoneOf, renameList, updateContact,
+  exportVcf, fetchContacts, fetchLists, fetchSuggestions, getContactsBackend,
+  googleContactsAccess, googleSyncContacts, importVcf, normalizeCard, primaryEmailOf,
+  primaryPhoneOf, renameList, setContactsBackend, updateContact,
 } from '../utils/contactsApi.js'
+import { googleReconnect } from '../utils/calendarApi.js'
+import { DavAccountModal, SyncChoiceModal, syncLabel } from './SyncSetup.jsx'
 import './ContactsSection.css'
 
 const EMAIL_LABELS = ['work', 'home', 'other']
@@ -87,7 +91,14 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
   const [toasts, setToasts] = useState([])
   const [creatingList, setCreatingList] = useState(false)
   const [renamingId, setRenamingId] = useState(null)
-  const [googleAvailable, setGoogleAvailable] = useState(false)
+  // Contacts sync backend: '', 'google', 'carddav' or 'local' (single-choice).
+  const [backend, setBackend] = useState('')
+  const [googleGmail, setGoogleGmail] = useState(false) // account is a Google account
+  const [googleGranted, setGoogleGranted] = useState(false) // token actually grants Contacts
+  const [carddavAvailable, setCarddavAvailable] = useState(false)
+  const [carddavOpen, setCarddavOpen] = useState(false)
+  const [cloudOpen, setCloudOpen] = useState(false) // choice modal (onboarding + settings)
+  const [reconnecting, setReconnecting] = useState(false)
   const fileInputRef = useRef(null)
   const syncBusy = useRef(false)
   const syncTimerRef = useRef(null)
@@ -132,10 +143,35 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
 
   useEffect(() => { reloadLists() }, [reloadLists])
 
+  // Load the sync backend choice + backend availability for this account, then
+  // silently adopt an already-working backend when nothing has been chosen yet.
+  // Anything else leaves the choice unmade, so the toolbar offers "Set up sync"
+  // instead of nagging. Mirrors the Calendar tab.
   useEffect(() => {
-    if (!accountId) { setGoogleAvailable(false); return }
+    if (!accountId) {
+      setBackend(''); setGoogleGmail(false); setGoogleGranted(false); setCarddavAvailable(false)
+      return undefined
+    }
     let alive = true
-    googleStatus(accountId).then((s) => { if (alive) setGoogleAvailable(!!s.available) }).catch(() => {})
+    ;(async () => {
+      const [pref, access, carddav] = await Promise.all([
+        getContactsBackend(accountId).catch(() => ({ backend: '' })),
+        googleContactsAccess(accountId).catch(() => ({ gmail: false, granted: false })),
+        carddavStatus(accountId).catch(() => ({ available: false })),
+      ])
+      if (!alive) return
+      const chosen = pref.backend || ''
+      setBackend(chosen)
+      setGoogleGmail(!!access.gmail)
+      setGoogleGranted(!!access.granted)
+      setCarddavAvailable(!!carddav.available)
+      if (chosen) return
+      if (access.gmail && access.granted) {
+        setContactsBackend(accountId, 'google').catch(() => {}); setBackend('google')
+      } else if (carddav.available) {
+        setContactsBackend(accountId, 'carddav').catch(() => {}); setBackend('carddav')
+      }
+    })()
     return () => { alive = false }
   }, [accountId])
 
@@ -272,34 +308,81 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     }
   }, [accountId, pushToast])
 
-  // Google sync always runs quietly in the background — no button, no toast.
+  // Two-way sync. Reassigned every render so the auto-sync timer always calls the
+  // latest closure; a ref guard prevents overlapping runs. Only the single chosen
+  // backend syncs; 'local' (or an unmade choice) syncs nothing. Runs quietly in the
+  // background — no button, no toast.
+  const syncEnabled = (backend === 'google' && googleGranted) || (backend === 'carddav' && carddavAvailable)
   const runSyncRef = useRef(async () => {})
   runSyncRef.current = async () => {
-    if (!googleAvailable || !networkOnline || syncBusy.current) return
+    // Cloud sync only runs while online — no point hammering Google/CardDAV with
+    // failing requests offline. The local view keeps refreshing regardless.
+    if (!syncEnabled || !networkOnline || syncBusy.current) return
     syncBusy.current = true
     try {
-      await googleSyncContacts(accountId)
+      if (backend === 'google') await googleSyncContacts(accountId)
+      else await carddavSyncContacts(accountId)
       await refreshAll({ silent: true })
     } catch { /* transient network / auth issues are non-fatal */ } finally {
       syncBusy.current = false
     }
   }
 
+  // ── Sync-choice handlers (shared by onboarding + settings) ──
+  const chooseGoogle = useCallback(async () => {
+    if (reconnecting) return
+    setReconnecting(true)
+    try {
+      await googleReconnect(accountId, (p) => {
+        if (p === 'pending') pushToast(t('Complete sign-in in your browser, then return here…'), 'info')
+      })
+      await setContactsBackend(accountId, 'google').catch(() => {})
+      setBackend('google'); setGoogleGranted(true); setGoogleGmail(true)
+      setCloudOpen(false)
+      pushToast(t('Connected to Google Contacts.'), 'info')
+      setTimeout(() => runSyncRef.current(), 100)
+    } catch (e) {
+      pushToast(e.message || t('Google sign-in failed. Please try again.'), 'error')
+    } finally {
+      setReconnecting(false)
+    }
+  }, [accountId, reconnecting, pushToast, t])
+
+  const chooseCarddav = useCallback(() => { setCloudOpen(false); setCarddavOpen(true) }, [])
+
+  const chooseLocal = useCallback(async () => {
+    await setContactsBackend(accountId, 'local').catch(() => {})
+    setBackend('local'); setCloudOpen(false)
+    pushToast(t('Contacts will stay on this device only.'), 'info')
+  }, [accountId, pushToast, t])
+
   // Sync on every change (debounced so a burst of edits coalesces into one push).
   syncSoonRef.current = () => {
-    if (!googleAvailable) return
+    if (!syncEnabled) return
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current)
     syncTimerRef.current = setTimeout(() => runSyncRef.current(), 1200)
   }
   useEffect(() => () => { if (syncTimerRef.current) clearTimeout(syncTimerRef.current) }, [])
 
-  // Auto ("paso") sync: once Google is available AND online, then periodically.
+  // Auto ("paso") sync: sync once a backend is available AND we're online (so
+  // regaining connectivity kicks an immediate catch-up sync), then periodically.
   useEffect(() => {
-    if (!googleAvailable || !networkOnline) return undefined
+    if (!syncEnabled || !networkOnline) return undefined
     runSyncRef.current()
     const id = setInterval(() => runSyncRef.current(), 30000)
     return () => clearInterval(id)
-  }, [googleAvailable, networkOnline])
+  }, [syncEnabled, networkOnline])
+
+  // The CardDAV form and the API talk in the same shapes; bind the account id here
+  // so the shared modal stays store-agnostic.
+  const carddavGet = useCallback(() => carddavGetConfig(accountId), [accountId])
+  const carddavSet = useCallback((payload) => carddavSetConfig(accountId, payload), [accountId])
+  const describeCarddav = useCallback((res) => {
+    const n = res && typeof res.addressBooks === 'number' ? res.addressBooks : null
+    return n != null
+      ? t('Connected — {{count}} address book(s) found.', { count: n })
+      : t('CardDAV connected.')
+  }, [t])
 
   const handleExportOne = useCallback(async (rec) => {
     try {
@@ -411,6 +494,12 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
           <li className="cs-toolbar-sep" aria-hidden="true" />
           <li><button className="db-submenu-main-btn" onClick={() => fileInputRef.current?.click()}>{btn(icon('folder'), t('Import'))}</button></li>
           <li><button className="db-submenu-main-btn" onClick={handleExportAll}>{btn(icon('save'), t('Export'))}</button></li>
+          <li className="cs-toolbar-sep" aria-hidden="true" />
+          <li>
+            <button className="db-submenu-main-btn" onClick={() => setCloudOpen(true)} title={t('Contacts sync')}>
+              {btn(icon('settings'), syncLabel(t, backend, 'CardDAV'))}
+            </button>
+          </li>
         </ul>
       </div>
 
@@ -524,6 +613,55 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
         </section>
       </div>
 
+      {/* ── Sync-choice modal (first-run onboarding + settings) ── */}
+      {cloudOpen && (
+        <SyncChoiceModal
+          t={t}
+          title={t('Contacts sync')}
+          intro={t('Choose where your contacts live. You can change this anytime.')}
+          backend={backend}
+          davKey="carddav"
+          googleAvailable={googleGmail}
+          reconnecting={reconnecting}
+          googleTitle={t('Google Contacts')}
+          googleDesc={t('Two-way sync with your Google account.')}
+          davTitle={t('Another server (CardDAV)')}
+          davDesc={t('iCloud, Nextcloud, Fastmail, mailbox.org, Radicale…')}
+          localTitle={t('This device only')}
+          localDesc={t('No cloud. Contacts stay local to this app.')}
+          onGoogle={chooseGoogle}
+          onDav={chooseCarddav}
+          onLocal={chooseLocal}
+          onClose={() => setCloudOpen(false)}
+        />
+      )}
+
+      {/* ── CardDAV account modal ── */}
+      {carddavOpen && (
+        <DavAccountModal
+          t={t}
+          title={t('CardDAV account')}
+          hint={t('Sync contacts two-way with any CardDAV server (Nextcloud, iCloud, Fastmail, mailbox.org, Radicale…). Most providers need an app-specific password.')}
+          urlPlaceholder="https://carddav.example.com/"
+          getConfig={carddavGet}
+          setConfig={carddavSet}
+          describeResult={describeCarddav}
+          pushToast={pushToast}
+          onClose={() => setCarddavOpen(false)}
+          onChanged={async (available) => {
+            setCarddavAvailable(available)
+            if (available) {
+              await setContactsBackend(accountId, 'carddav').catch(() => {})
+              setBackend('carddav')
+              setTimeout(() => runSyncRef.current(), 100)
+            } else if (backend === 'carddav') {
+              await setContactsBackend(accountId, '').catch(() => {})
+              setBackend('')
+            }
+          }}
+        />
+      )}
+
       <div className="cs-toasts">
         {toasts.map((toast) => (
           <div key={toast.id} className={`cs-toast cs-toast--${toast.type}`}>
@@ -570,7 +708,6 @@ function ContactsWelcome({ onNew, onPickSuggestion, accountId, t }) {
 
   return (
     <div className="cs-welcome">
-      <div className="cs-welcome-icon">👤</div>
       <h2>{t('Contacts')}</h2>
       <p>{t('Select a contact to view details, or add a new one.')}</p>
       <button className="cs-btn cs-btn--primary" onClick={onNew}>{t('New contact')}</button>

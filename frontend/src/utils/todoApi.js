@@ -142,3 +142,49 @@ export async function googleSyncTasks(accountId) {
   const res = await fetch(apiUrl(`/api/tasks/${accountId}/google-sync`), { method: 'POST' })
   return jsonOrThrow(res)
 }
+
+// Whether the stored Google token actually grants Tasks access — a real probe,
+// unlike googleStatus. Accounts signed in before the tasks scope existed report
+// gmail:true, granted:false until the user reconnects (googleReconnect in
+// calendarApi upgrades the scopes for the whole account).
+export async function googleTasksAccess(accountId) {
+  try {
+    const res = await fetch(apiUrl(`/api/google/${accountId}/tasks-access`))
+    if (!res.ok) return { gmail: false, configured: false, granted: false }
+    return res.json()
+  } catch {
+    return { gmail: false, configured: false, granted: false }
+  }
+}
+
+// ── Tasks sync backend preference ──
+// Which backend the account uses: '', 'google', 'caldav' or 'local'.
+export async function getTasksBackend(accountId) {
+  try {
+    const res = await fetch(apiUrl(`/api/tasks/${accountId}/backend`))
+    if (!res.ok) return { backend: '' }
+    return res.json()
+  } catch {
+    return { backend: '' }
+  }
+}
+
+export async function setTasksBackend(accountId, backend) {
+  const res = await fetch(apiUrl(`/api/tasks/${accountId}/backend`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backend }),
+  })
+  return jsonOrThrow(res)
+}
+
+// ── CalDAV (VTODO) ──
+// Tasks ride on the account's CalDAV connection — the same URL/credentials the
+// Calendar tab configures, so caldavStatus/caldavGetConfig/caldavSetConfig live in
+// calendarApi.js and are re-exported here for the Todo tab's convenience.
+export { caldavGetConfig, caldavSetConfig, caldavStatus } from './calendarApi.js'
+
+export async function caldavSyncTasks(accountId) {
+  const res = await fetch(apiUrl(`/api/tasks/${accountId}/caldav-sync`), { method: 'POST' })
+  return jsonOrThrow(res)
+}
