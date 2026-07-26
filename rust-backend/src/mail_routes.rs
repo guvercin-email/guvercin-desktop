@@ -60,7 +60,7 @@ pub async fn post_import_preview(
             raw.len() >= MAGIC.len() && raw[..MAGIC.len()] == MAGIC
         }
 
-        // Guvercin currently exports "MSG" as RFC822 raw bytes (IMAP raw), not a real CFB .msg file.
+        // guvercin currently exports "MSG" as RFC822 raw bytes (IMAP raw), not a real CFB .msg file.
         // Only try the .msg parser if the file looks like a real CFB container; otherwise treat as RFC822.
         if !looks_like_cfb(&raw) {
             imap_session::parse_mail_content_with_attachment_data(import_id.clone(), &raw)
@@ -243,7 +243,7 @@ pub async fn get_proxy_image(
 
     let response = match client
         .get(url)
-        .header(reqwest::header::USER_AGENT, "Guvercin/1.0")
+        .header(reqwest::header::USER_AGENT, "guvercin/1.0")
         .send()
         .await
     {

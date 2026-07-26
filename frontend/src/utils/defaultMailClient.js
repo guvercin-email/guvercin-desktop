@@ -1,4 +1,4 @@
-// Helpers for making Guvercin the OS default `mailto:` handler.
+// Helpers for making guvercin the OS default `mailto:` handler.
 // Backed by macOS LaunchServices via Tauri commands; safe no-ops elsewhere.
 
 const PROMPT_FLAG = 'default_mail_prompt_shown'

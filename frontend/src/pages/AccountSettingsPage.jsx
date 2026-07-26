@@ -173,8 +173,8 @@ function AccountSettingsPage() {
                             <h4 className="asp-advanced-title">{t('Default Email App')}</h4>
                             <p className="asp-advanced-description">
                                 {isDefaultMail
-                                    ? t('Guvercin is your default email app. Email links (mailto:) open in Guvercin.')
-                                    : t('Make Guvercin your default email app so email links (mailto:) open in Guvercin.')}
+                                    ? t('guvercin is your default email app. Email links (mailto:) open in guvercin.')
+                                    : t('Make guvercin your default email app so email links (mailto:) open in guvercin.')}
                             </p>
                             <button
                                 type="button"

@@ -149,7 +149,7 @@ function showFatalOverlay(title, details) {
     overlay.style.overflow = 'auto'
 
     const heading = document.createElement('div')
-    heading.textContent = `Guvercin UI error: ${title || 'Unknown error'}`
+    heading.textContent = `guvercin UI error: ${title || 'Unknown error'}`
     heading.style.fontSize = '14px'
     heading.style.fontWeight = '700'
     heading.style.marginBottom = '12px'

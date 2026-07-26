@@ -1,6 +1,6 @@
 # Fonts
 
-Guvercin ships with **Hanken Grotesk** (`HankenGrotesk-latin.woff2`, `HankenGrotesk-latin-ext.woff2`) as its default typeface — SIL Open Font License, free to use and redistribute.
+guvercin ships with **Hanken Grotesk** (`HankenGrotesk-latin.woff2`, `HankenGrotesk-latin-ext.woff2`) as its default typeface — SIL Open Font License, free to use and redistribute.
 
 ## Using a different font locally
 

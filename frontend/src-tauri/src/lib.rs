@@ -206,7 +206,7 @@ fn register_context_menu_windows() -> Result<(), String> {
 $regPath = 'Registry::HKEY_CLASSES_ROOT\*\shell\GuvercinSend'
 $cmdPath = '$regPath\command'
 New-Item -Path $regPath -Force | Out-Null
-New-ItemProperty -Path $regPath -Name '(Default)' -Value 'Guvercin ile Gönder' -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $regPath -Name '(Default)' -Value 'guvercin ile Gönder' -PropertyType String -Force | Out-Null
 New-Item -Path $cmdPath -Force | Out-Null
 New-ItemProperty -Path $cmdPath -Name '(Default)' -Value '\"{}\" --file-attachment \"%1\"' -PropertyType String -Force | Out-Null
 ""#,
@@ -245,7 +245,7 @@ fn register_context_menu_linux() -> Result<(), String> {
   fs::create_dir_all(&nautilus_dir).map_err(|e| e.to_string())?;
 
   let nautilus_script = "#!/bin/bash\nfor file in $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS; do\n    encoded_path=$(printf %s \"$file\" | sed 's/ /%20/g;s/&/%26/g;s/?/%3F/g')\n    xdg-open \"guvercin://attach-file?path=$encoded_path\" &\ndone\n";
-  let nautilus_path = nautilus_dir.join("Send with Guvercin");
+  let nautilus_path = nautilus_dir.join("Send with guvercin");
   fs::write(&nautilus_path, nautilus_script).map_err(|e| e.to_string())?;
 
   use std::os::unix::fs::PermissionsExt;
@@ -256,7 +256,7 @@ fn register_context_menu_linux() -> Result<(), String> {
   let kde_dir = PathBuf::from(&home).join(".local/share/kio/servicemenus");
   fs::create_dir_all(&kde_dir).map_err(|e| e.to_string())?;
 
-  let kde_service = "[Desktop Entry]\nType=Service\nServiceTypes=KonqPopupMenu/Plugin\nMimeTypes=all/all\nActions=SendWithGuvercin\n\n[Desktop Action SendWithGuvercin]\nName=Send with Guvercin\nExec=sh -c 'xdg-open \"guvercin://attach-file?path=%f\"'\nIcon=mail\n";
+  let kde_service = "[Desktop Entry]\nType=Service\nServiceTypes=KonqPopupMenu/Plugin\nMimeTypes=all/all\nActions=SendWithGuvercin\n\n[Desktop Action SendWithGuvercin]\nName=Send with guvercin\nExec=sh -c 'xdg-open \"guvercin://attach-file?path=%f\"'\nIcon=mail\n";
   let kde_path = kde_dir.join("guvercin-attach.desktop");
   fs::write(&kde_path, kde_service).map_err(|e| e.to_string())?;
 
@@ -309,7 +309,7 @@ async fn open_mail_window(
     &label,
     WebviewUrl::App(PathBuf::from("index.html")),
   )
-  .title("Guvercin - Mail")
+  .title("guvercin - Mail")
   .initialization_script(init_script)
   .visible(true)
   // Use a sensible default size for detached mail windows and a comfortable
@@ -417,7 +417,7 @@ async fn attach_file_to_compose(
   )
   .await;
 
-  // The "Send with Guvercin" flow is initiated from Finder, not the app, so the
+  // The "Send with guvercin" flow is initiated from Finder, not the app, so the
   // user wants just the compose window — hide the main window (only the window,
   // not the whole app, so the compose window keeps focus on macOS).
   if let Some(main) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -465,7 +465,7 @@ async fn open_compose_window(
     &label,
     WebviewUrl::App(PathBuf::from("index.html")),
   )
-  .title("Guvercin - Compose")
+  .title("guvercin - Compose")
   .initialization_script(init_script)
   .visible(true)
   .inner_size(800.0, 650.0)
@@ -805,9 +805,9 @@ fn set_unread_badge(app: tauri::AppHandle, count: u32) -> Result<(), String> {
 
   if let Some(tray) = app.tray_by_id(TRAY_ID) {
     let tooltip = if count == 0 {
-      "Guvercin".to_string()
+      "guvercin".to_string()
     } else {
-      format!("Guvercin — {count} unread")
+      format!("guvercin — {count} unread")
     };
     let _ = tray.set_tooltip(Some(tooltip));
   }
@@ -956,7 +956,7 @@ fn installed_app_path() -> Option<PathBuf> {
   let exe = std::env::current_exe().ok()?;
   #[cfg(target_os = "macos")]
   {
-    // …/Guvercin.app/Contents/MacOS/guvercin -> …/Guvercin.app
+    // …/guvercin.app/Contents/MacOS/guvercin -> …/guvercin.app
     let bundle = exe.parent()?.parent()?.parent()?;
     if bundle.extension().and_then(|e| e.to_str()) == Some("app") {
       return Some(bundle.to_path_buf());
@@ -1089,7 +1089,7 @@ pub fn run() {
       // background (see the close-to-tray handler below). Left-clicking the icon
       // restores the window; the context menu offers quick actions.
       {
-        let show_i = MenuItem::with_id(app, "show", "Show Guvercin", true, None::<&str>)?;
+        let show_i = MenuItem::with_id(app, "show", "Show guvercin", true, None::<&str>)?;
         let compose_i = MenuItem::with_id(app, "compose", "New Mail", true, None::<&str>)?;
         let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
         let sep = PredefinedMenuItem::separator(app)?;
@@ -1097,7 +1097,7 @@ pub fn run() {
         let menu = Menu::with_items(app, &[&show_i, &compose_i, &settings_i, &sep, &quit_i])?;
 
         let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
-          .tooltip("Guvercin")
+          .tooltip("guvercin")
           .menu(&menu)
           .show_menu_on_left_click(false)
           .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1223,7 +1223,7 @@ pub fn run() {
         #[cfg(target_os = "linux")]
         let _ = register_context_menu_linux().and_then(|_| context_menu_store.mark_registered());
 
-        // macOS context menu registration is not needed - user can drag files to Guvercin or use URI scheme
+        // macOS context menu registration is not needed - user can drag files to guvercin or use URI scheme
         #[cfg(target_os = "macos")]
         let _ = context_menu_store.mark_registered();
       }
@@ -1254,7 +1254,7 @@ pub fn run() {
               Err(rust_backend::error::AppError::KeyringDenied(_)) => {
                 log::warn!("Keyring access denied; prompting user to retry or quit");
                 let confirmed = _app_handle.dialog()
-                  .message("Access to the secure storage was denied. Guvercin needs this access to protect your account data.")
+                  .message("Access to the secure storage was denied. guvercin needs this access to protect your account data.")
                   .title("Keyring Access Required")
                   .kind(MessageDialogKind::Warning)
                   .buttons(MessageDialogButtons::OkCancelCustom("Retry".to_string(), "Quit".to_string()))

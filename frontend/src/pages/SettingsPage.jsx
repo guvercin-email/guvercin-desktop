@@ -3314,7 +3314,7 @@ function GeneralBehaviorSettings({ searchQuery = '' }) {
             <div className="sp-toggle-row">
                 <div className="sp-toggle-row__info">
                     <span className="sp-toggle-row__label"><HighlightMatch text="Launch at login" query={searchQuery} /></span>
-                    <span className="sp-toggle-row__sub"><HighlightMatch text="Start Guvercin automatically when you log in" query={searchQuery} /></span>
+                    <span className="sp-toggle-row__sub"><HighlightMatch text="Start guvercin automatically when you log in" query={searchQuery} /></span>
                 </div>
                 {launchLoading ? (
                     <div className="sp-spinner" style={{ width: 24, height: 24 }} />
@@ -4137,7 +4137,7 @@ function AccountsSettings({ accountId, searchQuery = '' }) {
         <div className="sp-section">
             <h2 className="sp-section__title"><HighlightMatch text="Accounts" query={searchQuery} /></h2>
             <p className="sp-section__desc">
-                Manage the mail accounts registered in Güvercin — switch between them, sign out, add another, or remove an account and its local data.
+                Manage the mail accounts registered in guvercin — switch between them, sign out, add another, or remove an account and its local data.
             </p>
 
             {loading ? (
@@ -4275,7 +4275,7 @@ function UninstallSettings({ searchQuery = '' }) {
             <h2 className="sp-section__title"><HighlightMatch text="Uninstall" query={searchQuery} /></h2>
             <p className="sp-section__desc">
                 <HighlightMatch
-                    text="Removes Güvercin from this computer. You choose separately whether your local data — accounts, cached mail and settings — is erased or kept for a future reinstall."
+                    text="Removes guvercin from this computer. You choose separately whether your local data — accounts, cached mail and settings — is erased or kept for a future reinstall."
                     query={searchQuery}
                 />
             </p>
@@ -4287,7 +4287,7 @@ function UninstallSettings({ searchQuery = '' }) {
                     onClick={openConfirm}
                     disabled={busy || !isTauri}
                 >
-                    {busy ? 'Uninstalling…' : 'Uninstall Güvercin'}
+                    {busy ? 'Uninstalling…' : 'Uninstall guvercin'}
                 </button>
             </div>
             {!isTauri && (
@@ -4301,9 +4301,9 @@ function UninstallSettings({ searchQuery = '' }) {
                         onClick={(e) => e.stopPropagation()}
                     >
                         <div className="sp-confirm-box__body">
-                            <h3 className="sp-confirm-box__title">Uninstall Güvercin</h3>
+                            <h3 className="sp-confirm-box__title">Uninstall guvercin</h3>
                             <p className="sp-confirm-box__desc">
-                                The application will be removed from this computer and Güvercin will close.
+                                The application will be removed from this computer and guvercin will close.
                             </p>
 
                             <label className="sp-radio-label" style={{ marginTop: 12 }}>

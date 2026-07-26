@@ -484,7 +484,7 @@ async fn accept_redirect(listener: TcpListener) -> Result<(String, String), Stri
             (Some(code), Some(state)) => {
                 let _ = respond(
                     &mut stream,
-                    "Signed in to Güvercin. You can close this tab and return to the app.",
+                    "Signed in to guvercin. You can close this tab and return to the app.",
                 )
                 .await;
                 return Ok((code, state));
@@ -500,7 +500,7 @@ async fn accept_redirect(listener: TcpListener) -> Result<(String, String), Stri
 async fn respond(stream: &mut tokio::net::TcpStream, message: &str) -> std::io::Result<()> {
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <title>Güvercin</title></head>\
+         <title>guvercin</title></head>\
          <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:48px;color:#333\">\
          <h2>{message}</h2></body></html>"
     );

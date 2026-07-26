@@ -23,7 +23,7 @@ fn email_domain(email: &str) -> Option<String> {
 fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("Guvercin/1.0 (avatar resolver)")
+        .user_agent("guvercin/1.0 (avatar resolver)")
         .build()
 }
 

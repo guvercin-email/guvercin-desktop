@@ -20,7 +20,7 @@ function safeParse(json) {
     }
 }
 
-// The context-menu ("Send with Guvercin") attach flow opens this window with no
+// The context-menu ("Send with guvercin") attach flow opens this window with no
 // account context — the Rust side doesn't know which account is active. All
 // windows share the same origin, so the active account persisted in
 // localStorage by the main window is readable here.

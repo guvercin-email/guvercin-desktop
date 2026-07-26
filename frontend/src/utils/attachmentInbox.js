@@ -1,6 +1,6 @@
 // Bridges OS-level `guvercin://attach-file` deep links to the compose UI.
 //
-// When a user selects "Send with Guvercin" from the context menu, the OS
+// When a user selects "Send with guvercin" from the context menu, the OS
 // calls the app with a guvercin://attach-file?path=<path> URI. This module
 // listens for these URIs and queues file attachment requests for the compose UI.
 

@@ -115,7 +115,7 @@ export async function notifyNewMail(mail, options = {}) {
     const subject = (mail.subject || '').toString().trim() || '(no subject)'
     const notification = showPreview
       ? { title: sender, body: subject }
-      : { title: 'Guvercin', body: 'You have new mail' }
+      : { title: 'guvercin', body: 'You have new mail' }
     if (withSound) notification.sound = 'default'
     if (mail.id != null) notification.id = notificationIdForMail(mail.id)
     sendNotification(notification)

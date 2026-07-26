@@ -9,7 +9,7 @@ use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
-pub const KEYRING_PROMPT: &str = "Guvercin needs access to its encryption key.";
+pub const KEYRING_PROMPT: &str = "guvercin needs access to its encryption key.";
 const MASTER_KEY_LEN: usize = 32;
 
 const FILE_MAGIC: &[u8; 5] = b"GVCN1";

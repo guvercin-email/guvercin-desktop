@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Guvercin",
+        "title": "guvercin",
         "width": 1000,
         "height": 700,
         "minWidth": 850,

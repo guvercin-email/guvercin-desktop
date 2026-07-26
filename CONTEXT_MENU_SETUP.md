@@ -1,27 +1,27 @@
-# Context Menu Integration for Guvercin
+# Context Menu Integration for guvercin
 
-Bu özellik, kullanıcıların herhangi bir dosyaya sağ tıklayarak "Guvercin ile Gönder" seçeneğini görmelerini sağlar. Bu sayede dosyayı doğrudan mail olarak göndermek için compose penceresi açılır.
+Bu özellik, kullanıcıların herhangi bir dosyaya sağ tıklayarak "guvercin ile Gönder" seçeneğini görmelerini sağlar. Bu sayede dosyayı doğrudan mail olarak göndermek için compose penceresi açılır.
 
 ## Otomatik Kurulum ✨
 
-**Windows & Linux**: Otomatik! Guvercin ilk kez çalıştığında, context menu kayıt edilir:
+**Windows & Linux**: Otomatik! guvercin ilk kez çalıştığında, context menu kayıt edilir:
 - **Windows**: Registry'ye otomatik eklenir
 - **Linux**: Nautilus ve KDE menülerine otomatik eklenir
 
 **macOS**: Context menu yerine Drag & Drop veya "Open With" kullan:
-- Dosyayı Guvercin window'una sürükleyin, VEYA
-- Sağ tıkla → "Open With..." → Guvercin seç
+- Dosyayı guvercin window'una sürükleyin, VEYA
+- Sağ tıkla → "Open With..." → guvercin seç
 
 Uygulama sadece açın, kapayın, başını kaldırmayın - hepsi oldu! 🎉
 
 ## Dosya Ekleme Yolları
 
 ### Windows & Linux
-1. **Context Menu**: Sağ tıkla → "Guvercin ile Gönder" (otomatik)
+1. **Context Menu**: Sağ tıkla → "guvercin ile Gönder" (otomatik)
 
 ### macOS
-1. **Drag & Drop**: Dosyayı Guvercin'e sürükle
-2. **Open With**: Sağ tıkla → "Open With..." → Guvercin
+1. **Drag & Drop**: Dosyayı guvercin'e sürükle
+2. **Open With**: Sağ tıkla → "Open With..." → guvercin
 3. **URI Scheme**: Terminal'den `open guvercin://attach-file?path=/path/to/file`
 
 ## Teknik Detaylar
@@ -37,7 +37,7 @@ Uygulama sadece açın, kapayın, başını kaldırmayın - hepsi oldu! 🎉
 - Command: `guvercin.exe --file-attachment "<path>"`
 
 #### Linux
-- Nautilus script otomatik olarak oluşturulur: `~/.local/share/nautilus/scripts/Send with Guvercin`
+- Nautilus script otomatik olarak oluşturulur: `~/.local/share/nautilus/scripts/Send with guvercin`
 - KDE service menu otomatik olarak oluşturulur: `~/.local/share/kio/servicemenus/guvercin-attach.desktop`
 - URI: `xdg-open "guvercin://attach-file?path=<encoded_path>"`
 
@@ -71,7 +71,7 @@ reg delete "HKEY_CLASSES_ROOT\*\shell\GuvercinSend" /f
 ### Linux
 ```bash
 # Scripts ve service menu'ü kaldır
-rm ~/.local/share/nautilus/scripts/"Send with Guvercin"
+rm ~/.local/share/nautilus/scripts/"Send with guvercin"
 rm ~/.local/share/kio/servicemenus/guvercin-attach.desktop
 ```
 
@@ -80,19 +80,19 @@ rm ~/.local/share/kio/servicemenus/guvercin-attach.desktop
 ### Linux
 - Konteks menüsü görünmüyor
   - File manager'ı yeniden başlatın
-  - Guvercin'i kapatıp yeniden açın (otomatik registration tetiklenecek)
+  - guvercin'i kapatıp yeniden açın (otomatik registration tetiklenecek)
 
 ### Tüm Platformlar
 - Context menu hala kayıtlı değilse:
-  - Guvercin'in uygulama verilerine yazma izni olduğundan emin olun
+  - guvercin'in uygulama verilerine yazma izni olduğundan emin olun
   - `~/.guvercin` veya `~/.config/guvercin` klasörü silin
   - Uygulamayı yeniden başlatın
 
 ## Güvenlik Notları
 
-- ✅ Yalnızca Guvercin URI scheme'i kabul edilir
+- ✅ Yalnızca guvercin URI scheme'i kabul edilir
 - ✅ Dosya yolu URL-encoded olur (special karakterler güvenli)
-- ✅ Guvercin process'i sadece gerçek dosyaları okur
+- ✅ guvercin process'i sadece gerçek dosyaları okur
 - ✅ Rastgele dosya okuma engellenir
 
 ## Supported File Types

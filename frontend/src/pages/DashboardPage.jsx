@@ -2812,7 +2812,7 @@ const DashboardPage = () => {
                         variant. CSS picks one per theme. */}
                     <img
                         src="/img/logo/guvercin-notext-nobackground-light.svg"
-                        alt="Guvercin"
+                        alt="guvercin"
                         className="db-logo-img db-logo-img--light"
                     />
                     <img
@@ -4280,7 +4280,7 @@ function MailSection({
         return unsubscribe
     }, [accountId, accountEmail, openInlineCompose])
 
-    // First-launch prompt: offer to make Guvercin the default mail app. Shown
+    // First-launch prompt: offer to make guvercin the default mail app. Shown
     // once ever (tracked in localStorage), and only if we aren't already the
     // default. Uses the native dialog so it works before any UI is drawn.
     useEffect(() => {
@@ -4295,7 +4295,7 @@ function MailSection({
             try {
                 const { ask } = await import('@tauri-apps/plugin-dialog')
                 const confirmed = await ask(
-                    t('Would you like to make Guvercin your default email app?'),
+                    t('Would you like to make guvercin your default email app?'),
                     { title: t('Default Email App'), kind: 'info', okLabel: t('Yes'), cancelLabel: t('No') },
                 )
                 markDefaultPromptShown()
@@ -8147,7 +8147,7 @@ function MailSection({
                             <div className="db-right-panel">
                                 {!hasMailSource ? (
                                     <div className="db-empty-state" style={{ paddingTop: 100 }}>
-                                        <div className="db-empty-icon"><img src="/img/logo/guvercin-notext-nobackground.svg" alt="Guvercin" className="db-empty-logo-img" /></div>
+                                        <div className="db-empty-icon"><img src="/img/logo/guvercin-notext-nobackground.svg" alt="guvercin" className="db-empty-logo-img" /></div>
                                         <div className="db-empty-text">
                                             {connecting
                                                 ? 'Connecting...'
@@ -8256,7 +8256,7 @@ function MailSection({
                                     </div>
                                 ) : !selectedMail ? (
                                     <div className="db-empty-state">
-                                        <div className="db-empty-icon"><img src="/img/logo/guvercin-notext-nobackground.svg" alt="Guvercin" className="db-empty-logo-img" /></div>
+                                        <div className="db-empty-icon"><img src="/img/logo/guvercin-notext-nobackground.svg" alt="guvercin" className="db-empty-logo-img" /></div>
                                         <div className="db-empty-text">Select an email</div>
                                     </div>
                                 ) : loadingContent ? (

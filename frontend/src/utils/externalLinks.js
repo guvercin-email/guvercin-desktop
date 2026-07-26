@@ -69,6 +69,27 @@ export function getUrlDomain(url) {
  * The link interceptor (installIframeLinkInterceptor) reads from
  * data-external-href to present the open/copy prompt.
  */
+// Resolve the app's current text color so mail rendered in the
+// sandboxed iframe inherits a readable color for the active theme.
+// Guarded for non-browser (unit test) environments.
+function readThemeCanvas() {
+  const fallback = { textColor: '#1a1a1a' }
+  try {
+    if (typeof document === 'undefined' || !document.documentElement) return fallback
+    const root = document.documentElement
+    const themeName = (root.dataset.theme || '').toLowerCase()
+    let isDark
+    if (themeName.includes('dark')) isDark = true
+    else if (themeName.includes('light')) isDark = false
+    else isDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    const text = getComputedStyle(root).getPropertyValue('--c-text-1').trim()
+    const textColor = text || (isDark ? '#e8e8e8' : '#1a1a1a')
+    return { textColor }
+  } catch {
+    return fallback
+  }
+}
+
 export function sanitizeMailHtml(html) {
   if (!html) return html
   try {
@@ -243,6 +264,28 @@ export function sanitizeMailHtml(html) {
       // the fallback src is always used reliably.
       img.removeAttribute('srcset')
     })
+
+    // ── Blend mail into the current theme ──────────────────────────
+    // Emails render in a sandboxed iframe. Whatever background the message
+    // hardcodes (or the UA canvas default) paints a box that stands out
+    // from the app — and forcing color-scheme:dark makes the canvas solid
+    // black, which is the same problem. Instead make the whole document
+    // transparent so the app's real background shows straight through, and
+    // force every element to the app's text color so the message stays
+    // readable in the active theme. color-scheme:normal keeps the UA from
+    // repainting an opaque canvas behind the transparent document.
+    const { textColor } = readThemeCanvas()
+    let head = doc.head
+    if (!head) {
+      head = doc.createElement('head')
+      doc.documentElement.insertBefore(head, doc.documentElement.firstChild)
+    }
+    const baseStyle = doc.createElement('style')
+    baseStyle.textContent =
+      'html,body{color-scheme:normal !important;background:transparent !important}' +
+      `html,body,body *{background-color:transparent !important;background-image:none !important;color:${textColor} !important}` +
+      'a,a *{color:inherit !important;text-decoration:underline}'
+    head.appendChild(baseStyle)
 
     // Serialize back — use the full document including <html>/<head>/<body>
     // so styles/meta are preserved

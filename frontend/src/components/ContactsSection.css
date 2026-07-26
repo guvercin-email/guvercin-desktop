@@ -250,7 +250,6 @@
 
 /* Welcome */
 .cs-welcome { margin: auto; max-width: 460px; text-align: center; padding: 40px 24px; }
-.cs-welcome-icon { font-size: 48px; margin-bottom: 8px; }
 .cs-welcome h2 { margin: 6px 0; font-size: 22px; }
 .cs-welcome p { color: var(--c-text-2); margin-bottom: 16px; }
 

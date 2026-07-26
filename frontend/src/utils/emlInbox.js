@@ -1,7 +1,7 @@
 // Bridges OS-level file associations (`.eml` / `.msg`) to the mail viewer.
 //
 // When the user double-clicks a message file, the OS launches (or re-focuses)
-// Guvercin and hands it the file. macOS delivers this as a `file://` deep link;
+// guvercin and hands it the file. macOS delivers this as a `file://` deep link;
 // Windows/Linux pass the path as a launch argument that the deep-link plugin
 // surfaces the same way. Like mailto links these can arrive during a cold start
 // before an account is active, so paths are buffered in a queue and drained by
