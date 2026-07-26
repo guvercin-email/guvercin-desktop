@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { EditorState, TextSelection } from 'prosemirror-state'
 import { EditorView } from 'prosemirror-view'
 import { Schema, DOMParser as PmDOMParser, DOMSerializer } from 'prosemirror-model'
@@ -287,6 +288,7 @@ export default function ComposeEditor({
     toolbarVisible = true,
     onInlineImageFilesSelected,
 }) {
+    const { t } = useTranslation()
     const editorRef = useRef(null)
     const viewRef = useRef(null)
     const [editorState, setEditorState] = useState(null)
@@ -678,13 +680,13 @@ export default function ComposeEditor({
                 <div className="ce-toolbar">
                 {/* Undo / Redo */}
                 <div className="ce-toolbar-group">
-                    <button type="button" onClick={() => exec(undo)} title="Geri Al">↩</button>
-                    <button type="button" onClick={() => exec(redo)} title="Yinele">↪</button>
+                    <button type="button" onClick={() => exec(undo)} title={t('Undo')}>↩</button>
+                    <button type="button" onClick={() => exec(redo)} title={t('Redo')}>↪</button>
                 </div>
 
                 {/* Font family */}
                 <div className="ce-toolbar-group">
-                    <select value={currentFontFamily} onChange={handleFontFamily} title="Yazı Tipi">
+                    <select value={currentFontFamily} onChange={handleFontFamily} title={t('Font Family')}>
                         <option value="sans-serif">Sans Serif</option>
                         <option value="Arial, sans-serif">Arial</option>
                         <option value="'Aptos', sans-serif">Aptos</option>
@@ -698,7 +700,7 @@ export default function ComposeEditor({
 
                 {/* Font size */}
                 <div className="ce-toolbar-group">
-                    <select value={currentFontSize} onChange={handleFontSize} title="Yazı Boyutu">
+                    <select value={currentFontSize} onChange={handleFontSize} title={t('Font Size')}>
                         <option value="10px">10</option>
                         <option value="11px">11</option>
                         <option value="12px">12</option>
@@ -720,45 +722,45 @@ export default function ComposeEditor({
                         className={isMarkActive(schema.marks.strong) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.strong)}
-                        title="Kalın"
+                        title={t('Bold')}
                     ><b>B</b></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.em) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.em)}
-                        title="İtalik"
+                        title={t('Italic')}
                     ><i>I</i></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.underline) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.underline)}
-                        title="Altı Çizili"
+                        title={t('Underline')}
                     ><u>U</u></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.strikethrough) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.strikethrough)}
-                        title="Üstü Çizili"
+                        title={t('Strikethrough')}
                     ><s>S</s></button>
                 </div>
 
                 {/* Text color & Highlight */}
                 <div className="ce-toolbar-group">
                     <div className="ce-color-wrap">
-                        <button type="button" onMouseDown={(e) => e.preventDefault()} title="Metin Rengi" style={{ color: currentTextColor }}>A</button>
-                        <input type="color" value={currentTextColor} onChange={handleTextColor} title="Metin Rengi" />
+                        <button type="button" onMouseDown={(e) => e.preventDefault()} title={t('Text Color')} style={{ color: currentTextColor }}>A</button>
+                        <input type="color" value={currentTextColor} onChange={handleTextColor} title={t('Text Color')} />
                     </div>
                     <div className="ce-color-wrap">
-                        <button type="button" onMouseDown={(e) => e.preventDefault()} title="Vurgu Rengi" style={{ backgroundColor: currentHighlight, color: '#333' }}>🖍</button>
-                        <input type="color" value={currentHighlight} onChange={handleHighlight} title="Vurgu Rengi" />
+                        <button type="button" onMouseDown={(e) => e.preventDefault()} title={t('Highlight Color')} style={{ backgroundColor: currentHighlight, color: '#333' }}>🖍</button>
+                        <input type="color" value={currentHighlight} onChange={handleHighlight} title={t('Highlight Color')} />
                     </div>
                 </div>
 
                 {/* Alignment */}
                 <div className="ce-toolbar-group">
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('left')} title="Sola Hizala">⫷</button>
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('center')} title="Ortala">☰</button>
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('right')} title="Sağa Hizala">⫸</button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('left')} title={t('Align Left')}>⫷</button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('center')} title={t('Center')}>☰</button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('right')} title={t('Align Right')}>⫸</button>
                 </div>
 
                 {/* Lists */}
@@ -766,12 +768,12 @@ export default function ComposeEditor({
                     <button type="button"
                         onClick={() => exec(wrapInList(schema.nodes.ordered_list))}
                         onMouseDown={(e) => e.preventDefault()}
-                        title="Numaralı Liste"
+                        title={t('Numbered List')}
                     >1.</button>
                     <button type="button"
                         onClick={() => exec(wrapInList(schema.nodes.bullet_list))}
                         onMouseDown={(e) => e.preventDefault()}
-                        title="Madde İşaretli Liste"
+                        title={t('Bullet List')}
                     >•</button>
                 </div>
 
@@ -780,12 +782,12 @@ export default function ComposeEditor({
                     <button type="button"
                         onClick={() => exec(liftListItem(schema.nodes.list_item))}
                         onMouseDown={(e) => e.preventDefault()}
-                        title="Girintiyi Azalt"
+                        title={t('Decrease Indent')}
                     >⇤</button>
                     <button type="button"
                         onClick={() => exec(sinkListItem(schema.nodes.list_item))}
                         onMouseDown={(e) => e.preventDefault()}
-                        title="Girintiyi Artır"
+                        title={t('Increase Indent')}
                     >⇥</button>
                 </div>
 
@@ -794,7 +796,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onClick={() => exec(wrapIn(schema.nodes.blockquote))}
                         onMouseDown={(e) => e.preventDefault()}
-                        title="Alıntı"
+                        title={t('Quote')}
                     >❝</button>
                 </div>
 
@@ -810,7 +812,7 @@ export default function ComposeEditor({
                                 setShowLink(!showLink)
                             }
                         }}
-                        title="Bağlantı Ekle"
+                        title={t('Insert Link')}
                     >🔗</button>
                     {showLink && (
                         <div className="ce-link-dialog">
@@ -824,14 +826,14 @@ export default function ComposeEditor({
                             />
                             <input
                                 type="text"
-                                placeholder="Link başlığı (opsiyonel)"
+                                placeholder={t('Link title (optional)')}
                                 value={linkTitle}
                                 onChange={(e) => setLinkTitle(e.target.value)}
                                 onKeyDown={(e) => e.key === 'Enter' && handleInsertLink()}
                             />
                             <div className="ce-link-dialog-actions">
-                                <button type="button" onClick={() => setShowLink(false)}>İptal</button>
-                                <button type="button" className="primary" onClick={handleInsertLink}>Ekle</button>
+                                <button type="button" onClick={() => setShowLink(false)}>{t('Cancel')}</button>
+                                <button type="button" className="primary" onClick={handleInsertLink}>{t('Add')}</button>
                             </div>
                         </div>
                     )}
@@ -842,7 +844,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setShowEmoji(!showEmoji)}
-                        title="Emoji"
+                        title={t('Emoji')}
                     >😊</button>
                     {showEmoji && (
                         <div className="ce-emoji-popup">
@@ -860,7 +862,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => exec(clearFormatting)}
-                        title="Biçimlendirmeyi Temizle"
+                        title={t('Clear Formatting')}
                     >🧹</button>
                 </div>
 
@@ -869,7 +871,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => exec(changeCaseCommand)}
-                        title="Büyük/Küçük Harf"
+                        title={t('Change Case')}
                     >aA</button>
                 </div>
 
@@ -878,7 +880,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setShowLineSpacing(!showLineSpacing)}
-                        title="Satır Aralığı"
+                        title={t('Line Spacing')}
                     >⇕</button>
                     {showLineSpacing && (
                         <div className="ce-linespacing-popup">
@@ -900,13 +902,13 @@ export default function ComposeEditor({
                         className={isMarkActive(schema.marks.subscript) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.subscript)}
-                        title="Alt Simge"
+                        title={t('Subscript')}
                     >x₂</button>
                     <button type="button"
                         className={isMarkActive(schema.marks.superscript) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.superscript)}
-                        title="Üst Simge"
+                        title={t('Superscript')}
                     >x²</button>
                 </div>
 
@@ -915,7 +917,7 @@ export default function ComposeEditor({
                     <button type="button"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={handleInsertImage}
-                        title="Görsel Ekle"
+                        title={t('Insert Image')}
                     >🖼️</button>
                 </div>
                 </div>

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { getUrlDomain } from '../utils/externalLinks.js'
 import './ExternalLinkPrompt.css'
 
@@ -15,6 +16,7 @@ export default function ExternalLinkPrompt({
   onCancel,
   onSelect,
 }) {
+  const { t } = useTranslation()
   const [remember, setRemember] = useState(false)
   const [rememberDomain, setRememberDomain] = useState(false)
 
@@ -42,7 +44,7 @@ export default function ExternalLinkPrompt({
   return (
     <div className="elp-overlay" role="dialog" aria-modal="true">
       <div className="elp-modal">
-        <div className="elp-title">Bu link ile ne yapılsın?</div>
+        <div className="elp-title">{t('What should be done with this link?')}</div>
         <div className="elp-url" title={url || ''}>{urlLabel}</div>
 
         <div className="elp-remember-container">
@@ -55,7 +57,7 @@ export default function ExternalLinkPrompt({
                 if (e.target.checked) setRememberDomain(false)
               }}
             />
-            Tüm linkler için hatırla
+            {t('Remember for all links')}
           </label>
 
           {domain && (
@@ -68,20 +70,20 @@ export default function ExternalLinkPrompt({
                   if (e.target.checked) setRemember(false)
                 }}
               />
-              Bu site ({domain}) için hatırla
+              {t('Remember for this site')} ({domain})
             </label>
           )}
         </div>
 
         <div className="elp-actions">
           <button type="button" className="elp-btn" onClick={() => onCancel?.()}>
-            İptal
+            {t('Cancel')}
           </button>
           <button type="button" className="elp-btn" onClick={() => onSelect?.('copy', remember, rememberDomain)}>
-            Kopyala
+            {t('Copy')}
           </button>
           <button type="button" className="elp-btn elp-btn-primary" onClick={() => onSelect?.('open', remember, rememberDomain)}>
-            Aç
+            {t('Open')}
           </button>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useComposeEditorContext } from '../context/ComposeEditorContext.jsx'
 import './ComposeFormatTools.css'
 
@@ -40,6 +41,7 @@ const ImageIcon = () => (
  * whatever doesn't fit into a "⋯" overflow menu on the right — no wrapping.
  */
 export default function ComposeFormatTools() {
+    const { t } = useTranslation()
     const ctx = useComposeEditorContext()
     const controller = ctx?.controller || null
     const snapshot = ctx?.snapshot || null
@@ -112,69 +114,69 @@ export default function ComposeFormatTools() {
     // ── Tool groups (each stays intact; overflow moves whole groups) ──
     const groups = [
         <div className="ce-toolbar-group" key="history">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.undo())} title="Geri Al">↶</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.redo())} title="Yinele">↷</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.undo())} title={t('Undo')}>↶</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.redo())} title={t('Redo')}>↷</button>
         </div>,
         <div className="ce-toolbar-group" key="font">
-            <select value={fontFamily} disabled={disabled} onChange={(e) => run(() => controller.setFontFamily(e.target.value))} title="Yazı Tipi">
+            <select value={fontFamily} disabled={disabled} onChange={(e) => run(() => controller.setFontFamily(e.target.value))} title={t('Font Family')}>
                 {FONT_FAMILIES.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
             </select>
         </div>,
         <div className="ce-toolbar-group" key="size">
-            <select value={fontSize} disabled={disabled} onChange={(e) => run(() => controller.setFontSize(e.target.value))} title="Yazı Boyutu">
+            <select value={fontSize} disabled={disabled} onChange={(e) => run(() => controller.setFontSize(e.target.value))} title={t('Font Size')}>
                 {FONT_SIZES.map((s) => <option key={s} value={s}>{parseInt(s, 10)}</option>)}
             </select>
         </div>,
         <div className="ce-toolbar-group" key="marks">
-            <button type="button" disabled={disabled} className={active.strong ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleBold())} title="Kalın"><b>B</b></button>
-            <button type="button" disabled={disabled} className={active.em ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleItalic())} title="İtalik"><i>I</i></button>
-            <button type="button" disabled={disabled} className={active.underline ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleUnderline())} title="Altı Çizili"><u>U</u></button>
-            <button type="button" disabled={disabled} className={active.strikethrough ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleStrike())} title="Üstü Çizili"><s>S</s></button>
+            <button type="button" disabled={disabled} className={active.strong ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleBold())} title={t('Bold')}><b>B</b></button>
+            <button type="button" disabled={disabled} className={active.em ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleItalic())} title={t('Italic')}><i>I</i></button>
+            <button type="button" disabled={disabled} className={active.underline ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleUnderline())} title={t('Underline')}><u>U</u></button>
+            <button type="button" disabled={disabled} className={active.strikethrough ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleStrike())} title={t('Strikethrough')}><s>S</s></button>
         </div>,
         <div className="ce-toolbar-group" key="color">
             <div className="ce-color-wrap">
-                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title="Metin Rengi" style={{ color: textColor }}>A</button>
-                <input type="color" value={textColor} disabled={disabled} onChange={(e) => run(() => controller.setTextColor(e.target.value))} title="Metin Rengi" />
+                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title={t('Text Color')} style={{ color: textColor }}>A</button>
+                <input type="color" value={textColor} disabled={disabled} onChange={(e) => run(() => controller.setTextColor(e.target.value))} title={t('Text Color')} />
             </div>
             <div className="ce-color-wrap">
-                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title="Vurgu Rengi" style={{ color: highlight }}><HighlightIcon /></button>
-                <input type="color" value={highlight} disabled={disabled} onChange={(e) => run(() => controller.setHighlight(e.target.value))} title="Vurgu Rengi" />
+                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title={t('Highlight Color')} style={{ color: highlight }}><HighlightIcon /></button>
+                <input type="color" value={highlight} disabled={disabled} onChange={(e) => run(() => controller.setHighlight(e.target.value))} title={t('Highlight Color')} />
             </div>
         </div>,
         <div className="ce-toolbar-group" key="align">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('left'))} title="Sola Hizala">⯇</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('center'))} title="Ortala">≡</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('right'))} title="Sağa Hizala">⯈</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('left'))} title={t('Align Left')}>⯇</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('center'))} title={t('Center')}>≡</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('right'))} title={t('Align Right')}>⯈</button>
         </div>,
         <div className="ce-toolbar-group" key="lists">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.orderedList())} title="Numaralı Liste">1.</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.bulletList())} title="Madde İşaretli Liste">•</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.orderedList())} title={t('Numbered List')}>1.</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.bulletList())} title={t('Bullet List')}>•</button>
         </div>,
         <div className="ce-toolbar-group" key="indent">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.outdent())} title="Girintiyi Azalt">⇤</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.indent())} title="Girintiyi Artır">⇥</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.outdent())} title={t('Decrease Indent')}>⇤</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.indent())} title={t('Increase Indent')}>⇥</button>
         </div>,
         <div className="ce-toolbar-group" key="quote">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.blockquote())} title="Alıntı">❝</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.blockquote())} title={t('Quote')}>❝</button>
         </div>,
         <div className="ce-toolbar-group" key="link">
-            <button type="button" disabled={disabled} className={`cf-popup-trigger ${active.link ? 'active' : ''}`} onMouseDown={(e) => e.preventDefault()} onClick={openLink} title="Bağlantı Ekle"><LinkIcon /></button>
+            <button type="button" disabled={disabled} className={`cf-popup-trigger ${active.link ? 'active' : ''}`} onMouseDown={(e) => e.preventDefault()} onClick={openLink} title={t('Insert Link')}><LinkIcon /></button>
         </div>,
         <div className="ce-toolbar-group" key="clear">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.clearFormatting())} title="Biçimlendirmeyi Temizle"><EraserIcon /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.clearFormatting())} title={t('Clear Formatting')}><EraserIcon /></button>
         </div>,
         <div className="ce-toolbar-group" key="case">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.changeCase())} title="Büyük/Küçük Harf">aA</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.changeCase())} title={t('Change Case')}>aA</button>
         </div>,
         <div className="ce-toolbar-group" key="spacing">
-            <button type="button" disabled={disabled} className="cf-popup-trigger" onMouseDown={(e) => e.preventDefault()} onClick={openSpacing} title="Satır Aralığı">↕</button>
+            <button type="button" disabled={disabled} className="cf-popup-trigger" onMouseDown={(e) => e.preventDefault()} onClick={openSpacing} title={t('Line Spacing')}>↕</button>
         </div>,
         <div className="ce-toolbar-group" key="script">
-            <button type="button" disabled={disabled} className={active.subscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSubscript())} title="Alt Simge">x₂</button>
-            <button type="button" disabled={disabled} className={active.superscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSuperscript())} title="Üst Simge">x²</button>
+            <button type="button" disabled={disabled} className={active.subscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSubscript())} title={t('Subscript')}>x₂</button>
+            <button type="button" disabled={disabled} className={active.superscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSuperscript())} title={t('Superscript')}>x²</button>
         </div>,
         <div className="ce-toolbar-group" key="image">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.insertImage())} title="Görsel Ekle"><ImageIcon /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.insertImage())} title={t('Insert Image')}><ImageIcon /></button>
         </div>,
     ]
 
@@ -233,7 +235,7 @@ export default function ComposeFormatTools() {
                         className="db-submenu-more-btn cf-popup-trigger"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setMoreOpen((v) => !v)}
-                        title="Daha Fazla"
+                        title={t('More')}
                     >
                         <img src="/img/icons/three-point.svg" className="svg-icon-inline" />
                     </button>
@@ -251,12 +253,12 @@ export default function ComposeFormatTools() {
                     <input type="url" placeholder="https://example.com" value={linkUrl} autoFocus
                         onChange={(e) => setLinkUrl(e.target.value)}
                         onKeyDown={(e) => e.key === 'Enter' && handleInsertLink()} />
-                    <input type="text" placeholder="Link başlığı (opsiyonel)" value={linkTitle}
+                    <input type="text" placeholder={t('Link title (optional)')} value={linkTitle}
                         onChange={(e) => setLinkTitle(e.target.value)}
                         onKeyDown={(e) => e.key === 'Enter' && handleInsertLink()} />
                     <div className="ce-link-dialog-actions">
-                        <button type="button" onClick={() => setLinkPos(null)}>İptal</button>
-                        <button type="button" className="primary" onClick={handleInsertLink}>Ekle</button>
+                        <button type="button" onClick={() => setLinkPos(null)}>{t('Cancel')}</button>
+                        <button type="button" className="primary" onClick={handleInsertLink}>{t('Add')}</button>
                     </div>
                 </div>
             )}
