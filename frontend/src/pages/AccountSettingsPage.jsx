@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { invoke } from '@tauri-apps/api/core'
 import { apiUrl } from '../utils/api'
 import {
     isDefaultMailClient,
@@ -23,10 +22,6 @@ function AccountSettingsPage() {
     const [deletePassword, setDeletePassword] = useState('')
     const [deleteError, setDeleteError] = useState(null)
     const [isDeleting, setIsDeleting] = useState(false)
-
-    // Uninstall state
-    const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
-    const [isUninstalling, setIsUninstalling] = useState(false)
 
     // Default mail client state
     const [isDefaultMail, setIsDefaultMail] = useState(false)
@@ -114,16 +109,6 @@ function AccountSettingsPage() {
         }
     }
 
-    const handleUninstall = async () => {
-        setIsUninstalling(true)
-        try {
-            await invoke('uninstall_app')
-        } catch (err) {
-            console.error('Uninstall error:', err)
-            setIsUninstalling(false)
-        }
-    }
-
     return (
         <div className="account-settings-page">
             <div className="asp-container">
@@ -206,22 +191,6 @@ function AccountSettingsPage() {
                         </div>
                     </section>
 
-                    {/* Advanced Section */}
-                    <section className="asp-section asp-section--advanced">
-                        <h3 className="asp-section-title">{t('Advanced')}</h3>
-                        <div className="asp-advanced-group">
-                            <h4 className="asp-advanced-title">{t('Uninstall Application')}</h4>
-                            <p className="asp-advanced-description">{t('Completely remove Guvercin and all associated data from your computer.')}</p>
-                            <button
-                                type="button"
-                                className="asp-btn-uninstall"
-                                onClick={() => setShowUninstallConfirm(true)}
-                                disabled={isUninstalling}
-                            >
-                                {isUninstalling ? t('Uninstalling...') : t('Uninstall Guvercin')}
-                            </button>
-                        </div>
-                    </section>
                 </div>
             </div>
 
@@ -268,34 +237,6 @@ function AccountSettingsPage() {
                 </div>
             )}
 
-            {showUninstallConfirm && (
-                <div className="asp-modal-overlay">
-                    <div className="asp-modal">
-                        <h3 className="asp-modal-title">{t('Uninstall Guvercin')}</h3>
-                        <p className="asp-modal-warning">
-                            {t('Are you sure you want to uninstall Guvercin?')}
-                            <br/><br/>
-                            {t('This will:')}
-                            <ul style={{ marginTop: '10px', marginLeft: '20px' }}>
-                                <li>{t('Delete the application from your computer')}</li>
-                                <li>{t('Remove all email accounts and data')}</li>
-                                <li>{t('Delete all cached emails and settings')}</li>
-                            </ul>
-                            <br/>
-                            {t('This action cannot be undone.')}
-                        </p>
-
-                        <div className="asp-modal-actions">
-                            <button type="button" className="asp-btn-cancel" onClick={() => setShowUninstallConfirm(false)} disabled={isUninstalling}>
-                                {t('Cancel')}
-                            </button>
-                            <button type="button" className="asp-btn-danger" onClick={handleUninstall} disabled={isUninstalling}>
-                                {isUninstalling ? t('Uninstalling...') : t('Uninstall')}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
         </div>
     )
 }

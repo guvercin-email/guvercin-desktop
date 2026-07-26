@@ -187,6 +187,13 @@ const CATEGORIES = [
             { id: 'encryption', label: 'Encryption', parentId: 'security' },
         ],
     },
+    {
+        id: 'advanced',
+        label: 'Advanced',
+        children: [
+            { id: 'uninstall', label: 'Uninstall', parentId: 'advanced' },
+        ],
+    },
 ]
 
 /** Searchable content per panel (titles, descriptions, labels, keywords). */
@@ -213,6 +220,7 @@ const PANEL_SEARCH_INDEX = {
     links: 'links link click open browser copy clipboard external url mailto tel',
     blocked: 'blocked senders block delete spam archive email addresses automatically moved',
     encryption: 'encryption encrypt stored data sqlite decrypt plaintext AES-256 SQLCipher XChaCha20',
+    uninstall: 'uninstall remove delete app application data local data wipe erase clean reset kaldır sil',
 }
 
 function SearchResultsPage({ filteredCategories, searchQuery, onSelectPanel, onSelectCategory, accountId, onClose, onRefreshAccount, appearance }) {
@@ -4220,6 +4228,131 @@ function AccountsSettings({ accountId, searchQuery = '' }) {
     )
 }
 
+/**
+ * Advanced → Uninstall.
+ *
+ * Removing the app and erasing the user's local data are two different
+ * decisions, so this asks explicitly instead of assuming: keeping the data
+ * means a reinstall picks up the existing accounts and cached mail.
+ */
+function UninstallSettings({ searchQuery = '' }) {
+    const [showConfirm, setShowConfirm] = useState(false)
+    const [deleteData, setDeleteData] = useState(false)
+    const [busy, setBusy] = useState(false)
+    const [dataPaths, setDataPaths] = useState([])
+    const [error, setError] = useState('')
+
+    const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
+    const openConfirm = useCallback(async () => {
+        setError('')
+        setDeleteData(false)
+        setShowConfirm(true)
+        if (!isTauri) return
+        try {
+            const { invoke } = await import('@tauri-apps/api/core')
+            const paths = await invoke('list_user_data_paths')
+            setDataPaths(Array.isArray(paths) ? paths : [])
+        } catch {
+            setDataPaths([])
+        }
+    }, [isTauri])
+
+    const confirmUninstall = useCallback(async () => {
+        setBusy(true)
+        setError('')
+        try {
+            const { invoke } = await import('@tauri-apps/api/core')
+            await invoke('uninstall_app', { deleteData })
+        } catch (err) {
+            setError(err?.message || String(err))
+            setBusy(false)
+        }
+    }, [deleteData])
+
+    return (
+        <div className="sp-section">
+            <h2 className="sp-section__title"><HighlightMatch text="Uninstall" query={searchQuery} /></h2>
+            <p className="sp-section__desc">
+                <HighlightMatch
+                    text="Removes Güvercin from this computer. You choose separately whether your local data — accounts, cached mail and settings — is erased or kept for a future reinstall."
+                    query={searchQuery}
+                />
+            </p>
+
+            <div className="sp-accounts-actions">
+                <button
+                    type="button"
+                    className="sp-confirm-btn sp-confirm-btn--danger"
+                    onClick={openConfirm}
+                    disabled={busy || !isTauri}
+                >
+                    {busy ? 'Uninstalling…' : 'Uninstall Güvercin'}
+                </button>
+            </div>
+            {!isTauri && (
+                <p className="sp-section__desc">Uninstalling is only available in the desktop app.</p>
+            )}
+
+            {showConfirm && (
+                <div className="sp-account-modal-overlay" onClick={() => !busy && setShowConfirm(false)}>
+                    <div
+                        className="sp-confirm-box sp-confirm-box--warn sp-account-modal"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="sp-confirm-box__body">
+                            <h3 className="sp-confirm-box__title">Uninstall Güvercin</h3>
+                            <p className="sp-confirm-box__desc">
+                                The application will be removed from this computer and Güvercin will close.
+                            </p>
+
+                            <label className="sp-radio-label" style={{ marginTop: 12 }}>
+                                <input
+                                    type="checkbox"
+                                    checked={deleteData}
+                                    onChange={(e) => setDeleteData(e.target.checked)}
+                                />
+                                Also delete all my local data (accounts, cached mail, settings)
+                            </label>
+                            <p className="sp-section__desc" style={{ marginTop: 8 }}>
+                                {deleteData
+                                    ? 'Your local data will be permanently erased. This cannot be undone.'
+                                    : 'Your local data stays on this computer, so reinstalling restores your accounts and cached mail.'}
+                            </p>
+
+                            {deleteData && dataPaths.length > 0 && (
+                                <ul className="sp-section__desc" style={{ marginTop: 8, marginLeft: 18 }}>
+                                    {dataPaths.map((p) => <li key={p}><code>{p}</code></li>)}
+                                </ul>
+                            )}
+
+                            {error && <div className="sp-form-message sp-form-message--error">{error}</div>}
+                        </div>
+                        <div className="sp-confirm-box__actions">
+                            <button
+                                type="button"
+                                className="sp-ghost-btn"
+                                onClick={() => setShowConfirm(false)}
+                                disabled={busy}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="sp-confirm-btn sp-confirm-btn--danger"
+                                onClick={confirmUninstall}
+                                disabled={busy}
+                            >
+                                {busy ? 'Uninstalling…' : deleteData ? 'Uninstall and delete data' : 'Uninstall, keep data'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    )
+}
+
 function renderContent(selection, accountId, onClose, onRefreshAccount, searchQuery = '', appearance) {
     if (!selection) return null
 
@@ -4316,6 +4449,7 @@ function renderSinglePanel(id, accountId, onClose, onRefreshAccount, searchQuery
         case 'links': return <LinksSettings key="links" searchQuery={q} />
         case 'blocked': return <BlockedSendersSettings accountId={accountId} key={`blocked-${accountId}`} searchQuery={q} />
         case 'encryption': return <EncryptionSettings searchQuery={q} />
+        case 'uninstall': return <UninstallSettings key="uninstall" searchQuery={q} />
         case 'accounts_manage': return <AccountsSettings accountId={accountId} onClose={onClose} searchQuery={q} />
         default: return null
     }

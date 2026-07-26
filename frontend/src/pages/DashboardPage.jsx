@@ -84,6 +84,19 @@ function normalizeToolbarStyle(value) {
     return TOOLBAR_STYLE_OPTIONS.has(normalized) ? normalized : TOOLBAR_STYLE_DEFAULT
 }
 
+// Requests a close of the window this view runs in. The Rust side turns the
+// request into hide-to-background (see src-tauri/src/lib.rs), so the app keeps
+// syncing mail; outside Tauri this is a no-op.
+async function requestWindowClose() {
+    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+    try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window')
+        await getCurrentWindow().close()
+    } catch {
+        // Tauri API unavailable — nothing to close.
+    }
+}
+
 function resizeIframeToContent(iframe) {
     if (!iframe) return
     try {
@@ -2789,11 +2802,25 @@ const DashboardPage = () => {
                         padding: 0,
                         height: '40px',
                         background: 'transparent',
-                        minWidth: isMainBarVertical ? '0' : '130px',
+                        minWidth: 0,
                         border: 'none'
                     }}
                 >
-                    <img src="/img/logo/guvercin-righttext-background.svg" alt="Guvercin" style={{ height: '100%', width: 'auto', display: 'block' }} />
+                    {/* Two variants of the same mark: the yellow-on-transparent
+                        one reads well on the dark navbar, while the light theme's
+                        navbar is itself yellow, so it needs the gray-bodied
+                        variant. CSS picks one per theme. */}
+                    <img
+                        src="/img/logo/guvercin-notext-nobackground-light.svg"
+                        alt="Guvercin"
+                        className="db-logo-img db-logo-img--light"
+                    />
+                    <img
+                        src="/img/logo/guvercin-notext-nobackground.svg"
+                        alt=""
+                        aria-hidden="true"
+                        className="db-logo-img db-logo-img--dark"
+                    />
                 </button>
                 {!isMailSection ? (
                     // Non-mail workspaces: a live filter over the current page's content.
@@ -3084,10 +3111,6 @@ const DashboardPage = () => {
                                         <button type="button" className="account-popover__action-item" onClick={handleLogout}>
                                             <img src="/img/icons/logout.svg" className="svg-icon-inline account-popover__action-icon" alt="" />
                                             <span>{t('Logout')}</span>
-                                        </button>
-                                        <button type="button" className="account-popover__action-item account-popover__action-item--danger" onClick={() => { closeAccountMenu(); navigate('/account-settings'); }}>
-                                            <img src="/img/icons/delete.svg" className="svg-icon-inline account-popover__action-icon" alt="" />
-                                            <span>{t('Delete Account')}</span>
                                         </button>
                                         <button type="button" className="account-popover__action-item account-popover__action-item--danger" onClick={handleExitApp}>
                                             <img src="/img/icons/close.svg" className="svg-icon-inline account-popover__action-icon" alt="" />
@@ -6595,7 +6618,13 @@ function MailSection({
         add_label: () => { void handleCreateLabelAction() },
         print: () => { window.print() },
         refresh: () => { void syncMailsFromRemote(selectedFolder) },
-        close_tab: () => { if (activeTabId) closeTab({ stopPropagation() {} }, activeTabId) },
+        // Cmd/Ctrl+W closes the focused mail tab; with no tab open it falls
+        // through to the platform meaning of the shortcut and closes the window
+        // itself — the browser-style behaviour of closing the last tab.
+        close_tab: () => {
+            if (activeTabId) closeTab({ stopPropagation() {} }, activeTabId)
+            else void requestWindowClose()
+        },
         toggle_fullscreen: () => toggleMailFullscreen(),
         compose_send: () => {
             if (activeComposeTab) void handleActiveComposeTabSend()

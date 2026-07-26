@@ -282,10 +282,13 @@ async fn open_mail_window(
   };
 
   if let Some(window) = handle.get_webview_window(&label) {
+    log::info!("win[{label}]: mail window already open, showing and focusing it");
     window.show().map_err(|e| e.to_string())?;
     let _ = window.set_focus();
     return Ok(());
   }
+
+  log::info!("win[{label}]: opening detached mail window");
 
   // Store the payload in shared app state so the new window can retrieve it
   // via `get_mail_window_data`. We cannot use localStorage (isolated per webview)
@@ -361,8 +364,12 @@ fn close_mail_window(handle: tauri::AppHandle, label: String) -> Result<(), Stri
     map.remove(&label);
   }
 
-  if let Some(window) = handle.get_webview_window(&label) {
-    let _ = window.close();
+  match handle.get_webview_window(&label) {
+    Some(window) => {
+      log::info!("win[{label}]: closing detached mail window");
+      let _ = window.close();
+    }
+    None => log::info!("win[{label}]: close requested but no such mail window"),
   }
   Ok(())
 }
@@ -386,6 +393,11 @@ async fn attach_file_to_compose(
     .to_string();
 
   let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+  log::info!(
+    "compose: attaching file from Finder: {} ({} bytes)",
+    file_name,
+    bytes.len()
+  );
   let base64_content = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
   let attachment_data = serde_json::json!({
@@ -409,6 +421,7 @@ async fn attach_file_to_compose(
   // user wants just the compose window — hide the main window (only the window,
   // not the whole app, so the compose window keeps focus on macOS).
   if let Some(main) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
+    log::info!("win[{MAIN_WINDOW_LABEL}]: hiding main window behind the attachment compose window");
     let _ = main.hide();
   }
 
@@ -428,10 +441,13 @@ async fn open_compose_window(
   };
 
   if let Some(window) = handle.get_webview_window(&label) {
+    log::info!("win[{label}]: compose window already open, showing and focusing it");
     window.show().map_err(|e| e.to_string())?;
     let _ = window.set_focus();
     return Ok(());
   }
+
+  log::info!("win[{label}]: opening compose window");
 
   {
     let store = handle.state::<ComposeWindowStore>();
@@ -493,8 +509,12 @@ fn close_compose_window(handle: tauri::AppHandle, label: String) -> Result<(), S
   } else {
     label
   };
-  if let Some(window) = handle.get_webview_window(&label) {
-    let _ = window.close();
+  match handle.get_webview_window(&label) {
+    Some(window) => {
+      log::info!("win[{label}]: closing compose window");
+      let _ = window.close();
+    }
+    None => log::info!("win[{label}]: close requested but no such compose window"),
   }
   Ok(())
 }
@@ -751,14 +771,26 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 /// Brings the main window back from the tray: unhides the app (macOS), then
 /// unminimizes, shows and focuses the window.
 fn show_main_window(app: &tauri::AppHandle) {
+  log::info!("win[{MAIN_WINDOW_LABEL}]: restoring main window");
   // On macOS the window is hidden by hiding the whole application (see the
   // close-to-tray handler), so it must be unhidden before the window can show.
   #[cfg(target_os = "macos")]
-  let _ = app.show();
-  if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+  if let Err(e) = app.show() {
+    log::warn!("app: unhide failed: {e}");
+  }
+  match app.get_webview_window(MAIN_WINDOW_LABEL) {
+    Some(window) => {
+      let _ = window.unminimize();
+      if let Err(e) = window.show() {
+        log::warn!("win[{MAIN_WINDOW_LABEL}]: show failed: {e}");
+      }
+      let _ = window.set_focus();
+      log::info!(
+        "win[{MAIN_WINDOW_LABEL}]: restored (visible={:?})",
+        window.is_visible()
+      );
+    }
+    None => log::warn!("win[{MAIN_WINDOW_LABEL}]: cannot restore — main window is gone"),
   }
 }
 
@@ -892,22 +924,111 @@ fn write_user_theme(handle: tauri::AppHandle, name: String, json: String) -> Res
   Ok(())
 }
 
+/// Every directory this app writes user data into. Resolved through Tauri's
+/// path API rather than hardcoded, because the real locations are derived from
+/// the bundle identifier (`com.guvercin.app`) and differ per platform — the
+/// previous hardcoded `~/Library/Application Support/Guvercin` never existed,
+/// which is why uninstalling used to leave all data behind.
+fn user_data_dirs(handle: &tauri::AppHandle) -> Vec<PathBuf> {
+  let path = handle.path();
+  let mut dirs: Vec<PathBuf> = vec![];
+  for dir in [
+    path.app_data_dir(),
+    path.app_local_data_dir(),
+    path.app_config_dir(),
+    path.app_cache_dir(),
+    path.app_log_dir(),
+  ]
+  .into_iter()
+  .flatten()
+  {
+    if !dirs.contains(&dir) {
+      dirs.push(dir);
+    }
+  }
+  dirs
+}
+
+/// Directory of the installed application itself, derived from the running
+/// executable. On macOS that is the enclosing `.app` bundle; elsewhere it is
+/// the directory the executable lives in.
+fn installed_app_path() -> Option<PathBuf> {
+  let exe = std::env::current_exe().ok()?;
+  #[cfg(target_os = "macos")]
+  {
+    // …/Guvercin.app/Contents/MacOS/guvercin -> …/Guvercin.app
+    let bundle = exe.parent()?.parent()?.parent()?;
+    if bundle.extension().and_then(|e| e.to_str()) == Some("app") {
+      return Some(bundle.to_path_buf());
+    }
+    None
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    exe.parent().map(|p| p.to_path_buf())
+  }
+}
+
+/// Lists the user-data directories that currently exist, so the frontend can
+/// tell the user exactly what would be removed before they decide.
 #[tauri::command]
-fn uninstall_app(handle: tauri::AppHandle) -> Result<(), String> {
+fn list_user_data_paths(handle: tauri::AppHandle) -> Vec<String> {
+  user_data_dirs(&handle)
+    .into_iter()
+    .filter(|dir| dir.exists())
+    .map(|dir| dir.to_string_lossy().to_string())
+    .collect()
+}
+
+/// Deletes every user-data directory without touching the installed app.
+#[tauri::command]
+fn delete_user_data(handle: tauri::AppHandle) -> Result<(), String> {
+  let mut failures: Vec<String> = vec![];
+  for dir in user_data_dirs(&handle) {
+    if !dir.exists() {
+      continue;
+    }
+    if let Err(e) = fs::remove_dir_all(&dir) {
+      failures.push(format!("{}: {e}", dir.display()));
+    }
+  }
+  if failures.is_empty() {
+    Ok(())
+  } else {
+    Err(failures.join("; "))
+  }
+}
+
+/// Removes the installed application. `delete_data` decides whether the user's
+/// local data (accounts, cached mail, settings) goes with it — the caller must
+/// ask the user explicitly, since keeping the data lets them reinstall and
+/// continue where they left off.
+#[tauri::command]
+fn uninstall_app(handle: tauri::AppHandle, delete_data: bool) -> Result<(), String> {
+  let data_dirs = if delete_data {
+    user_data_dirs(&handle)
+  } else {
+    vec![]
+  };
+  let app_path = installed_app_path();
+
   std::thread::spawn(move || {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Delete app from Applications
-    let _ = fs::remove_dir_all("/Applications/guvercin.app");
-
-    // Delete all user data
-    if let Ok(home) = std::env::var("HOME") {
-      let _ = fs::remove_dir_all(format!("{}/Library/Application Support/Guvercin", home));
-      let _ = fs::remove_dir_all(format!("{}/.config/guvercin", home));
-      let _ = fs::remove_dir_all(format!("{}/.guvercin", home));
+    for dir in data_dirs {
+      if let Err(e) = fs::remove_dir_all(&dir) {
+        if dir.exists() {
+          log::warn!("Failed to remove {}: {}", dir.display(), e);
+        }
+      }
     }
 
-    // Exit the app
+    if let Some(path) = app_path {
+      if let Err(e) = fs::remove_dir_all(&path) {
+        log::warn!("Failed to remove {}: {}", path.display(), e);
+      }
+    }
+
     handle.exit(0);
   });
 
@@ -1009,20 +1130,52 @@ pub fn run() {
         tray_builder.build(app)?;
       }
 
-      // Close-to-tray: hitting the window's close button hides it instead of
-      // quitting, so background mail sync and notifications keep running. A real
-      // quit is available via the tray menu's "Quit" item.
+      // Close-to-background: closing the main window (its close button or Cmd+W)
+      // hides it instead of quitting, so background mail sync and notifications
+      // keep running. Detached mail and compose windows stay open, matching the
+      // platform convention that closing a window is not quitting the app. A
+      // real quit is available via the tray menu's "Quit" item; the dock icon,
+      // the tray icon or a notification click brings the window back through
+      // show_main_window().
       if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let handle_for_close = app.handle().clone();
         main_window.on_window_event(move |event| {
+          match event {
+            WindowEvent::Focused(focused) => {
+              log::debug!("win[{MAIN_WINDOW_LABEL}]: focus changed (focused={focused})")
+            }
+            WindowEvent::Resized(size) => {
+              log::debug!("win[{MAIN_WINDOW_LABEL}]: resized to {}x{}", size.width, size.height)
+            }
+            WindowEvent::Moved(pos) => {
+              log::debug!("win[{MAIN_WINDOW_LABEL}]: moved to {},{}", pos.x, pos.y)
+            }
+            WindowEvent::Destroyed => log::info!("win[{MAIN_WINDOW_LABEL}]: destroyed"),
+            _ => {}
+          }
           if let WindowEvent::CloseRequested { api, .. } = event {
-            // On macOS, hide the whole application (like Cmd+H) rather than just
-            // the window. This way clicking a notification or the dock icon
-            // re-activates the app and macOS restores the window automatically,
-            // which in turn fires the focus event that opens the notified mail.
+            log::info!("win[{MAIN_WINDOW_LABEL}]: close requested (Cmd+W / close button / JS close)");
+            // macOS: while other windows (compose / detached mail) are still on
+            // screen, only this window goes away. When it is the last one, hide
+            // the whole application instead of ordering the window out — an
+            // ordered-out window is not restored when the app is unhidden, so
+            // hiding at the app level is what lets a dock click, Cmd+Tab or a
+            // notification bring the window back.
             #[cfg(target_os = "macos")]
             {
-              let _ = handle_for_close.hide();
+              let others_visible = handle_for_close
+                .webview_windows()
+                .iter()
+                .any(|(label, win)| {
+                  label != MAIN_WINDOW_LABEL && win.is_visible().unwrap_or(false)
+                });
+              if others_visible {
+                if let Some(win) = handle_for_close.get_webview_window(MAIN_WINDOW_LABEL) {
+                  let _ = win.hide();
+                }
+              } else {
+                let _ = handle_for_close.hide();
+              }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -1171,7 +1324,9 @@ pub fn run() {
       write_user_theme,
       get_backend_port,
       read_eml_file,
-      uninstall_app
+      uninstall_app,
+      list_user_data_paths,
+      delete_user_data
     ])
     .manage(MailWindowStore::default())
     .manage(ComposeWindowStore::default())

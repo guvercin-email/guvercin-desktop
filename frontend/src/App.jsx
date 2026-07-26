@@ -171,6 +171,11 @@ function StartupRouter() {
         const accounts = Array.isArray(data.accounts) ? data.accounts : []
         if (accounts.length === 0) {
           navigate('/login', { replace: true })
+        } else if (accounts.length === 1) {
+          // Only one registered account: there is nothing to choose, so sign in
+          // with it directly instead of showing the selection screen.
+          hydrateAccountSession(accounts[0])
+          navigate('/dashboard', { replace: true })
         } else {
           // Always go to account selection first.
           // This satisfies the user's request: "don't ask password on app start, ask when entering account".

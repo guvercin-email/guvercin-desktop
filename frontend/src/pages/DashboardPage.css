@@ -172,6 +172,28 @@ body.resizing * {
   background: var(--overlay-inverse-0);
 }
 
+/* Theme-specific logo variants. The light theme's navbar is yellow, so the
+   yellow mark disappears against it; that theme gets the gray-bodied variant
+   instead. Default (and any custom theme) uses the light-theme variant, which
+   matches how the icon rules below treat dark as the special case. */
+.db-logo-img {
+  height: 100%;
+  width: auto;
+  display: block;
+}
+
+.db-logo-img--dark {
+  display: none;
+}
+
+[data-theme='dark'] .db-logo-img--light {
+  display: none;
+}
+
+[data-theme='dark'] .db-logo-img--dark {
+  display: block;
+}
+
 .db-logo-icon {
   width: 30px;
   height: 30px;
