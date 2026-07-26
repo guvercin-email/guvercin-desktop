@@ -1,10 +1,11 @@
 import { apiUrl } from '../utils/api'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import './AccountSelectionPage.css'
 import { hydrateAccountSession } from '../utils/accountStorage.js'
 import LanguageSelector from '../components/LanguageSelector.jsx'
+import { getSavedWindowPreferences } from '../utils/windowPreferences.js'
 
 // Default main-window size (matches src-tauri/tauri.conf.json) restored once
 // the user leaves the account-selection screen.
@@ -40,15 +41,31 @@ async function setSelectionWindowSize() {
 }
 
 // Restores the normal main-window size and resizability when navigating
-// away to login/dashboard.
+// away to login/dashboard. Uses saved window preferences if available,
+// otherwise fullscreens on first launch.
 async function restoreMainWindow() {
   if (!isTauri()) return
   try {
     const { getCurrentWindow, LogicalSize } = await import('@tauri-apps/api/window')
     const win = getCurrentWindow()
     await win.setResizable(true)
-    await win.setSize(new LogicalSize(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT))
-    await win.center()
+    
+    const saved = getSavedWindowPreferences()
+
+    // First-launch fullscreen is applied after login (when the dashboard
+    // mounts), not here — otherwise the login screen itself opens fullscreen.
+    if (saved) {
+      // Restore saved size and position
+      await win.setSize(new LogicalSize(saved.width, saved.height))
+      await win.setPosition({
+        x: saved.x,
+        y: saved.y,
+      })
+    } else {
+      // Fallback to default
+      await win.setSize(new LogicalSize(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT))
+      await win.center()
+    }
   } catch {
     // Not inside Tauri or the API is unavailable.
   }
@@ -60,11 +77,14 @@ function AccountSelectionPage() {
   const [accounts, setAccounts] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const restoredRef = useRef(false)
 
   useEffect(() => {
     setSelectionWindowSize()
     return () => {
-      restoreMainWindow()
+      if (!restoredRef.current) {
+        restoreMainWindow()
+      }
     }
   }, [])
 
@@ -102,6 +122,9 @@ function AccountSelectionPage() {
   }, [t])
 
   const handleSelect = async (account) => {
+    // Restore window before navigation to ensure timing is correct
+    restoredRef.current = true
+    await restoreMainWindow()
     hydrateAccountSession(account)
     navigate('/dashboard')
   }

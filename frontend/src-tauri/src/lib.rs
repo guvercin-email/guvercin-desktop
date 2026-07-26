@@ -482,8 +482,8 @@ fn get_compose_window_data(
   label: String,
   store: State<'_, ComposeWindowStore>,
 ) -> Option<String> {
-  let mut map = store.0.lock().unwrap();
-  map.remove(&label)
+  let map = store.0.lock().unwrap();
+  map.get(&label).cloned()
 }
 
 #[tauri::command]

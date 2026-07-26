@@ -71,6 +71,12 @@
     background: var(--c-surface-3, #f8fafc);
 }
 
+.cv-toolbar-btn.is-active {
+    border-color: var(--c-accent-2, #2596be);
+    background: color-mix(in srgb, var(--c-accent-2, #2596be) 14%, var(--c-surface-2, #fff));
+    color: var(--c-accent-1, #1a5b73);
+}
+
 .cv-banner {
     border-bottom: 1px solid var(--c-border-1, #e5e7eb);
     background: var(--c-surface-2, #ffffff);
@@ -356,6 +362,19 @@
     width: 100%;
     border: none;
     background: var(--c-surface-2, #fff);
+}
+
+.cv-rich-editor {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+}
+
+.cv-rich-editor .compose-editor {
+    flex: 1;
+    min-height: 0;
+    border: none;
+    border-radius: 0;
 }
 
 .cv-editor-wrap .monaco-editor,

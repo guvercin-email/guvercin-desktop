@@ -65,6 +65,7 @@ import {
     hasShownDefaultPrompt,
     markDefaultPromptShown,
 } from '../utils/defaultMailClient.js'
+import { saveWindowPreferences, markAuthenticationComplete, shouldUseFullscreen } from '../utils/windowPreferences.js'
 import './DashboardPage.css'
 import SettingsPage from './SettingsPage.jsx'
 
@@ -1440,6 +1441,64 @@ const DashboardPage = () => {
             navigate(location.pathname, { replace: true, state: {} })
         }
     }, [location.pathname, location.state, navigate])
+
+    // Track window size/position changes and save to localStorage
+    useEffect(() => {
+        // Fullscreen belongs after login, not on the login screen: on first
+        // launch we maximize once the dashboard mounts. Capture the flag before
+        // marking auth complete, since markAuthenticationComplete() clears it.
+        const firstLaunch = shouldUseFullscreen()
+        markAuthenticationComplete()
+
+        let timeoutId = null
+        let cleanup = null
+
+        const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
+        if (isTauri()) {
+            (async () => {
+                try {
+                    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+                    const win = getCurrentWindow()
+
+                    if (firstLaunch) {
+                        try { await win.maximize() } catch { /* ignore */ }
+                    }
+
+                    const saveWindowState = async () => {
+                        if (timeoutId) clearTimeout(timeoutId)
+                        timeoutId = setTimeout(async () => {
+                            try {
+                                const size = await win.outerSize()
+                                const pos = await win.outerPosition()
+                                if (size && pos) {
+                                    saveWindowPreferences(
+                                        size.width,
+                                        size.height,
+                                        pos.x,
+                                        pos.y
+                                    )
+                                }
+                            } catch {
+                                // ignore errors saving preferences
+                            }
+                        }, 500) // debounce by 500ms
+                    }
+                    
+                    // Listen to standard window resize events
+                    window.addEventListener('resize', saveWindowState)
+                    cleanup = () => window.removeEventListener('resize', saveWindowState)
+                } catch {
+                    // Tauri API not available
+                }
+            })()
+        }
+        
+        return () => {
+            if (timeoutId) clearTimeout(timeoutId)
+            if (cleanup) cleanup()
+        }
+    }, [])
 
     useEffect(() => {
         if (!accountMenuOpen) return

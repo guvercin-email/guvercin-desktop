@@ -114,7 +114,7 @@ test('parseComposeBody builds html payload with plain fallback and attachments',
 test('parseComposeBody rejects malformed recipients with precise message', () => {
   assert.throws(
     () => parseComposeBody({ toRecipients: ['foo@'], plainBody: 'x' }),
-    /Invalid recipient: foo@/,
+    /Invalid email address: "foo@"/,
   )
 })
 
