@@ -1,11 +1,16 @@
 // Bridges OS-level file associations (`.eml` / `.msg`) to the mail viewer.
 //
 // When the user double-clicks a message file, the OS launches (or re-focuses)
-// guvercin and hands it the file. macOS delivers this as a `file://` deep link;
-// Windows/Linux pass the path as a launch argument that the deep-link plugin
-// surfaces the same way. Like mailto links these can arrive during a cold start
-// before an account is active, so paths are buffered in a queue and drained by
-// whichever consumer (typically DashboardPage) is ready. Listeners install once.
+// guvercin and hands it the file. The three platforms deliver it differently:
+// macOS sends a `file://` deep link, while Windows and Linux pass a plain path
+// as a launch argument — which is not a URL, so the deep-link plugin ignores it.
+// The Rust side parses those arguments and offers them through
+// `take_launch_files` (cold start) and the `os://open-file` event (already
+// running), so all three arrive here the same way.
+//
+// Like mailto links these can turn up before an account is active, so paths are
+// buffered in a queue and drained by whichever consumer (typically
+// DashboardPage) is ready. Listeners install once.
 
 const queue = []
 const subscribers = new Set()
@@ -18,7 +23,8 @@ function isTauri() {
 // Decodes a `file://` URL (or bare path) into a filesystem path and keeps only
 // message files we know how to import. Returns null for anything else so the
 // shared deep-link stream (which also carries mailto: links) is ignored safely.
-function toEmlPath(url) {
+// Exported for the tests: it has to hold for all three platforms' shapes.
+export function toEmlPath(url) {
   if (typeof url !== 'string') return null
   let path = url.trim()
   if (!path) return null
@@ -30,6 +36,9 @@ function toEmlPath(url) {
     } catch {
       // Leave the raw path if it isn't valid percent-encoding.
     }
+  } else if (/^[a-z]:[\\/]/i.test(path)) {
+    // A Windows path (C:\Users\…\note.eml). It looks like a URL scheme to the
+    // test below, so it has to be recognised first.
   } else if (/^[a-z][a-z0-9+.-]*:/i.test(path)) {
     // Some other scheme (mailto:, tel:, …) — not a file.
     return null
@@ -62,10 +71,30 @@ function handleUrls(urls) {
   }
 }
 
-// Installs the deep-link listeners. Safe to call multiple times.
+// Installs the deep-link and launch-argument listeners. Safe to call multiple
+// times.
 export async function initEmlInbox() {
   if (initialized || !isTauri()) return
   initialized = true
+
+  // Files passed as launch arguments (Windows/Linux), collected by the Rust
+  // side before any window existed.
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const pending = await invoke('take_launch_files')
+    handleUrls(pending)
+  } catch (error) {
+    console.error('Failed to read the launch files:', error)
+  }
+
+  // Files passed as arguments to a second launch, forwarded to this instance.
+  try {
+    const { listen } = await import('@tauri-apps/api/event')
+    await listen('os://open-file', (event) => handleUrls(event?.payload))
+  } catch (error) {
+    console.error('Failed to listen for opened files:', error)
+  }
+
   try {
     const { onOpenUrl, getCurrent } = await import('@tauri-apps/plugin-deep-link')
     // Files the app was launched with (cold start).

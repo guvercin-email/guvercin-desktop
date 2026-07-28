@@ -562,7 +562,13 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                     <iframe
                         title="compose-preview"
                         className="cv-preview-frame"
-                        sandbox=""
+                        /* No `allow-scripts`, so nothing in the previewed HTML
+                           can run. `allow-same-origin` only lets the app reach
+                           into the frame — which is what installs the
+                           context-menu guard from main.jsx inside it, so the
+                           preview behaves like the rest of the app on every
+                           platform instead of showing the webview's own menu. */
+                        sandbox="allow-same-origin"
                         srcDoc={previewDocument}
                     />
                 ) : (

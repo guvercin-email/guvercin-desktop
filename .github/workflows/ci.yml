@@ -49,3 +49,47 @@ jobs:
       - name: test
         working-directory: rust-backend
         run: cargo test
+
+  desktop:
+    # The desktop crate is where the OS integration lives — the default mail
+    # client, the file-manager entry, the taskbar badge, uninstall — and each
+    # platform compiles a different half of it. Only building on all three
+    # catches a break in the half this machine never sees.
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # WebKitGTK and the tray backend; SQLCipher is compiled from source.
+      - name: Install build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+      # tauri::generate_context! reads the built frontend, so it has to exist.
+      - run: npm install
+      - run: npm --prefix frontend install
+      - run: npm run build
+      - name: clippy
+        working-directory: frontend/src-tauri
+        run: cargo clippy --all-targets
+      - name: test
+        working-directory: frontend/src-tauri
+        run: cargo test

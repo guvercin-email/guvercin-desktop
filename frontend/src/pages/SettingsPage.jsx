@@ -4241,30 +4241,49 @@ function UninstallSettings({ searchQuery = '' }) {
     const [deleteData, setDeleteData] = useState(false)
     const [busy, setBusy] = useState(false)
     const [dataPaths, setDataPaths] = useState([])
+    const [appPath, setAppPath] = useState('')
     const [error, setError] = useState('')
+    // What is left for the user to do when the app cannot remove itself: a
+    // package-managed Linux install has to go through the package manager.
+    const [remainingStep, setRemainingStep] = useState(null)
 
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
     const openConfirm = useCallback(async () => {
         setError('')
+        setRemainingStep(null)
         setDeleteData(false)
         setShowConfirm(true)
         if (!isTauri) return
         try {
             const { invoke } = await import('@tauri-apps/api/core')
-            const paths = await invoke('list_user_data_paths')
+            const [paths, location] = await Promise.all([
+                invoke('list_user_data_paths'),
+                invoke('installed_app_location'),
+            ])
             setDataPaths(Array.isArray(paths) ? paths : [])
+            setAppPath(typeof location === 'string' ? location : '')
         } catch {
             setDataPaths([])
+            setAppPath('')
         }
     }, [isTauri])
 
     const confirmUninstall = useCallback(async () => {
         setBusy(true)
         setError('')
+        setRemainingStep(null)
         try {
             const { invoke } = await import('@tauri-apps/api/core')
-            await invoke('uninstall_app', { deleteData })
+            const outcome = await invoke('uninstall_app', { deleteData })
+            // When `removed` is true the app quits on its own a moment later.
+            if (outcome && outcome.removed === false) {
+                setRemainingStep({
+                    message: outcome.message || '',
+                    command: outcome.command || '',
+                })
+                setBusy(false)
+            }
         } catch (err) {
             setError(err?.message || String(err))
             setBusy(false)
@@ -4325,6 +4344,23 @@ function UninstallSettings({ searchQuery = '' }) {
                                 <ul className="sp-section__desc" style={{ marginTop: 8, marginLeft: 18 }}>
                                     {dataPaths.map((p) => <li key={p}><code>{p}</code></li>)}
                                 </ul>
+                            )}
+
+                            {appPath && (
+                                <p className="sp-section__desc" style={{ marginTop: 8 }}>
+                                    Installed at <code>{appPath}</code>
+                                </p>
+                            )}
+
+                            {remainingStep && (
+                                <div className="sp-form-message" style={{ marginTop: 12 }}>
+                                    <p>{remainingStep.message}</p>
+                                    {remainingStep.command && (
+                                        <p style={{ marginTop: 8 }}>
+                                            <code>{remainingStep.command}</code>
+                                        </p>
+                                    )}
+                                </div>
                             )}
 
                             {error && <div className="sp-form-message sp-form-message--error">{error}</div>}

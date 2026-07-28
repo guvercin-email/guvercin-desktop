@@ -42,6 +42,30 @@ function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
+// Which OS we are on. Notification sounds are named differently by each of
+// them, and there is no name all three understand.
+export function currentPlatform(userAgent) {
+  const ua = (userAgent
+    ?? (typeof navigator !== 'undefined' ? navigator.userAgent : '')
+    ?? '').toLowerCase()
+  if (ua.includes('mac')) return 'macos'
+  if (ua.includes('win')) return 'windows'
+  return 'linux'
+}
+
+// The name of the sound to play, in the vocabulary of the platform:
+//   macOS   — NSUserNotificationDefaultSoundName, the system default
+//   Windows — one of the fixed toast sounds ("Mail", "Reminder", …); an
+//             unknown name is dropped by the toast API, which is why a plain
+//             "default" used to leave Windows notifications silent
+//   Linux   — an XDG sound-naming-spec name from the user's sound theme
+// `kind` is 'mail' or 'reminder'.
+export function notificationSoundName(kind, platform = currentPlatform()) {
+  if (platform === 'macos') return 'NSUserNotificationDefaultSoundName'
+  if (platform === 'windows') return kind === 'reminder' ? 'Reminder' : 'Mail'
+  return kind === 'reminder' ? 'alarm-clock-elapsed' : 'message-new-instant'
+}
+
 function dispatchOpen(event) {
   for (const cb of openSubscribers) {
     try {
@@ -116,7 +140,7 @@ export async function notifyNewMail(mail, options = {}) {
     const notification = showPreview
       ? { title: sender, body: subject }
       : { title: 'guvercin', body: 'You have new mail' }
-    if (withSound) notification.sound = 'default'
+    if (withSound) notification.sound = notificationSoundName('mail')
     if (mail.id != null) notification.id = notificationIdForMail(mail.id)
     sendNotification(notification)
   } catch (error) {
@@ -167,14 +191,17 @@ export async function notifyReminder(reminder = {}) {
       title: (title || 'Reminder').toString(),
       body: (body || '').toString(),
     }
-    if (sound) notification.sound = 'default'
+    if (sound) notification.sound = notificationSoundName('reminder')
     sendNotification(notification)
   } catch (error) {
     console.error('Failed to send reminder notification:', error)
   }
 }
 
-// Updates the OS unread badge (macOS dock / Linux launcher) and tray tooltip.
+// Updates the OS unread badge and the tray tooltip. The badge is whatever the
+// platform offers: the dock badge on macOS, the launcher badge on Linux, and a
+// taskbar overlay icon on Windows (which has no numeric badge, so the count is
+// drawn into a small image — see `platform::shared::badge_rgba`).
 export async function setUnreadBadge(count) {
   if (!isTauri()) return
   try {

@@ -4268,7 +4268,14 @@ function MailSection({
                 )
                 markDefaultPromptShown()
                 if (confirmed && !cancelled) {
-                    await setAsDefaultMailClient()
+                    const outcome = await setAsDefaultMailClient()
+                    // Windows can only register us and open its Default apps
+                    // page; say so rather than leaving the user thinking it is
+                    // done. Same for a desktop that needs a re-login.
+                    if (!outcome.isDefault && outcome.message && !cancelled) {
+                        const { message } = await import('@tauri-apps/plugin-dialog')
+                        await message(outcome.message, { title: t('Default Email App'), kind: 'info' })
+                    }
                 }
             } catch (error) {
                 console.error('Default mail prompt failed:', error)

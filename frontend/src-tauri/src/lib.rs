@@ -12,6 +12,12 @@ use tauri::{
 };
 use tauri_plugin_log::{Target, TargetKind};
 
+mod platform;
+
+/// Event carrying `.eml`/`.msg` files the OS asked us to open while running.
+/// (Attachment requests need no event: the compose window is opened here.)
+const EVENT_OPEN_FILE: &str = "os://open-file";
+
 /// Label of the primary window. Tauri assigns "main" to the first window
 /// declared in tauri.conf.json.
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -22,6 +28,11 @@ const TRAY_ID: &str = "guvercin-tray";
 #[derive(Default)]
 struct BackendPort(Mutex<Option<u16>>);
 
+/// WebKitGTK builds its context menu before the page sees the event, so a
+/// `preventDefault()` in the webview does not always suppress it — the guard in
+/// `main.jsx` (which is what handles this on macOS and Windows, where WKWebView
+/// and WebView2 do respect it) needs this native backstop here. Editable fields
+/// keep their menu on every platform, so copy/paste still works.
 #[cfg(any(
   target_os = "linux",
   target_os = "dragonfly",
@@ -56,18 +67,13 @@ struct MailWindowStore(Mutex<HashMap<String, String>>);
 #[derive(Default)]
 struct ComposeWindowStore(Mutex<HashMap<String, String>>);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum LinkClickBehavior {
+  #[default]
   Ask,
   Open,
   Copy,
-}
-
-impl Default for LinkClickBehavior {
-  fn default() -> Self {
-    Self::Ask
-  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,79 +200,128 @@ fn is_allowed_external_url(url: &str) -> bool {
     || u.starts_with("tel:")
 }
 
-#[cfg(target_os = "windows")]
-fn register_context_menu_windows() -> Result<(), String> {
-  use std::process::Command;
+/// Files the OS handed us on the command line, kept until the frontend is up.
+///
+/// A cold start races the UI: the OS launches us *because* the user opened a
+/// message file or picked "Send with guvercin", so the paths arrive before any
+/// webview exists to receive an event. They are parked here and drained by the
+/// frontend through `take_launch_files` / `take_launch_attachments`; while the
+/// app is already running the same paths arrive as events instead.
+#[derive(Default)]
+struct LaunchQueue {
+  files: Mutex<Vec<String>>,
+  attachments: Mutex<Vec<String>>,
+}
 
-  let app_path = std::env::current_exe().map_err(|e| e.to_string())?;
-  let app_path_str = app_path.to_string_lossy();
+impl LaunchQueue {
+  fn push(&self, files: Vec<String>, attachments: Vec<String>) {
+    if !files.is_empty() {
+      self.files.lock().unwrap().extend(files);
+    }
+    if !attachments.is_empty() {
+      self.attachments.lock().unwrap().extend(attachments);
+    }
+  }
+}
 
-  let reg_script = format!(
-    r#"powershell -NoProfile -Command "
-$regPath = 'Registry::HKEY_CLASSES_ROOT\*\shell\GuvercinSend'
-$cmdPath = '$regPath\command'
-New-Item -Path $regPath -Force | Out-Null
-New-ItemProperty -Path $regPath -Name '(Default)' -Value 'guvercin ile Gönder' -PropertyType String -Force | Out-Null
-New-Item -Path $cmdPath -Force | Out-Null
-New-ItemProperty -Path $cmdPath -Name '(Default)' -Value '\"{}\" --file-attachment \"%1\"' -PropertyType String -Force | Out-Null
-""#,
-    app_path_str
+fn is_message_file(path: &str) -> bool {
+  let lower = path.trim().to_lowercase();
+  lower.ends_with(".eml") || lower.ends_with(".msg")
+}
+
+/// Splits a process argument list into `(message files, attachment paths)`.
+///
+/// Windows and Linux hand both kinds of request over as arguments — Explorer
+/// and the file managers run `guvercin --file-attachment <path>`, and opening a
+/// `.eml` runs `guvercin <path>`. (macOS delivers both as `file://` deep links
+/// instead, which the deep-link plugin surfaces on its own.) URLs are left
+/// alone here; they belong to the deep-link plugin on every platform.
+///
+/// Every path after `--file-attachment` is an attachment, because a file
+/// manager expands a multi-file selection into one argument each — and nothing
+/// else on the command line can follow that flag.
+fn parse_launch_args<I>(args: I) -> (Vec<String>, Vec<String>)
+where
+  I: IntoIterator<Item = String>,
+{
+  let mut files = vec![];
+  let mut attachments = vec![];
+  let mut collecting_attachments = false;
+
+  for arg in args.into_iter().skip(1) {
+    if arg == "--file-attachment" {
+      collecting_attachments = true;
+      continue;
+    }
+    if let Some(path) = arg.strip_prefix("--file-attachment=") {
+      collecting_attachments = true;
+      if !path.trim().is_empty() {
+        attachments.push(path.to_string());
+      }
+      continue;
+    }
+    if arg.starts_with('-') {
+      collecting_attachments = false;
+      continue;
+    }
+    if collecting_attachments {
+      if !arg.trim().is_empty() {
+        attachments.push(arg);
+      }
+      continue;
+    }
+    if is_message_file(&arg) {
+      files.push(arg);
+    }
+  }
+
+  (files, attachments)
+}
+
+/// Handles a launch (or a second launch forwarded by the single-instance
+/// plugin) that carries file arguments. `running` decides whether the paths go
+/// out as events or wait in the queue for the frontend to ask for them.
+fn handle_launch_args(handle: &tauri::AppHandle, args: Vec<String>, running: bool) {
+  let (files, attachments) = parse_launch_args(args);
+  if files.is_empty() && attachments.is_empty() {
+    return;
+  }
+  log::info!(
+    "launch: {} message file(s), {} attachment(s) from the command line",
+    files.len(),
+    attachments.len()
   );
 
-  let output = Command::new("powershell")
-    .args(&["-NoProfile", "-Command", &reg_script])
-    .output()
-    .map_err(|e| e.to_string())?;
+  if !running {
+    handle.state::<LaunchQueue>().push(files, attachments);
+    return;
+  }
 
-  if output.status.success() {
-    log::info!("Context menu registered for Windows");
-    Ok(())
-  } else {
-    log::warn!(
-      "Context menu registration failed: {}",
-      String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(()) // Don't fail the whole app if registration fails
+  if !files.is_empty() {
+    let _ = handle.emit(EVENT_OPEN_FILE, files);
+  }
+  if !attachments.is_empty() {
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+      if let Err(e) = attach_files_to_compose(handle, attachments).await {
+        log::warn!("compose: could not attach the files from the file manager: {e}");
+      }
+    });
   }
 }
 
-
-#[cfg(target_os = "linux")]
-fn register_context_menu_linux() -> Result<(), String> {
-  let home = std::env::var("HOME").ok();
-  if home.is_none() {
-    return Ok(()); // Skip if HOME is not set
-  }
-
-  let home = home.unwrap();
-
-  // Create Nautilus script
-  let nautilus_dir = PathBuf::from(&home).join(".local/share/nautilus/scripts");
-  fs::create_dir_all(&nautilus_dir).map_err(|e| e.to_string())?;
-
-  let nautilus_script = "#!/bin/bash\nfor file in $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS; do\n    encoded_path=$(printf %s \"$file\" | sed 's/ /%20/g;s/&/%26/g;s/?/%3F/g')\n    xdg-open \"guvercin://attach-file?path=$encoded_path\" &\ndone\n";
-  let nautilus_path = nautilus_dir.join("Send with guvercin");
-  fs::write(&nautilus_path, nautilus_script).map_err(|e| e.to_string())?;
-
-  use std::os::unix::fs::PermissionsExt;
-  let perms = fs::Permissions::from_mode(0o755);
-  fs::set_permissions(&nautilus_path, perms).map_err(|e| e.to_string())?;
-
-  // Create KDE Dolphin service menu
-  let kde_dir = PathBuf::from(&home).join(".local/share/kio/servicemenus");
-  fs::create_dir_all(&kde_dir).map_err(|e| e.to_string())?;
-
-  let kde_service = "[Desktop Entry]\nType=Service\nServiceTypes=KonqPopupMenu/Plugin\nMimeTypes=all/all\nActions=SendWithGuvercin\n\n[Desktop Action SendWithGuvercin]\nName=Send with guvercin\nExec=sh -c 'xdg-open \"guvercin://attach-file?path=%f\"'\nIcon=mail\n";
-  let kde_path = kde_dir.join("guvercin-attach.desktop");
-  fs::write(&kde_path, kde_service).map_err(|e| e.to_string())?;
-
-  log::info!("Context menu registered for Linux");
-  Ok(())
+/// Drains the message files the app was launched with.
+#[tauri::command]
+fn take_launch_files(queue: State<'_, LaunchQueue>) -> Vec<String> {
+  let mut files = queue.files.lock().unwrap();
+  std::mem::take(&mut *files)
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn register_context_menu_linux() -> Result<(), String> {
-  Ok(()) // No-op on other platforms
+/// Drains the attachment paths the app was launched with.
+#[tauri::command]
+fn take_launch_attachments(queue: State<'_, LaunchQueue>) -> Vec<String> {
+  let mut attachments = queue.attachments.lock().unwrap();
+  std::mem::take(&mut *attachments)
 }
 
 #[tauri::command]
@@ -379,36 +434,70 @@ async fn attach_file_to_compose(
   handle: tauri::AppHandle,
   file_path: String,
 ) -> Result<(), String> {
+  attach_files_to_compose(handle, vec![file_path]).await
+}
+
+/// Opens one compose window carrying every given file as an attachment.
+///
+/// A file manager expands a multi-file selection into one path per argument, so
+/// this takes the whole selection at once — one message with all of them
+/// attached, rather than one window per file (which the shared window label
+/// would collapse into a single attachment anyway).
+#[tauri::command]
+async fn attach_files_to_compose(
+  handle: tauri::AppHandle,
+  file_paths: Vec<String>,
+) -> Result<(), String> {
   use base64::Engine as _;
 
-  let path = PathBuf::from(file_path.trim());
-  if !path.exists() {
-    return Err("File not found".to_string());
+  let mut attachments: Vec<Value> = vec![];
+  let mut errors: Vec<String> = vec![];
+
+  for file_path in file_paths {
+    let path = PathBuf::from(file_path.trim());
+    if !path.exists() {
+      errors.push(format!("{}: file not found", path.display()));
+      continue;
+    }
+
+    let file_name = path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("attachment")
+      .to_string();
+
+    let bytes = match fs::read(&path) {
+      Ok(bytes) => bytes,
+      Err(e) => {
+        errors.push(format!("{}: {e}", path.display()));
+        continue;
+      }
+    };
+    log::info!(
+      "compose: attaching file from the file manager: {} ({} bytes)",
+      file_name,
+      bytes.len()
+    );
+
+    attachments.push(serde_json::json!({
+      "name": file_name,
+      "data_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+      "mimeType": ""
+    }));
   }
 
-  let file_name = path
-    .file_name()
-    .and_then(|n| n.to_str())
-    .unwrap_or("attachment")
-    .to_string();
+  if attachments.is_empty() {
+    return Err(if errors.is_empty() {
+      "No file to attach".to_string()
+    } else {
+      errors.join("; ")
+    });
+  }
+  if !errors.is_empty() {
+    log::warn!("compose: some files could not be attached: {}", errors.join("; "));
+  }
 
-  let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-  log::info!(
-    "compose: attaching file from Finder: {} ({} bytes)",
-    file_name,
-    bytes.len()
-  );
-  let base64_content = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-  let attachment_data = serde_json::json!({
-    "name": file_name,
-    "data_base64": base64_content,
-    "mimeType": ""
-  });
-
-  let compose_data = serde_json::json!({
-    "attachments": [attachment_data]
-  });
+  let compose_data = serde_json::json!({ "attachments": attachments });
 
   let compose_result = open_compose_window(
     handle.clone(),
@@ -417,9 +506,9 @@ async fn attach_file_to_compose(
   )
   .await;
 
-  // The "Send with guvercin" flow is initiated from Finder, not the app, so the
-  // user wants just the compose window — hide the main window (only the window,
-  // not the whole app, so the compose window keeps focus on macOS).
+  // The "Send with guvercin" flow is initiated from the file manager, not the
+  // app, so the user wants just the compose window — hide the main window (only
+  // the window, not the whole app, so the compose window keeps focus on macOS).
   if let Some(main) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
     log::info!("win[{MAIN_WINDOW_LABEL}]: hiding main window behind the attachment compose window");
     let _ = main.hide();
@@ -660,112 +749,87 @@ fn open_external_url(url: String) -> Result<(), String> {
   if !is_allowed_external_url(&url) {
     return Err("URL scheme not allowed".to_string());
   }
-  open::that(url).map_err(|e| e.to_string())?;
+  // Detached: `xdg-open` on Linux keeps running for as long as the browser it
+  // started, so waiting on the child would block this command.
+  open::that_detached(url).map_err(|e| e.to_string())?;
   Ok(())
 }
 
-/// Registers this app as the OS default handler for the `mailto:` scheme.
-/// On macOS this calls LaunchServices directly (same mechanism the "Default
-/// email reader" preference and other mail apps use). No-op error on other
-/// platforms where the default is managed elsewhere (installer/desktop file).
-#[cfg(target_os = "macos")]
-fn set_default_mail_client_macos(bundle_id: &str) -> Result<(), String> {
-  use core_foundation::base::TCFType;
-  use core_foundation::string::{CFString, CFStringRef};
-
-  extern "C" {
-    fn LSSetDefaultHandlerForURLScheme(
-      in_url_scheme: CFStringRef,
-      in_handler_bundle_id: CFStringRef,
-    ) -> i32;
-    fn LSSetDefaultRoleHandlerForContentType(
-      in_content_type: CFStringRef,
-      in_role: u32,
-      in_handler_bundle_id: CFStringRef,
-    ) -> i32;
-  }
-
-  let bundle = CFString::new(bundle_id);
-
-  let scheme = CFString::new("mailto");
-  let status = unsafe {
-    LSSetDefaultHandlerForURLScheme(scheme.as_concrete_TypeRef(), bundle.as_concrete_TypeRef())
-  };
-  if status != 0 {
-    return Err(format!("LSSetDefaultHandlerForURLScheme failed with status {status}"));
-  }
-
-  // Also claim `.eml` files. macOS maps them to the `com.apple.mail.email`
-  // content type; kLSRolesAll = 0xFFFFFFFF. Requires the bundle to declare this
-  // UTI via LSItemContentTypes (see src-tauri/Info.plist).
-  let eml_uti = CFString::new("com.apple.mail.email");
-  let eml_status = unsafe {
-    LSSetDefaultRoleHandlerForContentType(
-      eml_uti.as_concrete_TypeRef(),
-      0xFFFF_FFFF,
-      bundle.as_concrete_TypeRef(),
-    )
-  };
-  if eml_status != 0 {
-    return Err(format!(
-      "LSSetDefaultRoleHandlerForContentType failed with status {eml_status}"
-    ));
-  }
-
-  Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn is_default_mail_client_macos(bundle_id: &str) -> bool {
-  use core_foundation::base::TCFType;
-  use core_foundation::string::{CFString, CFStringRef};
-
-  extern "C" {
-    fn LSCopyDefaultHandlerForURLScheme(in_url_scheme: CFStringRef) -> CFStringRef;
-  }
-
-  let scheme = CFString::new("mailto");
-  let handler_ref = unsafe { LSCopyDefaultHandlerForURLScheme(scheme.as_concrete_TypeRef()) };
-  if handler_ref.is_null() {
-    return false;
-  }
-  let handler = unsafe { CFString::wrap_under_create_rule(handler_ref) };
-  handler.to_string().eq_ignore_ascii_case(bundle_id)
-}
-
+/// Makes guvercin the OS default handler for `mailto:` links and `.eml` files.
+/// Implemented for all three desktop platforms — see `platform` for how each
+/// one grants it, and what Windows makes the user confirm themselves.
 #[tauri::command]
-fn set_as_default_mail_client(app: tauri::AppHandle) -> Result<(), String> {
-  #[cfg(target_os = "macos")]
-  {
-    let id = app.config().identifier.clone();
-    set_default_mail_client_macos(&id)
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    let _ = app;
-    Err("Setting the default mail client is only supported on macOS".to_string())
-  }
+fn set_as_default_mail_client(
+  app: tauri::AppHandle,
+) -> Result<platform::DefaultMailOutcome, String> {
+  platform::set_as_default_mail_client(&app)
 }
 
 #[tauri::command]
 fn is_default_mail_client(app: tauri::AppHandle) -> bool {
-  #[cfg(target_os = "macos")]
-  {
-    let id = app.config().identifier.clone();
-    is_default_mail_client_macos(&id)
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    let _ = app;
-    false
-  }
+  platform::is_default_mail_client(&app)
+}
+
+/// Installs the file manager's "Send with guvercin" entry (Finder Quick Action,
+/// Explorer context menu, Nautilus/Dolphin/Nemo).
+#[tauri::command]
+fn register_file_context_menu(app: tauri::AppHandle) -> Result<(), String> {
+  platform::register_context_menu(&app)
+}
+
+#[tauri::command]
+fn unregister_file_context_menu(app: tauri::AppHandle) -> Result<(), String> {
+  platform::unregister_context_menu(&app)
+}
+
+#[tauri::command]
+fn is_file_context_menu_registered(app: tauri::AppHandle) -> bool {
+  platform::is_context_menu_registered(&app)
 }
 
 #[tauri::command]
 fn copy_to_clipboard(text: String) -> Result<(), String> {
-  let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-  clipboard.set_text(text).map_err(|e| e.to_string())?;
-  Ok(())
+  // X11 and Wayland have no clipboard server: the *application* owns the
+  // selection and serves it to whoever pastes. arboard's `wait()` keeps that
+  // ownership alive on a background thread until another app takes over —
+  // without it the copied text vanishes the moment the Clipboard is dropped,
+  // so copying silently did nothing on Linux while working on macOS/Windows.
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    use arboard::SetExtLinux;
+
+    // `wait()` blocks for as long as we own the selection, so it runs on its
+    // own thread; the channel only carries whether the clipboard could be
+    // opened at all, which is the one failure the user needs to hear about.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+      let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => {
+          let _ = tx.send(Ok(()));
+          clipboard
+        }
+        Err(e) => {
+          let _ = tx.send(Err(e.to_string()));
+          return;
+        }
+      };
+      if let Err(e) = clipboard.set().wait().text(text) {
+        log::warn!("clipboard: stopped serving the copied text: {e}");
+      }
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+      Ok(result) => result,
+      // A clipboard that is merely slow to open is not a failure to report.
+      Err(_) => Ok(()),
+    }
+  }
+  #[cfg(not(all(unix, not(target_os = "macos"))))]
+  {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text).map_err(|e| e.to_string())?;
+    Ok(())
+  }
 }
 
 /// Brings the main window back from the tray: unhides the app (macOS), then
@@ -794,13 +858,13 @@ fn show_main_window(app: &tauri::AppHandle) {
   }
 }
 
-/// Updates the unread-mail indicator: the OS badge (macOS dock / Linux launcher)
-/// and the tray tooltip. A count of 0 clears both.
+/// Updates the unread-mail indicator: the OS badge (the macOS dock, the Linux
+/// launcher, the Windows taskbar overlay) and the tray tooltip. A count of 0
+/// clears both.
 #[tauri::command]
 fn set_unread_badge(app: tauri::AppHandle, count: u32) -> Result<(), String> {
   if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-    let value = if count == 0 { None } else { Some(count as i64) };
-    let _ = window.set_badge_count(value);
+    platform::set_unread_badge(&window, count);
   }
 
   if let Some(tray) = app.tray_by_id(TRAY_ID) {
@@ -949,26 +1013,6 @@ fn user_data_dirs(handle: &tauri::AppHandle) -> Vec<PathBuf> {
   dirs
 }
 
-/// Directory of the installed application itself, derived from the running
-/// executable. On macOS that is the enclosing `.app` bundle; elsewhere it is
-/// the directory the executable lives in.
-fn installed_app_path() -> Option<PathBuf> {
-  let exe = std::env::current_exe().ok()?;
-  #[cfg(target_os = "macos")]
-  {
-    // …/guvercin.app/Contents/MacOS/guvercin -> …/guvercin.app
-    let bundle = exe.parent()?.parent()?.parent()?;
-    if bundle.extension().and_then(|e| e.to_str()) == Some("app") {
-      return Some(bundle.to_path_buf());
-    }
-    None
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    exe.parent().map(|p| p.to_path_buf())
-  }
-}
-
 /// Lists the user-data directories that currently exist, so the frontend can
 /// tell the user exactly what would be removed before they decide.
 #[tauri::command]
@@ -999,40 +1043,63 @@ fn delete_user_data(handle: tauri::AppHandle) -> Result<(), String> {
   }
 }
 
+/// Where this copy of guvercin is installed — the `.app` bundle on macOS, the
+/// install directory on Windows, the AppImage or executable on Linux. Shown to
+/// the user before an uninstall.
+#[tauri::command]
+fn installed_app_location(handle: tauri::AppHandle) -> Option<String> {
+  platform::installed_app_path(&handle).map(|path| path.to_string_lossy().to_string())
+}
+
 /// Removes the installed application. `delete_data` decides whether the user's
 /// local data (accounts, cached mail, settings) goes with it — the caller must
 /// ask the user explicitly, since keeping the data lets them reinstall and
 /// continue where they left off.
+///
+/// How the app itself goes away differs per platform (macOS deletes its own
+/// bundle, Windows hands over to the installer's uninstaller, a packaged Linux
+/// install has to be removed by the package manager), so the answer says what
+/// actually happened: when `removed` is false the app stays running and the
+/// message explains what is left to do.
 #[tauri::command]
-fn uninstall_app(handle: tauri::AppHandle, delete_data: bool) -> Result<(), String> {
-  let data_dirs = if delete_data {
-    user_data_dirs(&handle)
-  } else {
-    vec![]
-  };
-  let app_path = installed_app_path();
+fn uninstall_app(
+  handle: tauri::AppHandle,
+  delete_data: bool,
+) -> Result<platform::AppRemoval, String> {
+  // Data first: it is the part the user explicitly asked about, and it must not
+  // depend on whether the app itself could be removed. A file the running
+  // process still holds open (the log, on Windows) can refuse to go — that is
+  // worth reporting, but not worth cancelling the uninstall over, since what is
+  // left behind goes with the installer's own cleanup.
+  let mut leftover_data: Option<String> = None;
+  if delete_data {
+    if let Err(e) = delete_user_data(handle.clone()) {
+      log::warn!("uninstall: some user data could not be removed: {e}");
+      leftover_data = Some(e);
+    }
+  }
 
+  let mut outcome = platform::remove_installed_app(&handle)?;
+  if !outcome.removed {
+    // The app stays up, so this is the one moment the user can be told.
+    if let Some(e) = leftover_data {
+      outcome.message = format!(
+        "{} Some of your data could not be removed while guvercin was running: {e}",
+        outcome.message
+      );
+    }
+    log::info!("uninstall: {}", outcome.message);
+    return Ok(outcome);
+  }
+
+  let quit_handle = handle.clone();
   std::thread::spawn(move || {
+    // Give the frontend a moment to show the result before the window goes.
     std::thread::sleep(std::time::Duration::from_millis(500));
-
-    for dir in data_dirs {
-      if let Err(e) = fs::remove_dir_all(&dir) {
-        if dir.exists() {
-          log::warn!("Failed to remove {}: {}", dir.display(), e);
-        }
-      }
-    }
-
-    if let Some(path) = app_path {
-      if let Err(e) = fs::remove_dir_all(&path) {
-        log::warn!("Failed to remove {}: {}", path.display(), e);
-      }
-    }
-
-    handle.exit(0);
+    quit_handle.exit(0);
   });
 
-  Ok(())
+  Ok(outcome)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1049,22 +1116,13 @@ pub fn run() {
   #[cfg(any(target_os = "windows", target_os = "linux"))]
   {
     builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-      // Handle --file-attachment argument from context menu
-      if argv.len() > 1 {
-        for i in 0..argv.len() - 1 {
-          if argv[i] == "--file-attachment" && i + 1 < argv.len() {
-            let file_path = argv[i + 1].clone();
-            let app_handle = app.app_handle().clone();
-            std::thread::spawn(move || {
-              let rt = tokio::runtime::Runtime::new().unwrap();
-              rt.block_on(async {
-                let _ = attach_file_to_compose(app_handle, file_path).await;
-              });
-            });
-            break;
-          }
-        }
-      }
+      let handle = app.app_handle().clone();
+      // Launching guvercin while it is already running means the user wants it
+      // in front — the same thing macOS asks for with its Reopen event.
+      show_main_window(&handle);
+      // Files from Explorer / the file managers: "Send with guvercin", or a
+      // double-clicked .eml.
+      handle_launch_args(&handle, argv, true);
     }));
   }
 
@@ -1088,7 +1146,17 @@ pub fn run() {
       // System tray: keeps the app reachable while its window is hidden in the
       // background (see the close-to-tray handler below). Left-clicking the icon
       // restores the window; the context menu offers quick actions.
+      //
+      // Linux is the exception: its trays speak StatusNotifierItem, which
+      // reports menu activations and nothing else — a left click never reaches
+      // `on_tray_icon_event`, so on Linux the click opens the menu (whose first
+      // item is "Show guvercin") instead of leaving the icon dead.
       {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        const MENU_ON_LEFT_CLICK: bool = true;
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        const MENU_ON_LEFT_CLICK: bool = false;
+
         let show_i = MenuItem::with_id(app, "show", "Show guvercin", true, None::<&str>)?;
         let compose_i = MenuItem::with_id(app, "compose", "New Mail", true, None::<&str>)?;
         let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
@@ -1099,7 +1167,7 @@ pub fn run() {
         let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
           .tooltip("guvercin")
           .menu(&menu)
-          .show_menu_on_left_click(false)
+          .show_menu_on_left_click(MENU_ON_LEFT_CLICK)
           .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "compose" => {
@@ -1207,7 +1275,12 @@ pub fn run() {
         .unwrap_or_else(|| PathBuf::from("preferences.json"));
       app.manage(PreferencesStore::load(prefs_path));
 
-      // Register context menu on first launch
+      // "Send with guvercin" in the file manager, installed once on first
+      // launch. Every platform gets it: a Finder Quick Action on macOS, an
+      // Explorer context-menu verb on Windows, drop-in files for
+      // Nautilus/Dolphin/Nemo on Linux. A failure here is never fatal — the
+      // marker is only written when the registration actually succeeded, so a
+      // later launch tries again.
       let context_menu_marker = app
         .path()
         .app_data_dir()
@@ -1217,17 +1290,21 @@ pub fn run() {
       let context_menu_store = ContextMenuStore::new(context_menu_marker);
 
       if !context_menu_store.is_registered() {
-        #[cfg(target_os = "windows")]
-        let _ = register_context_menu_windows().and_then(|_| context_menu_store.mark_registered());
-
-        #[cfg(target_os = "linux")]
-        let _ = register_context_menu_linux().and_then(|_| context_menu_store.mark_registered());
-
-        // macOS context menu registration is not needed - user can drag files to guvercin or use URI scheme
-        #[cfg(target_os = "macos")]
-        let _ = context_menu_store.mark_registered();
+        match platform::register_context_menu(app.handle())
+          .and_then(|_| context_menu_store.mark_registered())
+        {
+          Ok(()) => log::info!("context menu: \"Send with guvercin\" is installed"),
+          Err(e) => log::warn!("context menu: could not install the entry: {e}"),
+        }
       }
-      
+
+      // Files the OS launched us with. On Windows and Linux these arrive as
+      // arguments (macOS sends them to the deep-link plugin as file:// URLs),
+      // and they arrive before the webview exists — so they wait in the queue
+      // until the frontend asks for them.
+      handle_launch_args(app.handle(), std::env::args().collect(), false);
+
+
       // Get app data directory for database
       let db_dir = app.path().app_data_dir().ok().map(|path| {
         let db_path = path.join("databases");
@@ -1305,6 +1382,7 @@ pub fn run() {
       close_mail_window,
       open_compose_window,
       attach_file_to_compose,
+      attach_files_to_compose,
       get_compose_window_data,
       close_compose_window,
       save_export_file_to_path,
@@ -1317,6 +1395,9 @@ pub fn run() {
       open_external_url,
       set_as_default_mail_client,
       is_default_mail_client,
+      register_file_context_menu,
+      unregister_file_context_menu,
+      is_file_context_menu_registered,
       copy_to_clipboard,
       set_unread_badge,
       list_user_themes,
@@ -1324,13 +1405,17 @@ pub fn run() {
       write_user_theme,
       get_backend_port,
       read_eml_file,
+      take_launch_files,
+      take_launch_attachments,
       uninstall_app,
+      installed_app_location,
       list_user_data_paths,
       delete_user_data
     ])
     .manage(MailWindowStore::default())
     .manage(ComposeWindowStore::default())
     .manage(BackendPort::default())
+    .manage(LaunchQueue::default())
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
@@ -1344,7 +1429,93 @@ pub fn run() {
       }
       #[cfg(not(target_os = "macos"))]
       {
+        // Windows and Linux get the same "brought to the front again" signal
+        // from the single-instance plugin instead (see `run`'s builder above).
         let _ = (app_handle, event);
       }
     });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn args(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+  }
+
+  #[test]
+  fn launch_args_pick_up_message_files() {
+    let (files, attachments) = parse_launch_args(args(&["guvercin.exe", r"C:\mail\note.EML"]));
+    assert_eq!(files, vec![r"C:\mail\note.EML".to_string()]);
+    assert!(attachments.is_empty());
+
+    let (files, _) = parse_launch_args(args(&["guvercin", "/home/u/a.msg", "/home/u/b.eml"]));
+    assert_eq!(files.len(), 2);
+  }
+
+  #[test]
+  fn launch_args_pick_up_attachments_in_both_forms() {
+    let (files, attachments) =
+      parse_launch_args(args(&["guvercin", "--file-attachment", "/tmp/report.pdf"]));
+    assert!(files.is_empty());
+    assert_eq!(attachments, vec!["/tmp/report.pdf".to_string()]);
+
+    let (_, attachments) = parse_launch_args(args(&["guvercin", "--file-attachment=/tmp/a b.png"]));
+    assert_eq!(attachments, vec!["/tmp/a b.png".to_string()]);
+  }
+
+  #[test]
+  fn launch_args_take_a_whole_multi_file_selection() {
+    // Dolphin and Nemo expand a multi-file selection into one argument each.
+    let (files, attachments) = parse_launch_args(args(&[
+      "guvercin",
+      "--file-attachment",
+      "/tmp/one.pdf",
+      "/tmp/two.png",
+      "/tmp/three.eml",
+    ]));
+    assert!(files.is_empty(), "an attachment is not a message to open");
+    assert_eq!(
+      attachments,
+      vec![
+        "/tmp/one.pdf".to_string(),
+        "/tmp/two.png".to_string(),
+        "/tmp/three.eml".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn launch_args_ignore_urls_flags_and_the_program_name() {
+    // argv[0] is the program; a .eml-looking program name must not be opened.
+    let (files, attachments) = parse_launch_args(args(&["/opt/note.eml"]));
+    assert!(files.is_empty() && attachments.is_empty());
+
+    // URLs belong to the deep-link plugin, not to us.
+    let (files, attachments) = parse_launch_args(args(&[
+      "guvercin",
+      "mailto:someone@example.com",
+      "guvercin://attach-file?path=%2Ftmp%2Fx",
+      "--verbose",
+      "note.txt",
+    ]));
+    assert!(files.is_empty(), "only message files are ours");
+    assert!(attachments.is_empty());
+  }
+
+  #[test]
+  fn launch_args_survive_a_missing_attachment_path() {
+    let (files, attachments) = parse_launch_args(args(&["guvercin", "--file-attachment"]));
+    assert!(files.is_empty());
+    assert!(attachments.is_empty());
+  }
+
+  #[test]
+  fn external_url_schemes_are_restricted() {
+    assert!(is_allowed_external_url("https://example.com"));
+    assert!(is_allowed_external_url("mailto:a@example.com"));
+    assert!(!is_allowed_external_url("file:///etc/passwd"));
+    assert!(!is_allowed_external_url("javascript:alert(1)"));
+  }
 }

@@ -44,7 +44,8 @@
       "nsis",
       "dmg",
       "deb",
-      "rpm"
+      "rpm",
+      "appimage"
     ],
     "icon": [
       "icons/32x32.png",
@@ -61,6 +62,26 @@
         "mimeType": "message/rfc822",
         "role": "Viewer"
       }
-    ]
+    ],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      },
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libayatana-appindicator3-1"
+        ],
+        "section": "mail"
+      },
+      "rpm": {
+        "depends": [
+          "webkit2gtk4.1",
+          "gtk3",
+          "libayatana-appindicator-gtk3"
+        ]
+      }
+    }
   }
 }

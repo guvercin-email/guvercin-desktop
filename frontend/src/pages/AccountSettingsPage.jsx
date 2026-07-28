@@ -7,6 +7,10 @@ import {
     setAsDefaultMailClient,
     markDefaultPromptShown,
 } from '../utils/defaultMailClient.js'
+import {
+    isFileContextMenuRegistered,
+    setFileContextMenuRegistered,
+} from '../utils/fileContextMenu.js'
 import './AccountSettingsPage.css'
 
 function AccountSettingsPage() {
@@ -26,6 +30,9 @@ function AccountSettingsPage() {
     // Default mail client state
     const [isDefaultMail, setIsDefaultMail] = useState(false)
     const [isSettingDefault, setIsSettingDefault] = useState(false)
+    // Windows hands the final choice to the user, and some Linux desktops only
+    // pick the change up after a re-login — so whatever the OS said is shown.
+    const [defaultMailNotice, setDefaultMailNotice] = useState('')
 
     const refreshDefaultMail = useCallback(async () => {
         setIsDefaultMail(await isDefaultMailClient())
@@ -37,14 +44,43 @@ function AccountSettingsPage() {
 
     const handleSetDefaultMail = useCallback(async () => {
         setIsSettingDefault(true)
+        setDefaultMailNotice('')
         try {
-            await setAsDefaultMailClient()
+            const outcome = await setAsDefaultMailClient()
             markDefaultPromptShown()
             await refreshDefaultMail()
+            if (!outcome.isDefault && outcome.message) {
+                setDefaultMailNotice(outcome.message)
+            }
         } finally {
             setIsSettingDefault(false)
         }
     }, [refreshDefaultMail])
+
+    // "Send with guvercin" in the file manager.
+    const [hasContextMenu, setHasContextMenu] = useState(false)
+    const [isChangingContextMenu, setIsChangingContextMenu] = useState(false)
+    const [contextMenuNotice, setContextMenuNotice] = useState('')
+
+    const refreshContextMenu = useCallback(async () => {
+        setHasContextMenu(await isFileContextMenuRegistered())
+    }, [])
+
+    useEffect(() => {
+        refreshContextMenu()
+    }, [refreshContextMenu])
+
+    const handleToggleContextMenu = useCallback(async () => {
+        setIsChangingContextMenu(true)
+        setContextMenuNotice('')
+        try {
+            const outcome = await setFileContextMenuRegistered(!hasContextMenu)
+            if (!outcome.ok && outcome.message) setContextMenuNotice(outcome.message)
+            await refreshContextMenu()
+        } finally {
+            setIsChangingContextMenu(false)
+        }
+    }, [hasContextMenu, refreshContextMenu])
 
     const fetchAccounts = useCallback(async () => {
         try {
@@ -188,6 +224,36 @@ function AccountSettingsPage() {
                                         ? t('Setting...')
                                         : t('Make Default Email App')}
                             </button>
+                            {defaultMailNotice && (
+                                <p className="asp-advanced-description" role="status">
+                                    {defaultMailNotice}
+                                </p>
+                            )}
+                        </div>
+                        <div className="asp-advanced-group">
+                            <h4 className="asp-advanced-title">{t('Send with guvercin')}</h4>
+                            <p className="asp-advanced-description">
+                                {hasContextMenu
+                                    ? t('Right-click a file in your file manager to start a message with it attached.')
+                                    : t("Add guvercin to your file manager's right-click menu.")}
+                            </p>
+                            <button
+                                type="button"
+                                className="asp-btn"
+                                onClick={handleToggleContextMenu}
+                                disabled={isChangingContextMenu}
+                            >
+                                {isChangingContextMenu
+                                    ? t('Setting...')
+                                    : hasContextMenu
+                                        ? t('Remove from file manager')
+                                        : t('Add to file manager')}
+                            </button>
+                            {contextMenuNotice && (
+                                <p className="asp-advanced-description" role="status">
+                                    {contextMenuNotice}
+                                </p>
+                            )}
                         </div>
                     </section>
 

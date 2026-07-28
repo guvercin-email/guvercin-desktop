@@ -85,8 +85,18 @@ rebindable. 64 interface languages ship with the app.
 
 grab an installer from the
 [latest release](https://github.com/herdem-herdem/guvercin-desktop/releases/latest):
-a `.dmg` on macos, an `.exe` on windows, a `.deb` or `.rpm` on linux. there is no
-separate backend to install or run — it is compiled into the binary.
+a `.dmg` on macos, an `.exe` on windows, a `.deb`, `.rpm` or `.appimage` on linux.
+there is no separate backend to install or run — it is compiled into the binary.
+
+the same desktop integrations are set up on all three: guvercin can become your
+default `mailto:` and `.eml` handler, installs *send with guvercin* into the file
+manager on first launch (a finder quick action, an explorer context-menu entry,
+drop-ins for nautilus, dolphin, nemo and thunar), shows unread count on the dock,
+launcher or taskbar, and uninstalls itself from settings → advanced.
+
+on linux the launcher count goes out over the `com.canonical.Unity.LauncherEntry`
+d-bus signal — what kde's task manager, dash to dock, cinnamon and the docks all
+listen for — rather than through `libunity`, which only a real unity session has.
 
 ## build from source
 
@@ -133,13 +143,19 @@ process, hot reload on the frontend.
 | backend tests | `cargo test` | `rust-backend/` |
 | backend lints | `cargo clippy` | `rust-backend/` |
 | backend on its own | `GUVERCIN_KEEP_ALIVE=1 cargo run` | `rust-backend/` |
+| shell tests + lints | `cargo test` / `cargo clippy` | `frontend/src-tauri/` |
 
 frontend code is in `frontend/src` (pages, workspace components, utils, and 64
 locale directories); the tauri shell — tray, deep links, file associations, window
-state — is in `frontend/src-tauri`; the axum backend is in `rust-backend/src`, where
-[lib.rs](rust-backend/src/lib.rs) registers every route.
+state — is in `frontend/src-tauri`, with everything os-specific behind one facade in
+[src/platform](frontend/src-tauri/src/platform/mod.rs): `shared.rs` holds the
+platform-neutral halves (and their tests, which run on any host), `macos.rs`,
+`windows.rs` and `unix.rs` hold the calls that genuinely differ. the axum backend is
+in `rust-backend/src`, where [lib.rs](rust-backend/src/lib.rs) registers every route.
 
-lint is clean and ci enforces it, along with `npm test` and `cargo clippy`. 18
+lint is clean and ci enforces it, along with `npm test` and `cargo clippy`. ci also
+builds and tests the tauri shell on all three operating systems, since each one
+compiles a different half of the platform module. 18
 `react-hooks/exhaustive-deps` warnings remain — each needs a judgement call
 about the hook it sits on, so they are warnings rather than errors.
 
