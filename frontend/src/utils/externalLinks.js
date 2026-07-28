@@ -90,8 +90,154 @@ function readThemeCanvas() {
   }
 }
 
-export function sanitizeMailHtml(html) {
+/** Marks a document whose remote images were withheld. */
+export const BLOCKED_REMOTE_ATTR = 'data-blocked-remote'
+
+const REMOTE_BAR_ID = '__guvercin_remote_bar'
+
+const DEFAULT_REMOTE_LABELS = {
+  blocked: 'Remote images in this message were not loaded.',
+  load: 'Load images',
+}
+
+function isRemoteUrl(value) {
+  return /^\s*(https?:)?\/\//i.test(String(value || ''))
+}
+
+/**
+ * Withhold anything that would make the reading pane talk to the sender's
+ * server on open — the tracking-pixel problem. Remote `src` values are parked
+ * in `data-blocked-src` (so "load images" can put them back without
+ * re-fetching the message) and remote `url()` backgrounds are dropped from
+ * inline styles. Returns how many elements were held back.
+ */
+function blockRemoteAssets(doc) {
+  let blocked = 0
+
+  doc.querySelectorAll('img[src], input[type="image"][src]').forEach((el) => {
+    const src = el.getAttribute('src')
+    if (!isRemoteUrl(src)) return
+    el.setAttribute('data-blocked-src', src)
+    el.removeAttribute('src')
+    blocked += 1
+  })
+
+  doc.querySelectorAll('[style]').forEach((el) => {
+    const style = el.getAttribute('style') || ''
+    if (!/url\(/i.test(style)) return
+    const stripped = style.replace(/url\(\s*['"]?\s*(?:https?:)?\/\/[^)]*\)/gi, 'none')
+    if (stripped === style) return
+    el.setAttribute('data-blocked-style', style)
+    el.setAttribute('style', stripped)
+    blocked += 1
+  })
+
+  // Stylesheets the message brings with it can pull remote assets too, and
+  // there is no way to rewrite them reliably — drop the external ones.
+  doc.querySelectorAll('link[rel~="stylesheet"][href]').forEach((el) => {
+    if (!isRemoteUrl(el.getAttribute('href'))) return
+    el.remove()
+    blocked += 1
+  })
+
+  return blocked
+}
+
+/**
+ * Add the "remote images were not loaded / load images" bar to a document
+ * whose assets were withheld.
+ *
+ * The button is wired by a script we inject ourselves, after every script the
+ * message brought with it has already been removed. Doing it this way means
+ * the control works in every reading surface (pane, tab, detached window)
+ * without each one having to wire up a handler, and restoring an image costs
+ * nothing extra — the URL is already parked on the element.
+ */
+function appendRemoteImageBar(doc, labels) {
+  const body = doc.body
+  if (!body) return
+
+  const bar = doc.createElement('div')
+  bar.id = REMOTE_BAR_ID
+  const text = doc.createElement('span')
+  text.textContent = labels.blocked
+  const button = doc.createElement('button')
+  button.type = 'button'
+  button.textContent = labels.load
+  bar.appendChild(text)
+  bar.appendChild(button)
+  body.insertBefore(bar, body.firstChild)
+
+  const style = doc.createElement('style')
+  style.textContent =
+    `#${REMOTE_BAR_ID}{display:flex !important;align-items:center;gap:.75em;` +
+    'flex-wrap:wrap;margin:0 0 1em;padding:.6em .8em;border-radius:6px;' +
+    'background:rgba(127,127,127,.16) !important;font:inherit;font-size:.9em}' +
+    `#${REMOTE_BAR_ID} button{cursor:pointer;padding:.35em .8em;border-radius:5px;` +
+    'border:1px solid currentColor;background:transparent !important;' +
+    'color:inherit !important;font:inherit;font-size:inherit}'
+  doc.head.appendChild(style)
+
+  const script = doc.createElement('script')
+  script.textContent =
+    `(function(){var b=document.getElementById(${JSON.stringify(REMOTE_BAR_ID)});` +
+    'if(!b)return;var t=b.querySelector("button");if(!t)return;' +
+    't.addEventListener("click",function(){' +
+    'document.querySelectorAll("[data-blocked-src]").forEach(function(el){' +
+    'el.setAttribute("src",el.getAttribute("data-blocked-src"));' +
+    'el.removeAttribute("data-blocked-src")});' +
+    'document.querySelectorAll("[data-blocked-style]").forEach(function(el){' +
+    'el.setAttribute("style",el.getAttribute("data-blocked-style"));' +
+    'el.removeAttribute("data-blocked-style")});' +
+    `document.body.removeAttribute(${JSON.stringify(BLOCKED_REMOTE_ATTR)});` +
+    'b.remove();' +
+    'window.dispatchEvent(new Event("guvercin-remote-images-loaded"))})})()'
+  body.appendChild(script)
+}
+
+/**
+ * Put back what blockRemoteAssets() withheld, in a live document. Used by the
+ * "load images" control so the message does not have to be re-fetched.
+ */
+export function allowRemoteAssets(doc) {
+  if (!doc) return 0
+  let restored = 0
+  doc.querySelectorAll('[data-blocked-src]').forEach((el) => {
+    el.setAttribute('src', el.getAttribute('data-blocked-src'))
+    el.removeAttribute('data-blocked-src')
+    restored += 1
+  })
+  doc.querySelectorAll('[data-blocked-style]').forEach((el) => {
+    el.setAttribute('style', el.getAttribute('data-blocked-style'))
+    el.removeAttribute('data-blocked-style')
+    restored += 1
+  })
+  doc.getElementById?.(REMOTE_BAR_ID)?.remove()
+  if (doc.body) doc.body.removeAttribute(BLOCKED_REMOTE_ATTR)
+  return restored
+}
+
+/** How many remote assets a sanitized document is currently withholding. */
+export function countBlockedRemoteAssets(doc) {
+  const raw = doc?.body?.getAttribute?.(BLOCKED_REMOTE_ATTR)
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/**
+ * @param {string} html
+ * @param {{ remoteImages?: 'auto'|'block'|'prompt',
+ *           labels?: { blocked?: string, load?: string } }} [options]
+ *   `auto` loads remote assets, `block` withholds them for good, `prompt`
+ *   withholds them behind a "load images" bar. Omitting it withholds them: a
+ *   caller that forgets to pass the account preference should fail towards
+ *   privacy, not away from it. `labels` supplies translated bar text.
+ */
+export function sanitizeMailHtml(html, options = {}) {
   if (!html) return html
+  const remoteImages = ['auto', 'block', 'prompt'].includes(options.remoteImages)
+    ? options.remoteImages
+    : 'block'
   try {
     const doc = new DOMParser().parseFromString(html, 'text/html')
 
@@ -286,6 +432,19 @@ export function sanitizeMailHtml(html) {
       `html,body,body *{background-color:transparent !important;background-image:none !important;color:${textColor} !important}` +
       'a,a *{color:inherit !important;text-decoration:underline}'
     head.appendChild(baseStyle)
+
+    // ── Withhold remote assets ─────────────────────────────────────
+    // Last, so it also catches the src values moved out of srcset above.
+    if (remoteImages !== 'auto') {
+      const blocked = blockRemoteAssets(doc)
+      if (blocked > 0 && doc.body) {
+        doc.body.setAttribute(BLOCKED_REMOTE_ATTR, String(blocked))
+        // 'block' is "never load"; only 'prompt' offers the way back.
+        if (remoteImages === 'prompt') {
+          appendRemoteImageBar(doc, { ...DEFAULT_REMOTE_LABELS, ...(options.labels || {}) })
+        }
+      }
+    }
 
     // Serialize back — use the full document including <html>/<head>/<body>
     // so styles/meta are preserved

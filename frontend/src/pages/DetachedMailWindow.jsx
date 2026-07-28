@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { apiUrl } from '../utils/api'
 import { normalizeMailboxResponse } from '../utils/mailboxes'
 import ExternalLinkPrompt from '../components/ExternalLinkPrompt.jsx'
@@ -13,6 +14,7 @@ import {
   setDomainLinkBehavior,
   setLinkClickBehavior,
 } from '../utils/externalLinks.js'
+import { getMailSanitizeOptions } from '../utils/mailRenderOptions.js'
 import {
   buildHeaderFallback,
   buildHeadersFileName,
@@ -77,6 +79,7 @@ function getDetachedLabelHint() {
 }
 
 export default function DetachedMailWindow({ initialLabel = '' } = {}) {
+  const { t } = useTranslation()
   const [windowLabel, setWindowLabel] = useState(() => initialLabel || getDetachedLabelHint())
   const [data, setData] = useState(null)
   const [mailContent, setMailContent] = useState(null)
@@ -811,7 +814,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
                     ref={iframeRef}
                     title="mail-content"
                     sandbox="allow-same-origin allow-scripts"
-                    srcDoc={sanitizeMailHtml(mailContent.html_body)}
+                    srcDoc={sanitizeMailHtml(mailContent.html_body, getMailSanitizeOptions(accountId, t))}
                     onLoad={handleIframeLoad}
                   />
                 </div>

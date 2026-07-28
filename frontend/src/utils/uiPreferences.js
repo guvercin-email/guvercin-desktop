@@ -6,8 +6,10 @@
  */
 
 export const UI_PREFERENCES_DEFAULTS = {
-  // Remote images handling: 'auto' loads all, 'block' blocks all, 'prompt' asks per email
-  remoteImageMode: 'auto',
+  // Remote images handling: 'auto' loads all, 'block' blocks all, 'prompt'
+  // withholds them behind a per-message "load images" control. Defaults to
+  // 'prompt': loading on open is what makes a tracking pixel work.
+  remoteImageMode: 'prompt',
   // Delay before marking emails as read when opened (in seconds). 0 = immediate
   markAsReadDelaySeconds: 0,
   // Thread/conversation view: 'on' or 'off'
@@ -31,7 +33,9 @@ function clampNumber(value, fallback, min, max) {
 function coerceSettings(raw) {
   const base = { ...UI_PREFERENCES_DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) }
   return {
-    remoteImageMode: ['auto', 'block', 'prompt'].includes(base.remoteImageMode) ? base.remoteImageMode : 'auto',
+    remoteImageMode: ['auto', 'block', 'prompt'].includes(base.remoteImageMode)
+      ? base.remoteImageMode
+      : UI_PREFERENCES_DEFAULTS.remoteImageMode,
     markAsReadDelaySeconds: clampNumber(base.markAsReadDelaySeconds, UI_PREFERENCES_DEFAULTS.markAsReadDelaySeconds, 0, 30),
     threadViewEnabled: Boolean(base.threadViewEnabled),
     messageListDensity: ['compact', 'normal'].includes(base.messageListDensity) ? base.messageListDensity : 'normal',
