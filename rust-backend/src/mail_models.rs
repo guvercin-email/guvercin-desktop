@@ -55,7 +55,7 @@ pub struct MailboxListResponse {
 
 pub fn is_label_mailbox(mailbox: &str) -> bool {
     let lower = mailbox.trim().to_lowercase();
-    lower.starts_with("labels/") || lower.starts_with("labels/") || lower.starts_with("[labels]/")
+    lower.starts_with("labels/") || lower.starts_with("[labels]/")
 }
 
 pub fn label_key_from_mailbox(mailbox: &str) -> Option<String> {
@@ -63,8 +63,6 @@ pub fn label_key_from_mailbox(mailbox: &str) -> Option<String> {
     let lower = trimmed.to_lowercase();
 
     let key = if lower.starts_with("labels/") {
-        &trimmed["Labels/".len()..]
-    } else if lower.starts_with("labels/") {
         &trimmed["Labels/".len()..]
     } else if lower.starts_with("[labels]/") {
         &trimmed["[Labels]/".len()..]
