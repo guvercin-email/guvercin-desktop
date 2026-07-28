@@ -52,7 +52,9 @@ of ours.
 special-use folder detection, a conversation view you can switch off, a reading
 pane you can move, advanced search, `.eml` import and export, a message source
 viewer, and blocked senders. scripts, frames and inline event handlers are
-stripped out of every message before it is displayed.
+stripped out of every message before it is displayed, and remote images are
+withheld until you ask for them — so opening a message does not tell the sender
+you opened it.
 
 **compose** — a rich-text wysiwyg surface with a formatting ribbon, drag-and-drop
 attachments, and a window you can pop out. right-click a file anywhere in your file
@@ -133,8 +135,9 @@ locale directories); the tauri shell — tray, deep links, file associations, wi
 state — is in `frontend/src-tauri`; the axum backend is in `rust-backend/src`, where
 [lib.rs](rust-backend/src/lib.rs) registers every route.
 
-`npm run lint` currently reports 84 pre-existing errors. ci reports them without
-failing on them; that backlog is open work, so please do not add to it.
+lint is clean and ci enforces it, along with `npm test` and `cargo clippy`. 18
+`react-hooks/exhaustive-deps` warnings remain — each needs a judgement call
+about the hook it sits on, so they are warnings rather than errors.
 
 ---
 
@@ -199,15 +202,9 @@ anything running as you — including malware in your own session — because th
 simply read the key. full-disk encryption is still your job. moving the key into
 the platform keychain is open work.
 
-two more things worth knowing before you trust this app with something sensitive:
-
-- **remote images in the reading pane are not blocked yet.** opening a message
-  fetches its images straight from the sender's server, which tells the sender you
-  opened it and reveals your ip. the setting for this exists in the ui but is not
-  wired to the rendering path.
-- **the shipped google oauth client secret is public.** it is compiled into the
-  binary because an installed desktop app has nowhere to hide it; pkce is what
-  actually protects that flow.
+one more thing worth knowing: **the shipped google oauth client secret is
+public.** it is compiled into the binary because an installed desktop app has
+nowhere to hide it; pkce is what actually protects that flow.
 
 the full threat model, and where to report a vulnerability, is in
 [SECURITY.md](SECURITY.md).

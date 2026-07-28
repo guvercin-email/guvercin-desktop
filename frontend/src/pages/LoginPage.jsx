@@ -299,14 +299,6 @@ const AUTOCONFIG_PROVIDERS = [
     },
 ]
 
-function safeParseJson(raw, fallback) {
-    try {
-        return JSON.parse(raw)
-    } catch {
-        return fallback
-    }
-}
-
 function cloneFormData(data = {}) {
     return { ...DEFAULT_FORM_DATA, ...data }
 }

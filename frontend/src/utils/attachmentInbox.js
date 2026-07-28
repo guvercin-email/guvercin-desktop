@@ -6,8 +6,6 @@
 
 import { invoke } from '@tauri-apps/api/core'
 
-const queue = []
-const subscribers = new Set()
 let initialized = false
 
 function isTauri() {
@@ -21,20 +19,6 @@ async function attachFile(filePath) {
     await invoke('attach_file_to_compose', { filePath })
   } catch (error) {
     console.error('Failed to attach file:', error)
-  }
-}
-
-function dispatch(attachment) {
-  if (subscribers.size === 0) {
-    queue.push(attachment)
-    return
-  }
-  for (const cb of subscribers) {
-    try {
-      cb(attachment)
-    } catch (error) {
-      console.error('attachment subscriber failed:', error)
-    }
   }
 }
 

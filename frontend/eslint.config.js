@@ -23,10 +23,24 @@ export default defineConfig([
       },
     },
     rules: {
-      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]', argsIgnorePattern: '^[A-Z_]' }],
+      // `caughtErrors: 'none'` — a great deal of this app is best-effort glue
+      // around APIs that simply are not there in some contexts (Tauri commands
+      // in a plain browser, localStorage behind a privacy setting). Swallowing
+      // those is deliberate, and naming the error only to ignore it is noise.
+      // The same reasoning drives allowEmptyCatch below.
+      'no-unused-vars': [
+        'error',
+        { varsIgnorePattern: '^[A-Z_]', argsIgnorePattern: '^[A-Z_]', caughtErrors: 'none' },
+      ],
+      'no-empty': ['error', { allowEmptyCatch: true }],
       'no-control-regex': 'off',
       'react-refresh/only-export-components': 'off',
       'react-hooks/set-state-in-effect': 'off',
     },
+  },
+  {
+    // Node's test runner: `node --test src/utils/*.test.js`.
+    files: ['**/*.test.{js,jsx}'],
+    languageOptions: { globals: { ...globals.browser, ...globals.node } },
   },
 ])

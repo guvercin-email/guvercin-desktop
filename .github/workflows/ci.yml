@@ -24,11 +24,7 @@ jobs:
             frontend/package-lock.json
       - run: npm install
       - run: npm --prefix frontend install
-      # 84 pre-existing errors (mostly no-unused-vars / no-empty) and 4
-      # no-dupe-keys that are real bugs. Reported, not enforced, until that
-      # backlog is burned down — then drop continue-on-error.
       - run: npm run lint
-        continue-on-error: true
       - run: npm test
 
   backend:

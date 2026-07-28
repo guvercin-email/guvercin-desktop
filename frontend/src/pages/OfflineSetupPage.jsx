@@ -31,7 +31,7 @@ function hasMinimumAccountForm(formData) {
 
 function buildTreeNodes(paths, nodeType) {
   const root = []
-  const insert = (parts, fullPath) => {
+  const insert = (parts) => {
     let level = root
     for (let i = 0; i < parts.length; i += 1) {
       const part = parts[i]
@@ -51,10 +51,6 @@ function buildTreeNodes(paths, nodeType) {
       }
       level = node.children
     }
-    
-    if (level && fullPath) {
-      
-    }
   }
 
   paths
@@ -64,7 +60,7 @@ function buildTreeNodes(paths, nodeType) {
     .forEach((path) => {
       const normalized = nodeType === 'folder' ? normalizeFolderPath(path) : normalizeLabelPath(path)
       const parts = normalized.split('/').filter(Boolean)
-      if (parts.length) insert(parts, normalized)
+      if (parts.length) insert(parts)
     })
 
   const sortNodes = (nodes) => {

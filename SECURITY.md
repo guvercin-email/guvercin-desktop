@@ -33,6 +33,12 @@ about the current code, not an aspiration.
   every `on*` attribute, and neutralises `javascript:` URLs. Links are rewritten
   to `data-external-href` and opened through a confirmation prompt rather than
   navigating the pane.
+- Tracking pixels. Remote images, remote `url()` backgrounds in inline styles
+  and remote stylesheets are withheld from the reading pane; their URLs are
+  parked on the element and only restored when the reader clicks "load
+  images". `cid:` and `data:` assets, which cost the sender no request, are
+  untouched. The default is per-message prompting; Settings → Remote Images
+  can make it always-load or never-load.
 - Local network exposure. The HTTP API binds `127.0.0.1:0` and is an in-process
   boundary, not a service. Nothing listens on an external interface.
 
@@ -53,13 +59,11 @@ about the current code, not an aspiration.
   nowhere to hide it; Google's desktop client type is designed on that
   assumption and PKCE is what actually protects the flow. Treat the value as
   published, not secret.
-- **Remote images are not blocked.** A message opened in the reading pane loads
-  its remote images straight from the sender's server. That confirms to the
-  sender that the message was opened and reveals the reader's IP address —
-  the standard tracking-pixel result. The `remoteImageMode` preference in
-  Settings is currently not wired to the rendering path, and the
-  `/api/mail/:account_id/proxy-image` endpoint is only used by the PDF/print
-  export. Do not rely on this app to defeat tracking pixels today.
+- **Withholding remote images hides the fact that you opened a message, not
+  your IP.** Once you click "load images" the request goes out from your
+  machine directly — there is no relay. The `proxy-image` endpoint exists but
+  is used only by the PDF/print export, and it would not help anyway: it runs
+  on the same machine.
 - **Mail HTML is filtered by a denylist, in an iframe that is not a real
   sandbox.** The reading pane iframe carries
   `sandbox="allow-same-origin allow-scripts"`, a combination that grants no

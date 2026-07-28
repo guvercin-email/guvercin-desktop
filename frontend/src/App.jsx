@@ -8,7 +8,8 @@ import DashboardPage from './pages/DashboardPage.jsx'
 import AccountSelectionPage from './pages/AccountSelectionPage.jsx'
 import DetachedMailWindow from './pages/DetachedMailWindow.jsx'
 import DetachedComposeWindow from './pages/DetachedComposeWindow.jsx'
-import i18n from './i18n'
+// Imported for its side effect: the module initialises i18next on load.
+import './i18n'
 import { useTranslation } from 'react-i18next'
 import { hydrateAccountSession } from './utils/accountStorage.js'
 import { initMailtoInbox } from './utils/mailtoInbox.js'
@@ -92,7 +93,6 @@ function App() {
 
     const tempFont = localStorage.getItem('temp_font')
     const savedFont = localStorage.getItem('font')
-    const onboardingPaths = ['/login', '/theme', '/offline-setup', '/not_auth', '/settings', '/account-settings']
 
     const defaultFontStack = '"Hanken Grotesk", "Helvetica Neue", Helvetica, Arial, sans-serif'
     const chosenFont = tempFont || savedFont

@@ -47,7 +47,6 @@ import {
     getGeneralSettings,
     saveGeneralSettings,
     getLaunchAtLogin,
-    setLaunchAtLogin,
     getAvailableLanguages,
 } from '../utils/generalSettings.js'
 import {
@@ -81,8 +80,14 @@ function useSettingsDraft(id, label, { isDirty, save, revert }) {
     const ctx = useContext(SettingsDraftContext)
     const saveRef = useRef(save)
     const revertRef = useRef(revert)
-    saveRef.current = save
-    revertRef.current = revert
+    // Latest-ref pattern. Assigning during render trips react-hooks/refs and is
+    // unsafe under concurrent rendering; both refs are only ever read from the
+    // effect below and from the registered callbacks, so committing them here
+    // is equivalent and legal.
+    useEffect(() => {
+        saveRef.current = save
+        revertRef.current = revert
+    })
 
     useEffect(() => {
         if (!ctx) return undefined
@@ -1754,15 +1759,11 @@ function LinksSettings({ searchQuery = '' }) {
             // Save global default
             await setLinkClickBehavior(behavior)
             
-            // Save all domain rules
-            // First clear old ones that were removed, or just overwrite all?
-            // The backend command set_domain_link_behavior sets one at a time.
-            // Ideally we need a bulk save command, but we can iterate for now.
-            // Wait, we need to handle removals too.
-            
+            // Domain rules are saved one at a time: the backend only exposes
+            // set_domain_link_behavior / removeDomainLinkBehavior per domain,
+            // so removals and writes are iterated separately below.
             const oldDomains = Object.keys(domainsBaselineRef.current)
-            const newDomains = Object.keys(domainBehaviors)
-            
+
             // Remove domains that are no longer in the list
             for (const d of oldDomains) {
                 if (!domainBehaviors[d]) {
