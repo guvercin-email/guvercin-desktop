@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: frontend (lint + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - run: npm install
+      - run: npm --prefix frontend install
+      # 84 pre-existing errors (mostly no-unused-vars / no-empty) and 4
+      # no-dupe-keys that are real bugs. Reported, not enforced, until that
+      # backlog is burned down — then drop continue-on-error.
+      - run: npm run lint
+        continue-on-error: true
+      - run: npm test
+
+  backend:
+    name: backend (clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # SQLCipher is compiled from source by libsqlite3-sys.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-backend
+      - name: clippy
+        working-directory: rust-backend
+        run: cargo clippy --all-targets
+      - name: test
+        working-directory: rust-backend
+        run: cargo test

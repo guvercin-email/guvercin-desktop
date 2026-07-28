@@ -12,6 +12,9 @@
     "app:dev": "tauri dev",
     "app:build": "tauri build"
   },
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24"
+  },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "@tauri-apps/plugin-deep-link": "^2.4.9",
