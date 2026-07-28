@@ -9,7 +9,6 @@ import {
     defaultMailboxSidebarPriority,
 } from '../utils/mailboxes'
 import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
-import { useTheme } from '../context/ThemeContext.jsx'
 import Avatar from '../components/Avatar.jsx'
 import ComposeMailContent from '../components/ComposeMailContent.jsx'
 import ComposeFormatTools from '../components/ComposeFormatTools.jsx'
@@ -47,6 +46,7 @@ import {
     setDomainLinkBehavior,
     setLinkClickBehavior,
 } from '../utils/externalLinks.js'
+import { getMailSanitizeOptions } from '../utils/mailRenderOptions.js'
 import {
     buildHeaderFallback,
     buildHeadersFileName,
@@ -121,7 +121,8 @@ function resizeIframeToContent(iframe) {
     }
 }
 
-function ResizableHtmlIframe({ html, title, onLinkClick }) {
+function ResizableHtmlIframe({ html, title, onLinkClick, accountId }) {
+    const { t } = useTranslation()
     const ref = useRef(null)
 
     useEffect(() => {
@@ -154,13 +155,13 @@ function ResizableHtmlIframe({ html, title, onLinkClick }) {
             window.setTimeout(handleResize, 250)
         }
 
-        iframe.srcdoc = sanitizeMailHtml(html) || ''
+        iframe.srcdoc = sanitizeMailHtml(html, getMailSanitizeOptions(accountId, t)) || ''
         window.setTimeout(handleResize, 50)
         return () => {
             if (iframe) iframe.onload = null
             if (disposeLinks) disposeLinks()
         }
-    }, [html, onLinkClick])
+    }, [html, onLinkClick, accountId, t])
 
     return <iframe ref={ref} title={title} sandbox="allow-same-origin allow-scripts" />
 }
@@ -1281,15 +1282,6 @@ const DashboardPage = () => {
         flushQueue,
     } = useOfflineSync()
 
-    const {
-        themeMode,
-        themeName,
-        availableThemes,
-        refreshThemes,
-        setThemeMode,
-        setThemeName,
-    } = useTheme()
-
     const [activeSection, setActiveSection] = useState('mail')
     // Shared search box for the non-mail workspaces (Contacts / Calendar / Todo).
     // The main navbar search drives this so it searches whatever page you're on.
@@ -1341,9 +1333,10 @@ const DashboardPage = () => {
     const [isMailFullscreen, setIsMailFullscreen] = useState(false)
     const [appMenuVisible, setAppMenuVisible] = useState(true)
     const [isSyncing, setIsSyncing] = useState(false)
-    const [isManualRefreshing, setIsManualRefreshing] = useState(false)
     const [actionNotices, setActionNotices] = useState([])
-    const [noticeNow, setNoticeNow] = useState(Date.now())
+    // NOTE: this never ticks — the notice countdown at the action-notice
+    // renderer is therefore frozen at mount time.
+    const [noticeNow] = useState(Date.now())
 
     const accountIdRef = useRef(accountId)
     const selectedFolderRef = useRef(selectedFolder)
@@ -1422,8 +1415,6 @@ const DashboardPage = () => {
             }
         }
     }, [externalLinkPromptUrl])
-    const syncAbortRef = useRef(null)
-    const isSyncingRef = useRef(false)
     const autoRefreshInFlightRef = useRef(false)
     // New-mail notification tracking: the INBOX mail ids seen on the previous
     // poll, and whether we've completed the first (baseline) poll yet.
@@ -1436,7 +1427,6 @@ const DashboardPage = () => {
     const nextTabId = useRef(0)
     const nextNoticeIdRef = useRef(0)
     const pendingNoticeActionsRef = useRef(new Map())
-    const prevCanUseRemoteMailRef = useRef(false)
     const lastConnectAttemptAtRef = useRef(0)
     const lastMailboxBeforeSearchRef = useRef(null)
     const canUseRemoteMail = backendReachable && networkOnline && (remoteMailAvailable || connected)
@@ -1581,6 +1571,20 @@ const DashboardPage = () => {
         return () => window.removeEventListener('guvercin-shortcuts-changed', reload)
     }, [])
 
+    // Cross-feature navigation: let Contacts/Mail hand work to Calendar/Todo by
+    // switching the active workspace (the target section then drains its own
+    // prefill queue). See utils/crossLinks.js. This has to live here, next to
+    // the activeSection state — subscribing from MailSection threw a
+    // ReferenceError because setActiveSection is not in that scope.
+    useEffect(() => {
+        const unsubscribe = subscribeNavigate((section) => {
+            if (['mail', 'calendar', 'contacts', 'todo'].includes(section)) {
+                setActiveSection(section)
+            }
+        })
+        return unsubscribe
+    }, [])
+
     // Clear the workspace search when moving between sections so a query typed
     // on one page doesn't leak into the next.
     useEffect(() => { setSectionSearch('') }, [activeSection])
@@ -1711,8 +1715,6 @@ const DashboardPage = () => {
     const mainBarRegion = layoutRegions.main || 'top'
     const appsBarRegion = layoutRegions.apps || 'left'
     const isMainBarVertical = mainBarRegion === 'left' || mainBarRegion === 'right'
-    const isMailboxesRight = layoutRegions.mailboxes === 'right'
-    const isMaillistRight = layoutRegions.maillist === 'right'
 
     const handleAccountButtonClick = () => setAccountMenuOpen(!accountMenuOpen)
     const closeAccountMenu = () => setAccountMenuOpen(false)
@@ -2734,7 +2736,7 @@ const DashboardPage = () => {
         try {
             const doc = iframe.contentDocument
             doc.open()
-            doc.write(sanitizeMailHtml(mailContent.html_body))
+            doc.write(sanitizeMailHtml(mailContent.html_body, getMailSanitizeOptions(accountId, t)))
             doc.close()
             resizeIframeToContent(iframe)
             window.setTimeout(() => resizeIframeToContent(iframe), 50)
@@ -2759,7 +2761,7 @@ const DashboardPage = () => {
                 mailIframeLinkCleanupRef.current = null
             }
         }
-    }, [iframeRef, mailContent, handleExternalLink, activeSection])
+    }, [iframeRef, mailContent, handleExternalLink, activeSection, accountId, t])
 
     useEffect(() => {
         if (mailContent?.html_body) return
@@ -2779,7 +2781,7 @@ const DashboardPage = () => {
     const timeStr = timeFormatter.format(nowForClock)
     const dateDayMonth = new Intl.DateTimeFormat(undefined, { day: '2-digit', month: '2-digit' })
         .format(nowForClock)
-        .replace(/[\/-]/g, '.')
+        .replace(/[/-]/g, '.')
     const dateYear = new Intl.DateTimeFormat(undefined, { year: 'numeric' }).format(nowForClock)
     const [timeMain, timeSuffix] = timeStr.includes(' ')
         ? timeStr.split(' ')
@@ -3788,15 +3790,6 @@ function MailSection({
     }, [selectedMail, visibleMails])
 
     const selectedPage = selectedGlobalIndex >= 0 ? Math.floor(selectedGlobalIndex / perPageValue) + 1 : 1
-    const selectedPageStart = (selectedPage - 1) * perPageValue
-    const selectedIndexInPage = selectedGlobalIndex >= 0 ? (selectedGlobalIndex - selectedPageStart + 1) : 0
-    const selectedPageCount = selectedGlobalIndex >= 0
-        ? visibleMails.slice(selectedPageStart, selectedPageStart + perPageValue).length
-        : 0
-    const prevMail = selectedGlobalIndex > 0 ? visibleMails[selectedGlobalIndex - 1] : null
-    const nextMail = selectedGlobalIndex >= 0 && selectedGlobalIndex < visibleMails.length - 1
-        ? visibleMails[selectedGlobalIndex + 1]
-        : null
 
     const selectedThreadGlobalIndex = useMemo(() => {
         if (!threadedEnabled || !selectedThread?.id) return -1
@@ -3805,20 +3798,6 @@ function MailSection({
     const selectedThreadPage = selectedThreadGlobalIndex >= 0
         ? Math.floor(selectedThreadGlobalIndex / perPageValue) + 1
         : 1
-
-    const selectedThreadIndex = useMemo(() => {
-        if (!threadedEnabled || !selectedThread) return -1
-        return (selectedThread.mails || []).findIndex((m) => String(m?.id ?? '') === String(selectedMail?.id ?? ''))
-    }, [selectedMail?.id, selectedThread, threadedEnabled])
-    const selectedThreadCount = threadedEnabled && selectedThread ? (selectedThread.mails || []).length : 0
-    const latestThreadMail = threadedEnabled && selectedThreadCount > 0
-        ? selectedThread.mails[selectedThreadCount - 1]
-        : null
-    const selectedIsThreadAnchor = !!(latestThreadMail && selectedMail && String(selectedMail.id) === String(latestThreadMail.id))
-    const prevThreadMail = threadedEnabled && selectedThreadIndex > 0 ? selectedThread.mails[selectedThreadIndex - 1] : null
-    const nextThreadMail = threadedEnabled && selectedThread && selectedThreadIndex >= 0 && selectedThreadIndex < selectedThreadCount - 1
-        ? selectedThread.mails[selectedThreadIndex + 1]
-        : null
 
     const fetchMailContentForThreadReader = useCallback(async (mail) => {
         if (!mail || !accountId || !backendReachable) return null
@@ -4234,17 +4213,6 @@ function MailSection({
         }, { preserveExisting: false })
     }, [accountEmail, openInlineCompose])
 
-    // Cross-feature navigation: let Contacts/Mail hand work to Calendar/Todo by
-    // switching the active workspace (the target section then drains its own
-    // prefill queue). See utils/crossLinks.js.
-    useEffect(() => {
-        const unsubscribe = subscribeNavigate((section) => {
-            if (['mail', 'calendar', 'contacts', 'todo'].includes(section)) {
-                setActiveSection(section)
-            }
-        })
-        return unsubscribe
-    }, [])
 
     // Handle `mailto:` deep links: open a prefilled compose surface. Drains any
     // links queued before the dashboard mounted (cold start) and receives new
@@ -4855,14 +4823,6 @@ function MailSection({
         }
     }, [inlineComposeSession, selectedMail])
 
-    const buildMultiMailSummary = (mailList) => (
-        mailList.map((mail) => {
-            const sender = mail.name || mail.address || 'Unknown'
-            const subject = mail.subject || '(No Subject)'
-            return `- ${sender}: ${subject}`
-        }).join('\n')
-    )
-
     const buildLabelSelectionStates = useCallback((targetMails) => {
         const mailsToCheck = Array.isArray(targetMails) ? targetMails.filter(Boolean) : []
         if (mailsToCheck.length === 0) return []
@@ -5090,7 +5050,6 @@ function MailSection({
     const labelMenuRef = useRef(null)
     const downloadAsMenuRef = useRef(null)
     const submenuMoreRef = useRef(null)
-    const [isSubmenuMoreOpen, setIsSubmenuMoreOpen] = useState(false)
     const [submenuVisibleCount, setSubmenuVisibleCount] = useState(99)
     const importFileInputRef = useRef(null)
     const mailItemMenuRef = useRef(null)
@@ -5492,7 +5451,7 @@ function MailSection({
         if (ref && content?.html_body) {
             const doc = ref.contentDocument
             doc.open()
-            doc.write(sanitizeMailHtml(content.html_body))
+            doc.write(sanitizeMailHtml(content.html_body, getMailSanitizeOptions(accountId, t)))
             doc.close()
             resizeIframeToContent(ref)
             window.setTimeout(() => resizeIframeToContent(ref), 50)
@@ -5505,7 +5464,7 @@ function MailSection({
                 img.addEventListener('error', () => resizeIframeToContent(ref), { once: true })
             })
         }
-    }, [activeTabId, tabContents])
+    }, [activeTabId, tabContents, accountId, t])
 
     useEffect(() => {
         const handleClickOutside = (e) => {
@@ -6113,7 +6072,7 @@ function MailSection({
         const action = actionType === 'Delete' ? 'delete' : 'move'
 
         try {
-            const res = await fetch(`/api/offline/${activeAccount?.account_id}/blocked-senders`, {
+            const res = await fetch(apiUrl(`/api/offline/${accountId}/blocked-senders`), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -7750,30 +7709,6 @@ function MailSection({
                                                         if (latestMail?.id) setLastSelectedMailId(latestMail.id)
                                                     }
 
-                                                    const handleThreadMarkReadToggle = async (event) => {
-                                                        event.stopPropagation()
-                                                        if (mailIds.length === 0) return
-                                                        await setMailsSeenState(mailIds, isUnread)
-                                                    }
-
-                                                    const handleThreadArchive = async (event) => {
-                                                        event.stopPropagation()
-                                                        if (mailIds.length === 0) return
-                                                        await moveMailsOptimistic(mailIds, resolveFolderDestination('Archive'))
-                                                    }
-
-                                                    const handleThreadTrash = async (event) => {
-                                                        event.stopPropagation()
-                                                        if (mailIds.length === 0) return
-                                                        await moveMailsOptimistic(mailIds, resolveFolderDestination('Trash'))
-                                                    }
-
-                                                    const handleThreadDelete = async (event) => {
-                                                        event.stopPropagation()
-                                                        if (mailIds.length === 0) return
-                                                        await deleteMailsOptimistic(mailIds)
-                                                    }
-
                                                     return (
                                                         <React.Fragment key={thread.id}>
                                                             <li
@@ -8224,7 +8159,7 @@ function MailSection({
                                         <hr className="db-mail-divider" />
 	                                        {importPreview?.content?.html_body ? (
 	                                            <div className="db-mail-body-html">
-	                                                <ResizableHtmlIframe title="imported-mail-content" html={importPreview.content.html_body} onLinkClick={onExternalLink} />
+	                                                <ResizableHtmlIframe title="imported-mail-content" html={importPreview.content.html_body} onLinkClick={onExternalLink} accountId={accountId} />
 	                                            </div>
 	                                        ) : (
 	                                            <div className="db-mail-body">{importPreview?.content?.plain_body || '(No content)'}</div>
@@ -8343,7 +8278,7 @@ function MailSection({
                                                                         </div>
                                                                     ) : content.html_body ? (
                                                                         <div className="db-mail-body-html">
-                                                                            <ResizableHtmlIframe title={`mail-content-${id}`} html={content.html_body} onLinkClick={onExternalLink} />
+                                                                            <ResizableHtmlIframe title={`mail-content-${id}`} html={content.html_body} onLinkClick={onExternalLink} accountId={accountId} />
                                                                         </div>
                                                                     ) : (
                                                                         <div className="db-mail-body">{content.plain_body || '(No content)'}</div>
@@ -8573,7 +8508,7 @@ function MailSection({
     )
 }
 
-export function MailDynamicLayout({ layoutMode, layoutData, mailboxesBar, maillistBar, tabsBar, toolsBar, centerPlane, hideCenterPlane = false }) {
+export function MailDynamicLayout({ layoutData, mailboxesBar, maillistBar, tabsBar, toolsBar, centerPlane, hideCenterPlane = false }) {
     const bars = {
         mailboxes: mailboxesBar,
         maillist: maillistBar,
