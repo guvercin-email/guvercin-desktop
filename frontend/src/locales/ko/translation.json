@@ -248,5 +248,7 @@
   "More": "더 보기",
   "Link title (optional)": "링크 제목(선택사항)",
   "Add": "추가",
-  "Emoji": "이모지"
+  "Emoji": "이모지",
+  "Remote images in this message were not loaded": "이 메시지의 원격 이미지를 불러오지 않았습니다",
+  "Load images": "이미지 불러오기"
 }

@@ -248,5 +248,7 @@
   "More": "Daha Fazla",
   "Link title (optional)": "Link başlığı (opsiyonel)",
   "Add": "Ekle",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Bu iletideki uzak görseller yüklenmedi",
+  "Load images": "Görselleri yükle"
 }

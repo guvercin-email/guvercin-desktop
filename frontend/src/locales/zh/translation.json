@@ -248,5 +248,7 @@
   "More": "更多",
   "Link title (optional)": "链接标题(可选)",
   "Add": "添加",
-  "Emoji": "表情符号"
+  "Emoji": "表情符号",
+  "Remote images in this message were not loaded": "此邮件中的远程图片未加载",
+  "Load images": "加载图片"
 }

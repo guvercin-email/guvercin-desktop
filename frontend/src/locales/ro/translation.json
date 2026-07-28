@@ -248,5 +248,7 @@
   "More": "More",
   "Link title (optional)": "Link title (optional)",
   "Add": "Add",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Imaginile la distanță din acest mesaj nu au fost încărcate",
+  "Load images": "Încarcă imaginile"
 }

@@ -248,5 +248,7 @@
   "More": "Mer",
   "Link title (optional)": "Länktitel (valfritt)",
   "Add": "Lägg till",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Fjärrbilder i det här meddelandet laddades inte",
+  "Load images": "Läs in bilder"
 }

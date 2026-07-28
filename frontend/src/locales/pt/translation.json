@@ -248,5 +248,7 @@
   "More": "Mais",
   "Link title (optional)": "Título do link (opcional)",
   "Add": "Adicionar",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "As imagens remotas desta mensagem não foram carregadas",
+  "Load images": "Carregar imagens"
 }

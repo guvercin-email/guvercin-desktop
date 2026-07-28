@@ -248,5 +248,7 @@
   "More": "さらに表示",
   "Link title (optional)": "リンクタイトル(オプション)",
   "Add": "追加",
-  "Emoji": "絵文字"
+  "Emoji": "絵文字",
+  "Remote images in this message were not loaded": "このメッセージのリモート画像は読み込まれていません",
+  "Load images": "画像を読み込む"
 }

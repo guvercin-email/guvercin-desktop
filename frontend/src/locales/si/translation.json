@@ -248,5 +248,7 @@
   "More": "More",
   "Link title (optional)": "Link title (optional)",
   "Add": "Add",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "මෙම පණිවිඩයේ දුරස්ථ පින්තූර පූරණය කර නැත",
+  "Load images": "පින්තූර පූරණය කරන්න"
 }

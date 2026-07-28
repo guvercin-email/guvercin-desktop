@@ -248,5 +248,7 @@
   "More": "Meer",
   "Link title (optional)": "Linktitel (optioneel)",
   "Add": "Toevoegen",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Externe afbeeldingen in dit bericht zijn niet geladen",
+  "Load images": "Afbeeldingen laden"
 }

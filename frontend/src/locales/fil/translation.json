@@ -248,5 +248,7 @@
   "More": "More",
   "Link title (optional)": "Link title (optional)",
   "Add": "Add",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Hindi na-load ang mga malayong larawan sa mensaheng ito",
+  "Load images": "I-load ang mga larawan"
 }

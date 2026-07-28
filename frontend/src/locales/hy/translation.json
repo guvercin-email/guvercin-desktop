@@ -248,5 +248,7 @@
   "More": "More",
   "Link title (optional)": "Link title (optional)",
   "Add": "Add",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "Այս նամակի հեռավոր պատկերները չեն բեռնվել",
+  "Load images": "Բեռնել պատկերները"
 }

@@ -248,5 +248,7 @@
   "More": "Еще",
   "Link title (optional)": "Название ссылки (необязательно)",
   "Add": "Добавить",
-  "Emoji": "Эмодзи"
+  "Emoji": "Эмодзи",
+  "Remote images in this message were not loaded": "Удалённые изображения в этом письме не были загружены",
+  "Load images": "Загрузить изображения"
 }

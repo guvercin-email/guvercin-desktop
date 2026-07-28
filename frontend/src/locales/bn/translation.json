@@ -248,5 +248,7 @@
   "More": "More",
   "Link title (optional)": "Link title (optional)",
   "Add": "Add",
-  "Emoji": "Emoji"
+  "Emoji": "Emoji",
+  "Remote images in this message were not loaded": "এই বার্তার দূরবর্তী ছবিগুলি লোড করা হয়নি",
+  "Load images": "ছবি লোড করুন"
 }
