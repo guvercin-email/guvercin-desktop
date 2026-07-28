@@ -1,7 +1,7 @@
 .sidebar-tabs {
   width: 50px;
   background: var(--c-bg);
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   display: flex;
   flex-direction: column;
   padding: 10px 4px;

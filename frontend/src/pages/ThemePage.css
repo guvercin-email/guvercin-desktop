@@ -35,7 +35,7 @@
 
 .onboarding-back-btn {
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
   border: none;
   background: transparent;
   color: var(--c-text-2);
@@ -66,7 +66,7 @@
 
 .theme-card {
   width: 100%;
-  text-align: left;
+  text-align: start;
   border-radius: 12px;
   padding: 14px;
   background: var(--c-surface-2);

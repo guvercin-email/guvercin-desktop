@@ -26,7 +26,7 @@
 
 .db-action-notices {
   position: fixed;
-  right: 18px;
+  inset-inline-end: 18px;
   bottom: 18px;
   display: flex;
   flex-direction: column;
@@ -264,7 +264,7 @@ body.resizing * {
   padding: 8px 12px;
   font-size: 14px;
   transition: background 0.2s ease, color 0.2s ease;
-  border-left: 1px solid color-mix(in srgb, var(--c-border-1) 90%, transparent);
+  border-inline-start: 1px solid color-mix(in srgb, var(--c-border-1) 90%, transparent);
   color: var(--c-text-2);
 }
 
@@ -273,7 +273,7 @@ body.resizing * {
 }
 
 .db-navbar-right {
-  margin-left: auto;
+  margin-inline-start: auto;
   display: flex;
   align-items: center;
   gap: 15px;
@@ -355,7 +355,7 @@ body.resizing * {
 .db-settings-menu {
   position: absolute;
   top: calc(100% + 8px);
-  right: 0;
+  inset-inline-end: 0;
   min-width: 220px;
   background: color-mix(in srgb, var(--c-surface-2) 92%, transparent);
   border: 1px solid var(--shell-panel-border, var(--c-border-1));
@@ -384,7 +384,7 @@ body.resizing * {
   border: none;
   background: transparent;
   color: inherit;
-  text-align: left;
+  text-align: start;
   padding: 8px 10px;
   border-radius: 10px;
   cursor: pointer;
@@ -413,7 +413,7 @@ body.resizing * {
 
 .db-sync-indicator__dot {
   position: absolute;
-  right: 6px;
+  inset-inline-end: 6px;
   bottom: 6px;
   width: 9px;
   height: 9px;
@@ -439,7 +439,7 @@ body.resizing * {
   display: none;
   position: absolute;
   top: calc(100% + 10px);
-  right: 0;
+  inset-inline-end: 0;
   min-width: 260px;
   max-width: 320px;
   background: color-mix(in srgb, var(--c-surface-2) 92%, transparent);
@@ -548,7 +548,7 @@ body.resizing * {
 .account-popover {
   position: absolute;
   top: calc(100% + 8px);
-  right: 0;
+  inset-inline-end: 0;
   width: 260px;
   background: color-mix(in srgb, var(--c-surface-2) 92%, transparent);
   border-radius: 1.25rem;
@@ -605,7 +605,7 @@ body.resizing * {
 
 .account-popover__settings-btn {
   position: absolute;
-  right: -0.25rem;
+  inset-inline-end: -0.25rem;
   top: -0.25rem;
   background: var(--c-surface-3);
   border: 1px solid var(--c-border-1);
@@ -663,7 +663,7 @@ body.resizing * {
   font-weight: 600;
   color: var(--c-text-1);
   transition: all 0.15s ease;
-  text-align: left;
+  text-align: start;
 }
 
 .account-popover__action-item:not(:last-child) {
@@ -776,7 +776,7 @@ body.resizing * {
   flex-shrink: 0;
   transition: background 0.2s ease, transform 0.2s ease;
   border-radius: 10px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
 }
 
 .db-submenu-more-btn:hover {
@@ -796,7 +796,7 @@ body.resizing * {
 .db-overflow-menu {
   position: absolute;
   top: 100%;
-  right: 4px;
+  inset-inline-end: 4px;
   background: color-mix(in srgb, var(--c-surface-2) 92%, transparent);
   border: 1px solid var(--shell-panel-border, var(--c-border-1));
   border-radius: 14px;
@@ -832,7 +832,7 @@ body.resizing * {
 
 .db-overflow-menu-item li button {
   width: 100%;
-  text-align: left;
+  text-align: start;
   height: 32px;
   padding: 0 16px;
   border-radius: 0;
@@ -973,7 +973,7 @@ body.resizing * {
   width: 100%;
   border: none;
   background: transparent;
-  text-align: left;
+  text-align: start;
   padding: 8px 12px;
   font-size: 12px;
   color: var(--c-text-1);
@@ -1018,7 +1018,7 @@ body.resizing * {
   display: flex;
   align-items: center;
   gap: 10px;
-  text-align: left;
+  text-align: start;
   padding: 8px 12px;
   font-size: 12px;
   color: var(--c-text-1);
@@ -1092,7 +1092,7 @@ body.resizing * {
   padding: 10px 0;
   flex-shrink: 0;
   gap: 8px;
-  border-right: 1px solid var(--shell-panel-border, var(--c-border-1));
+  border-inline-end: 1px solid var(--shell-panel-border, var(--c-border-1));
 }
 
 .db-sidebar-btn {
@@ -1147,7 +1147,7 @@ body.resizing * {
   border-radius: 7px;
   background: transparent;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   font: inherit;
   color: inherit;
   transition: background 0.12s ease;
@@ -1427,7 +1427,7 @@ body.resizing * {
 }
 
 .db-folder-icon {
-  margin-right: 8px;
+  margin-inline-end: 8px;
   font-size: 15px;
   width: 20px;
   display: flex;
@@ -1586,7 +1586,7 @@ body.resizing * {
   justify-content: center;
   width: 16px;
   height: 16px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   font-size: 8px;
   color: var(--c-text-2);
   transition: transform 0.2s ease;
@@ -1607,7 +1607,7 @@ body.resizing * {
 }
 
 .db-folder-icon {
-  margin-right: 8px;
+  margin-inline-end: 8px;
   font-size: 15px;
   width: 20px;
   display: flex;
@@ -1652,7 +1652,7 @@ body.resizing * {
 }
 
 .db-folder-count {
-  margin-left: auto;
+  margin-inline-start: auto;
   background: var(--c-border-1);
   padding: 1px 5px;
   border-radius: 10px;
@@ -1755,18 +1755,18 @@ body.resizing * {
 .db-mail-toolbar-btn--split {
   width: 16px;
   font-size: 10px;
-  border-left: 1px solid var(--shadow-color-2);
-  border-top-left-radius: 0;
-  border-bottom-left-radius: 0;
+  border-inline-start: 1px solid var(--shadow-color-2);
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
 }
 
 .db-mail-toolbar-split>.db-mail-toolbar-btn:first-child {
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
 }
 
 .db-mail-toolbar-split>.db-mail-toolbar-btn.active+.db-mail-toolbar-btn--split {
-  border-left-color: var(--c-border-strong);
+  border-inline-start-color: var(--c-border-strong);
 }
 
 .db-toolbar-dropdown {
@@ -1793,7 +1793,7 @@ body.resizing * {
   background: transparent;
   border-radius: 6px;
   padding: 7px 10px;
-  text-align: left;
+  text-align: start;
   font-size: 12px;
   color: var(--c-text-1);
   cursor: pointer;
@@ -1849,7 +1849,7 @@ body.resizing * {
   border: none;
   background: transparent;
   padding: 8px 12px;
-  text-align: left;
+  text-align: start;
   font-size: 13px;
   color: var(--c-text-2);
   cursor: pointer;
@@ -1913,7 +1913,7 @@ body.resizing * {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-left: 0;
+  margin-inline-start: 0;
   flex: 0 0 auto;
 }
 
@@ -1949,7 +1949,7 @@ body.resizing * {
 }
 
 .db-perpage-wrapper {
-  margin-left: 0;
+  margin-inline-start: 0;
   display: flex;
   align-items: center;
   position: relative;
@@ -1990,7 +1990,7 @@ body.resizing * {
 .db-perpage-dropdown {
   position: absolute;
   top: 100%;
-  right: 0;
+  inset-inline-end: 0;
   width: 60px;
   background: var(--c-surface-2);
   border: 1px solid var(--c-border-1);
@@ -2017,7 +2017,7 @@ body.resizing * {
 .db-center-panel {
   position: relative;
   background: color-mix(in srgb, var(--c-surface-2) 88%, transparent);
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -2180,7 +2180,7 @@ body.resizing * {
 .db-mail-list[data-cols="4"] .db-mail-avatar {
   width: 36px;
   height: 36px;
-  margin-right: 10px;
+  margin-inline-end: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2243,14 +2243,14 @@ body.resizing * {
   position: relative;
   width: 36px;
   height: 36px;
-  margin-right: 14px;
+  margin-inline-end: 14px;
   flex: 0 0 auto;
 }
 
 .db-thread-expander {
   width: 26px;
   height: 26px;
-  margin-right: 10px;
+  margin-inline-end: 10px;
   border-radius: 10px;
   border: 1px solid transparent;
   background: color-mix(in srgb, var(--c-surface-2) 70%, transparent);
@@ -2393,19 +2393,19 @@ body.resizing * {
 }
 
 .db-mail-hover-actions {
-  margin-left: 0;
+  margin-inline-start: 0;
   opacity: 0;
   width: 0;
   overflow: hidden;
   pointer-events: none;
   flex: 0 0 auto;
-  transition: opacity 0.12s ease-in-out, width 0.14s ease, margin-left 0.14s ease;
+  transition: opacity 0.12s ease-in-out, width 0.14s ease, margin-inline-start 0.14s ease;
 }
 
 .db-mail-item:hover .db-mail-hover-actions {
   opacity: 1;
   width: 34px;
-  margin-left: 8px;
+  margin-inline-start: 8px;
   pointer-events: auto;
 }
 
@@ -2461,14 +2461,14 @@ body.resizing * {
 .db-mail-item.unread .db-mail-sender::before {
   content: "●";
   display: inline-block;
-  margin-right: 6px;
+  margin-inline-end: 6px;
   color: var(--c-warm-text-3);
 }
 
 .db-thread-count {
   position: absolute;
   bottom: -6px;
-  right: -8px;
+  inset-inline-end: -8px;
   min-width: 18px;
   height: 18px;
   padding: 0 6px;
@@ -2507,12 +2507,12 @@ body.resizing * {
 }
 
 .db-mail-item--thread-child {
-  margin-left: 46px;
+  margin-inline-start: 46px;
   width: calc(100% - 46px);
   padding: 10px 14px;
   border-radius: 16px;
   box-shadow: 0 10px 22px var(--shadow-color-1);
-  border-left: 2px solid color-mix(in srgb, var(--c-primary) 35%, transparent);
+  border-inline-start: 2px solid color-mix(in srgb, var(--c-primary) 35%, transparent);
 }
 
 .db-thread-reader {
@@ -2541,7 +2541,7 @@ body.resizing * {
   background: transparent;
   color: inherit;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
 }
 
 .db-thread-reader-head-left {
@@ -2612,7 +2612,7 @@ body.resizing * {
 .db-mail-item--thread-child .db-mail-avatar-wrap {
   width: 28px;
   height: 28px;
-  margin-right: 12px;
+  margin-inline-end: 12px;
 }
 
 .db-mail-item--thread-child .db-mail-avatar {
@@ -2642,7 +2642,7 @@ body.resizing * {
   gap: 6px;
   max-height: 180px;
   overflow: auto;
-  padding-right: 4px;
+  padding-inline-end: 4px;
 }
 
 .db-conversation-item {
@@ -2674,7 +2674,7 @@ body.resizing * {
 .db-conversation-item.unread .db-conversation-item__from::before {
   content: "●";
   display: inline-block;
-  margin-right: 6px;
+  margin-inline-end: 6px;
   color: var(--c-warm-text-3);
 }
 
@@ -2698,6 +2698,7 @@ body.resizing * {
   font-size: 13px;
   color: var(--c-text-1);
   margin-bottom: 2px;
+  unicode-bidi: plaintext;
 }
 
 .db-mail-subject {
@@ -2707,14 +2708,15 @@ body.resizing * {
   white-space: nowrap;
   text-overflow: ellipsis;
   min-width: 0;
+  unicode-bidi: plaintext;
 }
 
 .db-mail-time {
   font-size: 11px;
   color: var(--c-text-3);
   flex: 0 0 auto;
-  margin-left: auto;
-  text-align: right;
+  margin-inline-start: auto;
+  text-align: end;
 }
 
 .db-mail-sender {
@@ -2862,6 +2864,8 @@ body.resizing * {
   flex: 1;
   max-width: 82ch;
   width: 100%;
+  /* a plain-text mail carries its own direction; don't drag it into the UI's */
+  unicode-bidi: plaintext;
 }
 
 .db-mail-body-html {
@@ -3163,9 +3167,9 @@ body.resizing * {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-right: 8px;
-  margin-right: 8px;
-  border-right: 1px solid var(--c-border-1);
+  padding-inline-end: 8px;
+  margin-inline-end: 8px;
+  border-inline-end: 1px solid var(--c-border-1);
 }
 
 .db-mail-pager-label {
@@ -3221,7 +3225,7 @@ body.resizing * {
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   border-bottom: 2px solid transparent;
   transition: background 0.15s, color 0.15s;
   flex-shrink: 0;
@@ -3653,7 +3657,7 @@ body.resizing * {
   height: auto;
   padding: 8px 12px;
   align-items: center;
-  border-right: none;
+  border-inline-end: none;
 }
 
 .db-layout-region--top .db-sidebar {
@@ -3667,7 +3671,7 @@ body.resizing * {
 .db-layout-region--top .db-sidebar-spacer,
 .db-layout-region--bottom .db-sidebar-spacer {
   margin-top: 0;
-  margin-left: auto;
+  margin-inline-start: auto;
 }
 
 .db-layout-region--top .db-sidebar-btn,
@@ -3926,19 +3930,19 @@ body.resizing * {
 }
 
 .db-mail-toolbar--mirrored .db-mail-toolbar-btn--split {
-  border-left: none;
-  border-right: 1px solid var(--shadow-color-2);
-  border-top-left-radius: 4px;
-  border-bottom-left-radius: 4px;
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
+  border-inline-start: none;
+  border-inline-end: 1px solid var(--shadow-color-2);
+  border-start-start-radius: 4px;
+  border-end-start-radius: 4px;
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
 }
 
 .db-mail-toolbar--mirrored .db-mail-toolbar-split>.db-mail-toolbar-btn:first-child {
-  border-top-right-radius: 4px;
-  border-bottom-right-radius: 4px;
-  border-top-left-radius: 0;
-  border-bottom-left-radius: 0;
+  border-start-end-radius: 4px;
+  border-end-end-radius: 4px;
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
 }
 
 .db-layout-region--right .db-toolbar-dropdown,

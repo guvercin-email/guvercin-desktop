@@ -14,6 +14,25 @@ for (const path in modules) {
     }
 }
 
+// Languages written right-to-left. Keyed by base language so regional variants
+// (ar-bh, ar-ps) are covered without listing each one.
+const RTL_LANGUAGES = new Set(['ar', 'fa', 'ps', 'ur', 'he', 'yi', 'dv', 'ku', 'sd', 'ug']);
+
+export function isRtlLanguage(lang) {
+    if (!lang) return false;
+    return RTL_LANGUAGES.has(String(lang).toLowerCase().split(/[-_]/)[0]);
+}
+
+// Mirror the active language onto <html lang/dir> so the whole document — including
+// text selection, caret movement and the CSS logical properties in our stylesheets —
+// lays out in the right direction.
+export function applyDocumentDirection(lang) {
+    if (typeof document === 'undefined') return;
+    const root = document.documentElement;
+    root.lang = lang || 'en';
+    root.dir = isRtlLanguage(lang) ? 'rtl' : 'ltr';
+}
+
 function getInitialLanguage() {
     const saved = localStorage.getItem('temp_language') || localStorage.getItem('language');
     if (saved) return saved;
@@ -48,6 +67,9 @@ i18n
             escapeValue: false
         }
     });
+
+applyDocumentDirection(initialLang);
+i18n.on('languageChanged', applyDocumentDirection);
 
 export default i18n;
 

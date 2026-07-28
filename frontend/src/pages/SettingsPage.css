@@ -48,7 +48,7 @@
   display: flex;
   flex-direction: column;
   background: var(--c-surface-2);
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   overflow: hidden;
 }
 
@@ -97,7 +97,7 @@
 
 .sp-search-icon {
   position: absolute;
-  left: 10px;
+  inset-inline-start: 10px;
   top: 50%;
   transform: translateY(-50%);
   color: var(--c-text-3);
@@ -128,7 +128,7 @@
 
 .sp-search-clear {
   position: absolute;
-  right: 8px;
+  inset-inline-end: 8px;
   top: 50%;
   transform: translateY(-50%);
   background: none;
@@ -183,7 +183,7 @@
 .sp-search-results__category-title {
   display: block;
   width: 100%;
-  text-align: left;
+  text-align: start;
   margin: 0 0 12px;
   padding: 0;
   font-size: 18px;
@@ -203,7 +203,7 @@
 
 .sp-search-results__item {
   margin-bottom: 16px;
-  padding-left: 8px;
+  padding-inline-start: 8px;
 }
 
 .sp-search-results__item:last-child {
@@ -213,7 +213,7 @@
 .sp-search-results__item-title {
   display: block;
   width: 100%;
-  text-align: left;
+  text-align: start;
   margin: 0 0 4px;
   padding: 0;
   font-size: 15px;
@@ -328,8 +328,8 @@
 /* Children */
 .sp-tree__children {
   margin: 1px 0 2px 12px;
-  border-left: 1.5px solid var(--c-border-1);
-  padding-left: 4px;
+  border-inline-start: 1.5px solid var(--c-border-1);
+  padding-inline-start: 4px;
 }
 
 .sp-tree__child {
@@ -467,7 +467,7 @@
 .sp-theme-card__check {
   position: absolute;
   top: 6px;
-  right: 8px;
+  inset-inline-end: 8px;
   font-size: 12px;
   color: var(--c-primary);
   font-weight: 800;
@@ -506,7 +506,7 @@
 }
 
 .sp-system-btn__badge {
-  margin-left: 6px;
+  margin-inline-start: 6px;
   font-size: 10px;
   font-weight: 700;
   background: var(--c-primary);
@@ -919,7 +919,7 @@
 .sp-toggle__knob {
   position: absolute;
   top: 3px;
-  left: 3px;
+  inset-inline-start: 3px;
   width: 18px;
   height: 18px;
   background: #fff;
@@ -930,6 +930,11 @@
 
 .sp-toggle.on .sp-toggle__knob {
   transform: translateX(20px);
+}
+
+/* transform is physical, so the knob has to travel the other way under RTL */
+[dir="rtl"] .sp-toggle.on .sp-toggle__knob {
+  transform: translateX(-20px);
 }
 
 /* ─── Offline section ───────────────────────────────────────────── */
@@ -1011,9 +1016,9 @@
 }
 
 .sp-off-node__children {
-  margin-left: 10px;
-  border-left: 1.5px solid var(--c-border-1);
-  padding-left: 4px;
+  margin-inline-start: 10px;
+  border-inline-start: 1.5px solid var(--c-border-1);
+  padding-inline-start: 4px;
 }
 
 /* ─── Offline error ─────────────────────────────────────────────── */
@@ -1290,6 +1295,16 @@
 .sp-order-item:hover {
   transform: translateX(4px);
   border-color: var(--c-primary);
+}
+
+[dir="rtl"] .sp-order-item:hover {
+  transform: translateX(-4px);
+}
+
+/* the collapsed disclosure glyph points along the reading direction */
+[dir="rtl"] .sp-dock__toggle {
+  display: inline-block;
+  transform: scaleX(-1);
 }
 
 .sp-order-item__label {
@@ -1786,7 +1801,7 @@
   background: transparent;
   border: none;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   transition: background 0.15s ease;
 }
 
@@ -1817,7 +1832,7 @@
 
 .sp-account-delete {
   align-self: center;
-  margin-right: 10px;
+  margin-inline-end: 10px;
   flex-shrink: 0;
 }
 

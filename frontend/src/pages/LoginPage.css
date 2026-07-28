@@ -337,7 +337,7 @@
 .button-icon {
     width: auto;
     height: 20px;
-    margin-right: 10px;
+    margin-inline-end: 10px;
 }
 
 .response-message {
@@ -495,7 +495,7 @@
 
 .settings-btn {
     position: absolute;
-    right: 0;
+    inset-inline-end: 0;
     top: 50%;
     transform: translateY(calc(-50% - 5px));
     background: var(--c-surface-3);
@@ -517,7 +517,7 @@
 .accounts-list {
     max-height: 200px;
     overflow-y: auto;
-    padding-right: 5px;
+    padding-inline-end: 5px;
 }
 
 .account-item {
@@ -536,6 +536,10 @@
 .account-item:hover {
     background-color: var(--c-primary-hover);
     transform: translateX(3px);
+}
+
+[dir="rtl"] .account-item:hover {
+    transform: translateX(-3px);
 }
 
 .account-item strong {

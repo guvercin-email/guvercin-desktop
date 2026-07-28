@@ -40,7 +40,7 @@
 
 .onboarding-back-btn {
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
   border: none;
   background: transparent;
   color: var(--c-text-2);

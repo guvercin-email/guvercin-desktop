@@ -1,7 +1,7 @@
 .global-language-selector {
     position: absolute;
     top: 24px;
-    right: 24px;
+    inset-inline-end: 24px;
     z-index: 999;
     font-family: inherit;
 }
@@ -54,14 +54,14 @@
 .arrow-down {
     font-size: 0.75rem;
     opacity: 0.7;
-    margin-left: 2px;
+    margin-inline-start: 2px;
 }
 
 /* Dropdown Container */
 .selector-dropdown {
     position: absolute;
     top: calc(100% + 8px);
-    right: 0;
+    inset-inline-end: 0;
     width: 290px;
     background: var(--c-surface-1, #ffffff);
     border: 1.5px solid var(--c-primary-2, rgba(0, 0, 0, 0.15));
@@ -185,6 +185,10 @@
 .dropdown-item:hover {
     background-color: var(--c-primary-hover, rgba(0, 0, 0, 0.04));
     transform: translateX(2px);
+}
+
+[dir="rtl"] .dropdown-item:hover {
+    transform: translateX(-2px);
 }
 
 .dropdown-item.active {

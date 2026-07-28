@@ -45,7 +45,7 @@
   min-width: 180px;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   background: var(--c-surface-1);
   overflow-y: auto;
   padding: 8px 8px 12px;
@@ -86,7 +86,7 @@
   padding: 7px 9px;
   border-radius: 8px;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   font-size: 13px;
 }
 .cs-nav-item:hover { background: var(--c-surface-3); }
@@ -116,14 +116,14 @@
   color: inherit;
   padding: 7px 9px;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   font: inherit;
   border-radius: 8px;
 }
 .cs-list-row-actions {
   display: none;
   gap: 2px;
-  padding-right: 4px;
+  padding-inline-end: 4px;
 }
 .cs-list-row:hover .cs-list-row-actions { display: inline-flex; }
 .cs-list-row-actions button {
@@ -155,7 +155,7 @@
   min-width: 240px;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--c-border-1);
+  border-inline-end: 1px solid var(--c-border-1);
   background: var(--c-surface-1);
   min-height: 0;
 }
@@ -203,12 +203,12 @@
   background: transparent;
   padding: 7px 12px;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   color: inherit;
-  border-left: 3px solid transparent;
+  border-inline-start: 3px solid transparent;
 }
 .cs-list-item:hover { background: var(--c-surface-3); }
-.cs-list-item.active { background: var(--c-primary-soft); border-left-color: var(--c-primary); }
+.cs-list-item.active { background: var(--c-primary-soft); border-inline-start-color: var(--c-primary); }
 .cs-list-item-text { flex: 1; min-width: 0; }
 .cs-list-item-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cs-list-item-sub { font-size: 12px; color: var(--c-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -253,11 +253,11 @@
 .cs-welcome h2 { margin: 6px 0; font-size: 22px; }
 .cs-welcome p { color: var(--c-text-2); margin-bottom: 16px; }
 
-.cs-suggest { margin-top: 30px; text-align: left; border-top: 1px solid var(--c-border-1); padding-top: 18px; }
+.cs-suggest { margin-top: 30px; text-align: start; border-top: 1px solid var(--c-border-1); padding-top: 18px; }
 .cs-suggest-head { font-size: 14px; font-weight: 700; }
 .cs-suggest-hint { font-size: 12px; color: var(--c-text-3); margin: 2px 0 10px; }
 .cs-suggest-list { display: flex; flex-direction: column; gap: 4px; }
-.cs-suggest-item { display: flex; align-items: center; gap: 10px; border: 1px solid var(--c-border-1); background: var(--c-surface-2); border-radius: 10px; padding: 7px 10px; cursor: pointer; text-align: left; color: inherit; }
+.cs-suggest-item { display: flex; align-items: center; gap: 10px; border: 1px solid var(--c-border-1); background: var(--c-surface-2); border-radius: 10px; padding: 7px 10px; cursor: pointer; text-align: start; color: inherit; }
 .cs-suggest-item:hover { background: var(--c-surface-3); border-color: var(--c-border-2); }
 .cs-suggest-item-text { flex: 1; min-width: 0; }
 .cs-suggest-item-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

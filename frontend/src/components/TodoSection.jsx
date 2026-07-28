@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { isRtlLanguage } from '../i18n.js'
 import { formatIsoLocalDate, formatIsoLocalDateTime, parseIsoLocal } from '../utils/calendarApi.js'
 import { requestNewEvent, subscribeNewTask } from '../utils/crossLinks.js'
 import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
@@ -55,6 +56,7 @@ function dueLabel(task, locale, t) {
 export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small', searchQuery }) {
   const { t, i18n } = useTranslation()
   const locale = i18n.language || 'en'
+  const collapsedGlyph = isRtlLanguage(locale) ? '◂' : '▸'
   const { networkOnline } = useOfflineSync()
 
   const [lists, setLists] = useState([])
@@ -569,7 +571,7 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
             {completed.length > 0 && (
               <div className="td-bucket td-completed">
                 <button className="td-bucket-head td-completed-head" onClick={() => setShowCompleted((s) => !s)}>
-                  <span>{showCompleted ? '▾' : '▸'} {t('Completed')}</span>
+                  <span>{showCompleted ? '▾' : collapsedGlyph} {t('Completed')}</span>
                   <span className="td-bucket-count">{completed.length}</span>
                   <button className="td-clear-btn" onClick={(e) => { e.stopPropagation(); handleClearCompleted() }}>{t('Clear')}</button>
                 </button>
