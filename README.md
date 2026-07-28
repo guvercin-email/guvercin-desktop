@@ -14,7 +14,11 @@ calendar, contacts and tasks built in. your mail lives on your machine, not on o
 
 **[download](https://github.com/herdem-herdem/guvercin-desktop/releases/latest)**
 · [guvercin.email](https://guvercin.email)
+· [try it in your browser](https://try.guvercin.email)
 · [build from source](#build-from-source)
+
+<sub>the try-it build is the real interface over an in-browser mock: no imap, no
+smtp, no database, no account — nothing leaves the tab, and a reload resets it.</sub>
 
 <br>
 
