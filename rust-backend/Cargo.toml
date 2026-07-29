@@ -27,7 +27,10 @@ chrono = "0.4"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
-libsqlite3-sys = { version = "0.27", features = ["bundled-sqlcipher"] }
+# SQLCipher is compiled from source. OpenSSL is vendored with it rather than
+# linked from the system: Windows runners ship no OpenSSL, so bundled-sqlcipher
+# alone panics with "Missing environment variable OPENSSL_DIR" there.
+libsqlite3-sys = { version = "0.27", features = ["bundled-sqlcipher-vendored-openssl"] }
 rand = "0.8"
 zeroize = "1.7"
 lettre = { version = "0.11.19", features = ["tokio1-rustls-tls", "smtp-transport", "builder"], default-features = false }

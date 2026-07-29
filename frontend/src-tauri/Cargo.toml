@@ -27,7 +27,9 @@ tauri-plugin-notification = "2"
 tokio = { version = "1.37", features = ["full", "rt-multi-thread"] }
 rust-backend = { path = "../../rust-backend" }
 tauri-plugin-dialog = "2.6.0"
-libsqlite3-sys = { version = "0.27", features = ["bundled-sqlcipher"] }
+# Must match rust-backend: both link the same libsqlite3-sys, and a feature
+# mismatch would silently pick one build for the whole graph.
+libsqlite3-sys = { version = "0.27", features = ["bundled-sqlcipher-vendored-openssl"] }
 open = "5.3.2"
 arboard = "3.4.0"
 tauri-plugin-deep-link = "2"
