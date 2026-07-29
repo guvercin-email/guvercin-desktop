@@ -99,9 +99,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          # 0.x is beta by definition; GitHub keeps prereleases out of
-          # /releases/latest, which is exactly what the README links to.
-          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
+          # Not marked prerelease even at 0.x. GitHub excludes prereleases from
+          # /releases/latest, and that is the URL the README download button and
+          # every download link on guvercin.email point at — flagging the only
+          # release there is would send all of them to an empty page. The beta
+          # is signalled in the release title and notes instead.
+          prerelease: false
           generate_release_notes: true
           body: |
             ## installing
