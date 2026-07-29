@@ -57,7 +57,7 @@ impl CryptoManager {
     pub fn sqlcipher_key_hex_for_db(&self, path: &Path) -> Result<String> {
         let info = format!("db:{}", path.display());
         let key = self.derive_key(info.as_bytes())?;
-        Ok(hex::encode(&*key))
+        Ok(hex::encode(*key))
     }
 
     pub fn file_key(&self, purpose: &str) -> Result<Zeroizing<[u8; 32]>> {

@@ -333,14 +333,16 @@ fn map_event(g: &GEvent, calendar_id: i64) -> Option<cal::EventCard> {
     let start = g.start.as_ref()?;
     let (start_iso, all_day) = gtime_to_iso(start)?;
     let end_iso = g.end.as_ref().and_then(gtime_to_iso).map(|(s, _)| s);
-    let mut card = cal::EventCard::default();
-    card.uid = format!("google-{}", g.id);
-    card.calendar_id = Some(calendar_id);
-    card.title = g.summary.clone().unwrap_or_default();
-    card.location = g.location.clone().unwrap_or_default();
-    card.description = g.description.clone().unwrap_or_default();
-    card.all_day = all_day;
-    card.start = start_iso.clone();
+    let mut card = cal::EventCard {
+        uid: format!("google-{}", g.id),
+        calendar_id: Some(calendar_id),
+        title: g.summary.clone().unwrap_or_default(),
+        location: g.location.clone().unwrap_or_default(),
+        description: g.description.clone().unwrap_or_default(),
+        all_day,
+        start: start_iso.clone(),
+        ..Default::default()
+    };
     if all_day {
         card.end = match end_iso {
             Some(e) if e != start_iso => minus_one_day(&e),
@@ -490,7 +492,7 @@ pub async fn sync_calendar(
 
     // 2. Fetch all remote events (per calendar), remember which gcal each came from.
     let mut remote: Vec<(String, GEvent)> = Vec::new();
-    for (gcal, _local) in &gcal_to_local {
+    for gcal in gcal_to_local.keys() {
         let mut page: Option<String> = None;
         let mut pages = 0;
         loop {
@@ -718,8 +720,10 @@ struct PNick {
 }
 
 fn map_person(p: &Person) -> con::ContactCard {
-    let mut card = con::ContactCard::default();
-    card.uid = p.resource_name.clone();
+    let mut card = con::ContactCard {
+        uid: p.resource_name.clone(),
+        ..Default::default()
+    };
     if let Some(n) = p.names.first() {
         card.name.first = n.given_name.clone().unwrap_or_default();
         card.name.middle = n.middle_name.clone().unwrap_or_default();
@@ -964,12 +968,14 @@ fn map_task(g: &GTask, list_id: i64) -> Option<todo::TaskCard> {
     if title.trim().is_empty() {
         return None;
     }
-    let mut card = todo::TaskCard::default();
-    card.uid = format!("gtasks-{}", g.id);
-    card.list_id = Some(list_id);
-    card.title = title;
-    card.notes = g.notes.clone().unwrap_or_default();
-    card.completed = g.status.as_deref() == Some("completed");
+    let mut card = todo::TaskCard {
+        uid: format!("gtasks-{}", g.id),
+        list_id: Some(list_id),
+        title,
+        notes: g.notes.clone().unwrap_or_default(),
+        completed: g.status.as_deref() == Some("completed"),
+        ..Default::default()
+    };
     if let Some(due) = &g.due {
         if due.len() >= 10 {
             card.due = due[..10].to_string();
@@ -1035,7 +1041,7 @@ pub async fn sync_tasks(
 
     // 2. Fetch all remote tasks.
     let mut remote: Vec<(String, GTask)> = Vec::new();
-    for (gl, _local) in &gl_to_local {
+    for gl in gl_to_local.keys() {
         let mut page: Option<String> = None;
         let mut pages = 0;
         loop {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { apiUrl } from '../utils/api'
@@ -90,7 +90,7 @@ function OfflineSetupPage() {
   const folderTree = useMemo(() => buildTreeNodes(folders, 'folder'), [folders])
   const labelTree = useMemo(() => buildTreeNodes(labels, 'label'), [labels])
 
-  const fetchMailboxPreview = async () => {
+  const fetchMailboxPreview = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
@@ -139,11 +139,11 @@ function OfflineSetupPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [t])
 
   useEffect(() => {
     fetchMailboxPreview()
-  }, [])
+  }, [fetchMailboxPreview])
 
   const hasInheritedSelection = (node) => {
     if (selectedPrefixes.has('all')) return true

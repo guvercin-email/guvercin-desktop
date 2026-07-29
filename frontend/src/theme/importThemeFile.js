@@ -1,4 +1,5 @@
 import { validateTheme, upsertCustomTheme } from './themeManager.js'
+import { invoke } from '@tauri-apps/api/core'
 
 async function isTauri() {
     return Boolean(window.__TAURI__)
@@ -32,7 +33,6 @@ export async function importThemeFromFile(file, options = {}) {
 
         const theme = validated.theme
         if (await isTauri()) {
-            const { invoke } = await import('@tauri-apps/api/core')
             await invoke('write_user_theme', { name: theme.name, json: JSON.stringify(theme) })
         } else {
             const res = upsertCustomTheme(theme)

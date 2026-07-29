@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { apiUrl, apiReady } from './utils/api'
 import LoginPage from './pages/LoginPage.jsx'
@@ -6,8 +6,13 @@ import OfflineSetupPage from './pages/OfflineSetupPage.jsx'
 import NotAuthPage from './pages/NotAuthPage.jsx'
 import DashboardPage from './pages/DashboardPage.jsx'
 import AccountSelectionPage from './pages/AccountSelectionPage.jsx'
-import DetachedMailWindow from './pages/DetachedMailWindow.jsx'
-import DetachedComposeWindow from './pages/DetachedComposeWindow.jsx'
+
+// Split out of the main bundle. The detached windows are small popups that the
+// main window never renders (and vice versa), and the settings screens are only
+// reached after the dashboard is already up — none of them need to be parsed at
+// startup.
+const DetachedMailWindow = lazy(() => import('./pages/DetachedMailWindow.jsx'))
+const DetachedComposeWindow = lazy(() => import('./pages/DetachedComposeWindow.jsx'))
 // Imported for its side effect: the module initialises i18next on load.
 import './i18n'
 import { useTranslation } from 'react-i18next'
@@ -16,9 +21,9 @@ import { initMailtoInbox } from './utils/mailtoInbox.js'
 import { initEmlInbox } from './utils/emlInbox.js'
 import { initAttachmentInbox } from './utils/attachmentInbox.js'
 import { initNotifications } from './utils/notifications.js'
-import ThemePage from './pages/ThemePage.jsx'
-import SettingsPage from './pages/SettingsPage.jsx'
-import AccountSettingsPage from './pages/AccountSettingsPage.jsx'
+const ThemePage = lazy(() => import('./pages/ThemePage.jsx'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage.jsx'))
+const AccountSettingsPage = lazy(() => import('./pages/AccountSettingsPage.jsx'))
 
 function getDetachedHint() {
   try {
@@ -118,15 +123,23 @@ function App() {
   }, [location, windowLabel, isMailWindow, isComposeWindow])
 
   if (isMailWindow) {
-    return <DetachedMailWindow initialLabel={windowLabel} />
+    return (
+      <Suspense fallback={null}>
+        <DetachedMailWindow initialLabel={windowLabel} />
+      </Suspense>
+    )
   }
 
   if (isComposeWindow) {
-    return <DetachedComposeWindow initialLabel={windowLabel} />
+    return (
+      <Suspense fallback={null}>
+        <DetachedComposeWindow initialLabel={windowLabel} />
+      </Suspense>
+    )
   }
 
   return (
-    <>
+    <Suspense fallback={null}>
       <Routes>
         <Route path="/" element={<StartupRouter />} />
         <Route path="/index.html" element={<Navigate to="/" replace />} />
@@ -140,7 +153,7 @@ function App() {
         <Route path="/account-settings" element={<AccountSettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </>
+    </Suspense>
   )
 }
 

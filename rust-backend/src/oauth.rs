@@ -13,10 +13,12 @@
 //! box for end-users. This is expected for an *installed / desktop* app: Google
 //! documents that such clients are not confidential — the "secret" necessarily
 //! ships inside the distributed binary. Resolution order for each value:
-//!   1. the `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` environment variable
-//!      (loaded from `.env` in development),
-//!   2. a value baked in at build time via `option_env!`,
-//!   3. the shipped `DEFAULT_CLIENT_*` constant below.
+//!
+//! 1. the `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` environment variable
+//!    (loaded from `.env` in development),
+//! 2. a value baked in at build time via `option_env!`,
+//! 3. the shipped `DEFAULT_CLIENT_*` constant below.
+//!
 //! A fork can override the defaults with its own client via (1) or (2) without
 //! touching this file.
 

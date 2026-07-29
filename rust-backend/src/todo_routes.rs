@@ -310,19 +310,6 @@ pub async fn sync_write_task(
     }
 }
 
-/// Upsert a task keyed on its stored UID (used by Google Tasks sync).
-pub async fn upsert_task_by_uid(pool: &SqlitePool, card: &TaskCard) -> Result<i64, AppError> {
-    let existing: Option<i64> = if card.uid.trim().is_empty() {
-        None
-    } else {
-        sqlx::query_scalar("SELECT task_id FROM tasks WHERE uid = ? LIMIT 1")
-            .bind(&card.uid)
-            .fetch_optional(pool)
-            .await?
-    };
-    upsert_task(pool, existing, card).await
-}
-
 /// Find or create a task list by name (used to mirror Google task lists).
 pub async fn ensure_named_list(pool: &SqlitePool, name: &str) -> Result<i64, AppError> {
     if let Some(id) = sqlx::query_scalar::<_, i64>("SELECT list_id FROM task_lists WHERE name = ? LIMIT 1")

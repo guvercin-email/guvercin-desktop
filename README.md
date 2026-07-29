@@ -145,7 +145,7 @@ process, hot reload on the frontend.
 | backend on its own | `GUVERCIN_KEEP_ALIVE=1 cargo run` | `rust-backend/` |
 | shell tests + lints | `cargo test` / `cargo clippy` | `frontend/src-tauri/` |
 
-frontend code is in `frontend/src` (pages, workspace components, utils, and 64
+frontend code is in `frontend/src` (pages, section components, utils, and 64
 locale directories); the tauri shell — tray, deep links, file associations, window
 state — is in `frontend/src-tauri`, with everything os-specific behind one facade in
 [src/platform](frontend/src-tauri/src/platform/mod.rs): `shared.rs` holds the
@@ -155,9 +155,15 @@ in `rust-backend/src`, where [lib.rs](rust-backend/src/lib.rs) registers every r
 
 lint is clean and ci enforces it, along with `npm test` and `cargo clippy`. ci also
 builds and tests the tauri shell on all three operating systems, since each one
-compiles a different half of the platform module. 18
-`react-hooks/exhaustive-deps` warnings remain — each needs a judgement call
-about the hook it sits on, so they are warnings rather than errors.
+compiles a different half of the platform module. eslint, clippy and the vite
+build all run warning-free; the two `react-hooks/exhaustive-deps` cases that are
+deliberate carry an inline disable explaining why.
+
+the startup chunk carries the app core and nothing else. english is the only
+locale bundled — the other 63 are fetched per language — and the settings screens,
+the detached windows, the calendar/contacts/tasks sections and the pdf export path
+are all loaded on demand. keep it that way when adding a screen: reach for
+`lazy()` unless the first paint genuinely needs it.
 
 ---
 
@@ -260,7 +266,9 @@ issues and pull requests are welcome. run `npm run lint`, `npm test` and
 user-facing strings go through i18next: add the english key in
 `frontend/src/locales/en/translation.json` and leave the other 63 files to a
 translation pass. new locale directories are picked up automatically by the glob in
-[i18n.js](frontend/src/i18n.js), so nothing else belongs under `src/locales/`.
+[i18n.js](frontend/src/i18n.js), so nothing else belongs under `src/locales/`. to
+switch language at runtime use `changeLanguage()` from that module rather than
+`i18n.changeLanguage()`, so the locale is loaded before the switch.
 
 anything touching `crypto.rs`, `keystore/`, `db.rs`, `oauth.rs` or the mail html
 sanitiser needs a clear note on the security implications — see

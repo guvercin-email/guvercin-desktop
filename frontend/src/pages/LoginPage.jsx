@@ -864,7 +864,7 @@ function LoginPage() {
                         {(screenMode === 'landing' || (screenMode === 'auto' && !activeAutoCandidate)) && (
                             <div className="login-page__social-actions">
                                 <button type="button" className="shortcut-button shortcut-button--alt" onClick={handleGoogleSignIn} disabled={googleBusy}>
-                                    <img src="/icon-google.png" alt="Google Icon" className="button-icon" />
+                                    <img src="/img/icon-google.png" alt="Google Icon" className="button-icon" />
                                     {googleBusy ? t('Signing in…') : t('Continue with Google')}
                                 </button>
                             </div>
@@ -1000,7 +1000,7 @@ function LoginPage() {
                                 <>
                                     <div className="login-page__social-actions">
                                         <button type="button" className="shortcut-button shortcut-button--alt" onClick={handleGoogleSignIn} disabled={googleBusy}>
-                                            <img src="/icon-google.png" alt="Google Icon" className="button-icon" />
+                                            <img src="/img/icon-google.png" alt="Google Icon" className="button-icon" />
                                             {googleBusy ? t('Signing in…') : t('Continue with Google')}
                                         </button>
                                     </div>

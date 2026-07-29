@@ -19,7 +19,8 @@ yarn-error.log*
 target/
 **/target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is tracked on purpose: both crates here are binaries, so the lock
+# file is what makes a build reproducible.
 
 # Tauri
 src-tauri/target/
@@ -39,10 +40,12 @@ databases/
 *.xlsx
 .env
 .env.*
+!.env.example
 
-# Assets (Sources no longer needed in repo if SVGs are used)
+# Assets — the UI ships SVG icons; Illustrator sources are not kept in the repo.
+# The PNGs that do stay (flags, provider marks, the window background) have no
+# SVG equivalent, so only the design sources are ignored here.
 *.ai
-*.png
 
 # Licensed fonts (commercial license, not redistributable — see frontend/public/fonts/README.md)
 # HankenGrotesk-*.woff2 is the OFL-licensed default and stays tracked.

@@ -11,6 +11,7 @@ import {
 } from '../utils/compose.js'
 import { queueComposeSend } from '../utils/composeSend.js'
 import './DashboardPage.css'
+import { invoke } from '@tauri-apps/api/core'
 
 function safeParse(json) {
     try {
@@ -154,7 +155,6 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         const load = async () => {
             let composeData = null
             try {
-                const { invoke } = await import('@tauri-apps/api/core')
                 const json = await invoke('get_compose_window_data', { label: windowLabel })
                 if (json) {
                     composeData = safeParse(json)
@@ -223,7 +223,6 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     const closeWindow = useCallback(async () => {
         allowCloseRef.current = true
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             if (windowLabel) {
                 await invoke('close_compose_window', { label: windowLabel })
                 return

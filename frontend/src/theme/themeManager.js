@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core'
+
 const THEME_MODE_KEY = 'theme_mode'
 const THEME_NAME_KEY = 'theme_name'
 
@@ -35,7 +37,6 @@ async function isTauri() {
 }
 
 async function invokeTauri(command, args) {
-  const { invoke } = await import('@tauri-apps/api/core')
   return invoke(command, args)
 }
 

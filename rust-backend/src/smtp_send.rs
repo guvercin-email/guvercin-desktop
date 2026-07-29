@@ -179,44 +179,61 @@ fn build_message_body(
     Ok(MessageBody::Multi(mixed))
 }
 
-fn build_message(
-    from: &str,
-    to: Vec<String>,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    subject: &str,
-    format: OutgoingMailFormat,
-    html_body: &str,
-    plain_body: &str,
-    attachments: &[OutgoingAttachment],
-    raw_headers: &[(String, String)],
-) -> Result<Message, String> {
+/// Everything that makes up the outgoing message itself, kept apart from the
+/// server it is handed to so both builders and the sender take one argument.
+pub struct OutgoingMessage<'a> {
+    pub from: &'a str,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: &'a str,
+    pub format: OutgoingMailFormat,
+    pub html_body: &'a str,
+    pub plain_body: &'a str,
+    pub attachments: &'a [OutgoingAttachment],
+    /// Extra headers written verbatim, e.g. the draft tracking key.
+    pub raw_headers: &'a [(String, String)],
+}
+
+/// The SMTP endpoint and the credentials used to authenticate against it.
+pub struct SmtpServer<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub ssl_mode: &'a str,
+    pub email: &'a str,
+    /// An OAuth2 access token when `xoauth2` is set, a password otherwise.
+    pub password: &'a str,
+    pub xoauth2: bool,
+}
+
+fn build_message(msg: OutgoingMessage<'_>) -> Result<Message, String> {
     let mut builder = Message::builder()
         .from(
-            from.parse()
+            msg.from
+                .parse()
                 .map_err(|e| format!("Invalid 'from' address: {}", e))?,
         )
-        .subject(subject);
+        .subject(msg.subject);
 
-    for addr_str in to {
+    for addr_str in msg.to {
         let addr = addr_str
             .parse()
             .map_err(|e| format!("Invalid 'to' address: {}", e))?;
         builder = builder.to(addr);
     }
-    for addr_str in cc {
+    for addr_str in msg.cc {
         let addr = addr_str
             .parse()
             .map_err(|e| format!("Invalid 'cc' address: {}", e))?;
         builder = builder.cc(addr);
     }
-    for addr_str in bcc {
+    for addr_str in msg.bcc {
         let addr = addr_str
             .parse()
             .map_err(|e| format!("Invalid 'bcc' address: {}", e))?;
         builder = builder.bcc(addr);
     }
-    for (name, value) in raw_headers {
+    for (name, value) in msg.raw_headers {
         let header_name = header::HeaderName::new_from_ascii(name.trim().to_string())
             .map_err(|e| format!("Invalid header name '{}': {}", name, e))?;
         builder = builder.raw_header(header::HeaderValue::new(
@@ -225,7 +242,7 @@ fn build_message(
         ));
     }
 
-    match build_message_body(format, plain_body, html_body, attachments)? {
+    match build_message_body(msg.format, msg.plain_body, msg.html_body, msg.attachments)? {
         MessageBody::Single(part) => builder
             .singlepart(part)
             .map_err(|e| format!("Failed to build message: {}", e)),
@@ -235,102 +252,32 @@ fn build_message(
     }
 }
 
-pub fn build_rfc822_message(
-    from: &str,
-    to: Vec<String>,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    subject: &str,
-    format: OutgoingMailFormat,
-    html_body: &str,
-    plain_body: &str,
-    attachments: &[OutgoingAttachment],
-    raw_headers: &[(String, String)],
-) -> Result<Vec<u8>, String> {
-    let message = build_message(
-        from,
-        to,
-        cc,
-        bcc,
-        subject,
-        format,
-        html_body,
-        plain_body,
-        attachments,
-        raw_headers,
-    )?;
-    Ok(message.formatted())
+pub fn build_rfc822_message(msg: OutgoingMessage<'_>) -> Result<Vec<u8>, String> {
+    Ok(build_message(msg)?.formatted())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn send_mail(
-    smtp_host: &str,
-    smtp_port: u16,
-    ssl_mode: &str,
-    email: &str,
-    password: &str,
-    from: &str,
-    to: Vec<String>,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    subject: &str,
-    format: OutgoingMailFormat,
-    html_body: &str,
-    plain_body: &str,
-    attachments: &[OutgoingAttachment],
-    xoauth2: bool,
-) -> Result<(), String> {
-    send_mail_with_headers(
-        smtp_host,
-        smtp_port,
+/// Sends `msg` through `server`. When `server.xoauth2` is set the SMTP
+/// `XOAUTH2` mechanism is used and `server.password` is an access token
+/// (Gmail); otherwise plain credentials are used.
+pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Result<(), String> {
+    let SmtpServer {
+        host: smtp_host,
+        port: smtp_port,
         ssl_mode,
         email,
         password,
-        from,
-        to,
-        cc,
-        bcc,
-        subject,
-        format,
-        html_body,
-        plain_body,
-        attachments,
-        &[],
         xoauth2,
-    )
-    .await
-}
+    } = server;
 
-/// When `xoauth2` is true, `password` is treated as an OAuth2 access token and
-/// the SMTP `XOAUTH2` mechanism is used (Gmail); otherwise plain credentials.
-#[allow(clippy::too_many_arguments)]
-pub async fn send_mail_with_headers(
-    smtp_host: &str,
-    smtp_port: u16,
-    ssl_mode: &str,
-    email: &str,
-    password: &str,
-    from: &str,
-    to: Vec<String>,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    subject: &str,
-    format: OutgoingMailFormat,
-    html_body: &str,
-    plain_body: &str,
-    attachments: &[OutgoingAttachment],
-    raw_headers: &[(String, String)],
-    xoauth2: bool,
-) -> Result<(), String> {
     info!(
         "Preparing to send email to {} recipients via {}:{} ({})",
-        to.len() + cc.len() + bcc.len(),
+        msg.to.len() + msg.cc.len() + msg.bcc.len(),
         smtp_host,
         smtp_port,
         ssl_mode
     );
 
-    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+    if msg.to.is_empty() && msg.cc.is_empty() && msg.bcc.is_empty() {
         return Err("No recipients specified".into());
     }
 
@@ -345,18 +292,7 @@ pub async fn send_mail_with_headers(
         ));
     }
 
-    let email_message = build_message(
-        from,
-        to,
-        cc,
-        bcc,
-        subject,
-        format,
-        html_body,
-        plain_body,
-        attachments,
-        raw_headers,
-    )?;
+    let email_message = build_message(msg)?;
 
     let credentials = Credentials::new(email.to_string(), password.to_string());
     let is_loopback = is_loopback_smtp_host(smtp_host);
@@ -445,6 +381,7 @@ pub async fn send_mail_with_headers(
 mod tests {
     use super::{
         build_message, OutgoingAttachment, OutgoingAttachmentDisposition, OutgoingMailFormat,
+        OutgoingMessage,
     };
 
     fn sample_attachment(disposition: OutgoingAttachmentDisposition) -> OutgoingAttachment {
@@ -459,18 +396,18 @@ mod tests {
 
     #[test]
     fn builds_plain_only_message() {
-        let message = build_message(
-            "sender@example.com",
-            vec!["to@example.com".to_string()],
-            vec![],
-            vec![],
-            "Plain",
-            OutgoingMailFormat::Plain,
-            "",
-            "Hello plain",
-            &[],
-            &[],
-        )
+        let message = build_message(OutgoingMessage {
+            from: "sender@example.com",
+            to: vec!["to@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Plain",
+            format: OutgoingMailFormat::Plain,
+            html_body: "",
+            plain_body: "Hello plain",
+            attachments: &[],
+            raw_headers: &[],
+        })
         .expect("plain message");
 
         let bytes = message.formatted();
@@ -482,18 +419,18 @@ mod tests {
 
     #[test]
     fn builds_html_alternative_message() {
-        let message = build_message(
-            "sender@example.com",
-            vec!["to@example.com".to_string()],
-            vec![],
-            vec![],
-            "HTML",
-            OutgoingMailFormat::Html,
-            "<p>Hello html</p>",
-            "Hello html",
-            &[],
-            &[],
-        )
+        let message = build_message(OutgoingMessage {
+            from: "sender@example.com",
+            to: vec!["to@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "HTML",
+            format: OutgoingMailFormat::Html,
+            html_body: "<p>Hello html</p>",
+            plain_body: "Hello html",
+            attachments: &[],
+            raw_headers: &[],
+        })
         .expect("html message");
 
         let bytes = message.formatted();
@@ -505,18 +442,18 @@ mod tests {
 
     #[test]
     fn builds_html_message_with_inline_attachment() {
-        let message = build_message(
-            "sender@example.com",
-            vec!["to@example.com".to_string()],
-            vec![],
-            vec![],
-            "Inline",
-            OutgoingMailFormat::Html,
-            "<p><img src=\"cid:cid-123\"></p>",
-            "Inline",
-            &[sample_attachment(OutgoingAttachmentDisposition::Inline)],
-            &[],
-        )
+        let message = build_message(OutgoingMessage {
+            from: "sender@example.com",
+            to: vec!["to@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Inline",
+            format: OutgoingMailFormat::Html,
+            html_body: "<p><img src=\"cid:cid-123\"></p>",
+            plain_body: "Inline",
+            attachments: &[sample_attachment(OutgoingAttachmentDisposition::Inline)],
+            raw_headers: &[],
+        })
         .expect("inline html message");
 
         let bytes = message.formatted();
@@ -537,16 +474,16 @@ mod tests {
 
     #[test]
     fn builds_html_message_with_inline_and_regular_attachments() {
-        let message = build_message(
-            "sender@example.com",
-            vec!["to@example.com".to_string()],
-            vec![],
-            vec![],
-            "Mixed",
-            OutgoingMailFormat::Html,
-            "<p><img src=\"cid:cid-123\"></p>",
-            "Inline",
-            &[
+        let message = build_message(OutgoingMessage {
+            from: "sender@example.com",
+            to: vec!["to@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Mixed",
+            format: OutgoingMailFormat::Html,
+            html_body: "<p><img src=\"cid:cid-123\"></p>",
+            plain_body: "Inline",
+            attachments: &[
                 sample_attachment(OutgoingAttachmentDisposition::Inline),
                 OutgoingAttachment {
                     filename: "doc.pdf".to_string(),
@@ -556,8 +493,8 @@ mod tests {
                     content_id: None,
                 },
             ],
-            &[],
-        )
+            raw_headers: &[],
+        })
         .expect("mixed message");
 
         let bytes = message.formatted();
@@ -569,18 +506,18 @@ mod tests {
 
     #[test]
     fn builds_message_with_raw_headers() {
-        let message = build_message(
-            "sender@example.com",
-            vec!["to@example.com".to_string()],
-            vec![],
-            vec![],
-            "Headers",
-            OutgoingMailFormat::Plain,
-            "",
-            "Body",
-            &[],
-            &[("In-Reply-To".to_string(), "<msg-1@example.com>".to_string())],
-        )
+        let message = build_message(OutgoingMessage {
+            from: "sender@example.com",
+            to: vec!["to@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Headers",
+            format: OutgoingMailFormat::Plain,
+            html_body: "",
+            plain_body: "Body",
+            attachments: &[],
+            raw_headers: &[("In-Reply-To".to_string(), "<msg-1@example.com>".to_string())],
+        })
         .expect("message with raw headers");
 
         let bytes = message.formatted();

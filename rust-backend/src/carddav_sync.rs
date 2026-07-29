@@ -565,9 +565,11 @@ mod tests {
     }
 
     fn card_json(uid: &str, display: &str) -> String {
-        let mut card = con::ContactCard::default();
-        card.uid = uid.to_string();
-        card.display_name = display.to_string();
+        let card = con::ContactCard {
+            uid: uid.to_string(),
+            display_name: display.to_string(),
+            ..Default::default()
+        };
         serde_json::to_string(&card).unwrap()
     }
 
@@ -629,14 +631,17 @@ mod tests {
         assert_eq!(stats["pushed"], 2, "the edit and the new contact should be pushed: {stats}");
         assert_eq!(stats["deletedRemote"], 1, "the tombstone should delete remotely: {stats}");
 
-        let s = srv.lock().unwrap();
-        assert!(!s.cards.contains_key("gone.vcf"), "tombstoned contact still on the server");
-        assert!(s.cards["edited.vcf"].0.contains("Fresh Local Name"), "local edit did not win");
-        assert!(
-            s.cards.keys().any(|k| k.starts_with("brand-new")),
-            "new local contact was not created: {:?}",
-            s.cards.keys().collect::<Vec<_>>()
-        );
+        // Scoped so the guard is dropped before the awaits below.
+        {
+            let s = srv.lock().unwrap();
+            assert!(!s.cards.contains_key("gone.vcf"), "tombstoned contact still on the server");
+            assert!(s.cards["edited.vcf"].0.contains("Fresh Local Name"), "local edit did not win");
+            assert!(
+                s.cards.keys().any(|k| k.starts_with("brand-new")),
+                "new local contact was not created: {:?}",
+                s.cards.keys().collect::<Vec<_>>()
+            );
+        }
 
         // Pulled row exists and is clean; the pushed rows are no longer dirty.
         let pulled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contacts WHERE uid = 'remote-only' AND dirty = 0 AND deleted = 0")
@@ -657,7 +662,7 @@ mod tests {
         assert_eq!(rid.as_deref(), Some("people/c1"));
         assert_eq!(dirty, 0);
         assert!(
-            !s.cards.keys().any(|k| k.starts_with("people")),
+            !srv.lock().unwrap().cards.keys().any(|k| k.starts_with("people")),
             "a Google-synced contact must never be pushed to CardDAV"
         );
     }

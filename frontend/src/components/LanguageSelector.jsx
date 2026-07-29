@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
+import { changeLanguage } from '../i18n'
 import './LanguageSelector.css'
 
 const LANGUAGES = [
@@ -123,7 +124,8 @@ export default function LanguageSelector() {
     const handleSelect = (code) => {
         localStorage.setItem('temp_language', code)
         localStorage.setItem('language', code)
-        i18n.changeLanguage(code)
+        // Loads the locale's bundle first, so the UI never flashes English.
+        changeLanguage(code)
         setIsOpen(false)
         setSearchQuery('')
     }
@@ -140,7 +142,7 @@ export default function LanguageSelector() {
                 {currentLang && (
                     <>
                         <img
-                            src={`/flags/${currentLang.flag}.png`}
+                            src={`/img/flags/${currentLang.flag}.png`}
                             alt={currentLang.alt}
                             className="current-flag"
                         />
@@ -181,7 +183,7 @@ export default function LanguageSelector() {
                                 className={`dropdown-item ${currentLangCode === lang.code ? 'active' : ''}`}
                                 onClick={() => handleSelect(lang.code)}
                             >
-                                <img src={`/flags/${lang.flag}.png`} alt={lang.alt} className="item-flag" />
+                                <img src={`/img/flags/${lang.flag}.png`} alt={lang.alt} className="item-flag" />
                                 <span className="item-names">
                                     <span className="native-name">{lang.native}</span>
                                     <span className="english-name">({lang.english})</span>

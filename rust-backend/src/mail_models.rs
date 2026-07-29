@@ -185,30 +185,24 @@ pub struct AttachmentInfo {
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SearchScope {
+    #[default]
     All,
     Mailboxes,
 }
 
-impl Default for SearchScope {
-    fn default() -> Self {
-        Self::All
-    }
-}
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ReadStatus {
+    #[default]
     All,
     Read,
     Unread,
 }
 
-impl Default for ReadStatus {
-    fn default() -> Self {
-        Self::All
-    }
-}
 
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]

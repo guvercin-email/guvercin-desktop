@@ -1,4 +1,3 @@
-use imap;
 use native_tls::TlsConnector;
 use std::io::{Read, Write};
 use std::net::TcpStream;

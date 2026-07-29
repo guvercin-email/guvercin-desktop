@@ -8,6 +8,8 @@
 // the caller has to be able to say "now pick guvercin in the page that opened"
 // rather than claim a success that has not happened yet.
 
+import { invoke } from '@tauri-apps/api/core'
+
 const PROMPT_FLAG = 'default_mail_prompt_shown'
 
 function isTauri() {
@@ -17,7 +19,6 @@ function isTauri() {
 export async function isDefaultMailClient() {
   if (!isTauri()) return false
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     return Boolean(await invoke('is_default_mail_client'))
   } catch (error) {
     console.error('is_default_mail_client failed:', error)
@@ -36,7 +37,6 @@ export async function setAsDefaultMailClient() {
     return { ok: false, isDefault: false, needsUserAction: false, message: '' }
   }
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     const outcome = await invoke('set_as_default_mail_client')
     return {
       ok: true,

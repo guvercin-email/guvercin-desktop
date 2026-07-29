@@ -210,8 +210,8 @@ export default function ComposeFormatTools() {
         const ro = new ResizeObserver(recompute)
         if (containerRef.current) ro.observe(containerRef.current)
         return () => ro.disconnect()
-        // groups is rebuilt each render but its length/structure is stable
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        // groups is rebuilt each render but its length/structure is stable, so
+        // the observer only needs to be wired up once.
     }, [])
 
     const visible = groups.slice(0, visibleCount)

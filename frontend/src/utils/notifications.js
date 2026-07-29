@@ -11,6 +11,8 @@
 // regained focus while a notification was pending" as the click, opening the
 // most recently notified mail. Consumers subscribe via subscribeNotificationOpen.
 
+import { invoke } from '@tauri-apps/api/core'
+
 let initialized = false
 let permissionGranted = false
 const openSubscribers = new Set()
@@ -205,7 +207,6 @@ export async function notifyReminder(reminder = {}) {
 export async function setUnreadBadge(count) {
   if (!isTauri()) return
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     await invoke('set_unread_badge', { count: Math.max(0, Math.floor(count) || 0) })
   } catch (error) {
     console.error('Failed to set unread badge:', error)

@@ -73,6 +73,7 @@ function parseSavedOrderFromSettings(setData, camelKey, snakeKey) {
 }
 
 import './SettingsPage.css'
+import { invoke } from '@tauri-apps/api/core'
 
 const SettingsDraftContext = createContext(null)
 
@@ -4256,7 +4257,6 @@ function UninstallSettings({ searchQuery = '' }) {
         setShowConfirm(true)
         if (!isTauri) return
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             const [paths, location] = await Promise.all([
                 invoke('list_user_data_paths'),
                 invoke('installed_app_location'),
@@ -4274,7 +4274,6 @@ function UninstallSettings({ searchQuery = '' }) {
         setError('')
         setRemainingStep(null)
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             const outcome = await invoke('uninstall_app', { deleteData })
             // When `removed` is true the app quits on its own a moment later.
             if (outcome && outcome.removed === false) {
@@ -4539,8 +4538,11 @@ function SettingsPage(props) {
         [registerDraft, unregisterDraft],
     )
 
+    // draftsRef is a ref, so it never triggers a recompute on its own; draftTick
+    // is bumped whenever a draft registers or changes and is the only signal here.
     const dirtyDraftEntries = useMemo(
         () => Array.from(draftsRef.current.entries()).map(([id, data]) => ({ id, ...data })),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
         [draftTick],
     )
     const dirtyCount = dirtyDraftEntries.length

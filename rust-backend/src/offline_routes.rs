@@ -33,6 +33,7 @@ use crate::{
     },
     smtp_send::{
         build_rfc822_message, OutgoingAttachment, OutgoingAttachmentDisposition, OutgoingMailFormat,
+        OutgoingMessage,
     },
 };
 
@@ -1093,7 +1094,7 @@ pub async fn sync_mailbox(
     }
 
     // Determine how many pages exist in this mailbox.
-    let total_pages = (total + per_page - 1) / per_page;
+    let total_pages = total.div_ceil(per_page);
 
     // Inner function: write a batch of previews into local_mail_cache (headers only, no body).
     async fn insert_previews(
@@ -2096,18 +2097,18 @@ pub async fn post_offline_action(
             .to_string();
         let attachments = parse_send_attachments(&payload_value);
         let tracking_key = format!("draft-{}-{:08x}", now_ms(), rand::random::<u32>());
-        let raw_rfc822 = build_rfc822_message(
-            &from_addr,
-            to_addrs,
-            cc_addrs,
-            bcc_addrs,
-            &subject,
+        let raw_rfc822 = build_rfc822_message(OutgoingMessage {
+            from: &from_addr,
+            to: to_addrs,
+            cc: cc_addrs,
+            bcc: bcc_addrs,
+            subject: &subject,
             format,
-            &html_body,
-            &plain_body,
-            &attachments,
-            &[("X-Guvercin-Draft-Key".to_string(), tracking_key.clone())],
-        )
+            html_body: &html_body,
+            plain_body: &plain_body,
+            attachments: &attachments,
+            raw_headers: &[("X-Guvercin-Draft-Key".to_string(), tracking_key.clone())],
+        })
         .map_err(AppError::BadRequest)?;
         let draft_uid = imap_session::append_draft(
             &state.imap,
@@ -2541,23 +2542,27 @@ pub async fn process_queue_once(
                             {
                                 Err(e) => Err(e),
                                 Ok((send_secret, use_xoauth2)) => {
-                                    match crate::smtp_send::send_mail_with_headers(
-                                        &smtp_host,
-                                        smtp_port,
-                                        &ssl_mode,
-                                        &email,
-                                        &send_secret,
-                                        from,
-                                        to,
-                                        cc,
-                                        bcc,
-                                        subject,
-                                        format,
-                                        html_body,
-                                        plain_body,
-                                        &attachments,
-                                        &headers,
-                                        use_xoauth2,
+                                    match crate::smtp_send::send_mail(
+                                        crate::smtp_send::SmtpServer {
+                                            host: &smtp_host,
+                                            port: smtp_port,
+                                            ssl_mode: &ssl_mode,
+                                            email: &email,
+                                            password: &send_secret,
+                                            xoauth2: use_xoauth2,
+                                        },
+                                        crate::smtp_send::OutgoingMessage {
+                                            from,
+                                            to,
+                                            cc,
+                                            bcc,
+                                            subject,
+                                            format,
+                                            html_body,
+                                            plain_body,
+                                            attachments: &attachments,
+                                            raw_headers: &headers,
+                                        },
                                     )
                                     .await
                                     {
@@ -2820,21 +2825,26 @@ pub async fn process_queue_once(
                                             Err(e) => Err(e),
                                             Ok((send_secret, use_xoauth2)) => {
                                                 crate::smtp_send::send_mail(
-                                                    &smtp_host,
-                                                    smtp_port,
-                                                    &ssl_mode,
-                                                    &email,
-                                                    &send_secret,
-                                                    &email,
-                                                    to,
-                                                    cc,
-                                                    bcc,
-                                                    &subject,
-                                                    format,
-                                                    &html_body,
-                                                    &plain_body,
-                                                    &attachments,
-                                                    use_xoauth2,
+                                                    crate::smtp_send::SmtpServer {
+                                                        host: &smtp_host,
+                                                        port: smtp_port,
+                                                        ssl_mode: &ssl_mode,
+                                                        email: &email,
+                                                        password: &send_secret,
+                                                        xoauth2: use_xoauth2,
+                                                    },
+                                                    crate::smtp_send::OutgoingMessage {
+                                                        from: &email,
+                                                        to,
+                                                        cc,
+                                                        bcc,
+                                                        subject: &subject,
+                                                        format,
+                                                        html_body: &html_body,
+                                                        plain_body: &plain_body,
+                                                        attachments: &attachments,
+                                                        raw_headers: &[],
+                                                    },
                                                 )
                                                 .await
                                             }
@@ -3087,21 +3097,26 @@ pub async fn process_queue_once(
                                             Err(e) => Err(e),
                                             Ok((send_secret, use_xoauth2)) => {
                                                 crate::smtp_send::send_mail(
-                                                    &smtp_host,
-                                                    smtp_port,
-                                                    &ssl_mode,
-                                                    &email,
-                                                    &send_secret,
-                                                    &email,
-                                                    to,
-                                                    cc,
-                                                    bcc,
-                                                    &subject,
-                                                    format,
-                                                    &html_body,
-                                                    &plain_body,
-                                                    &attachments,
-                                                    use_xoauth2,
+                                                    crate::smtp_send::SmtpServer {
+                                                        host: &smtp_host,
+                                                        port: smtp_port,
+                                                        ssl_mode: &ssl_mode,
+                                                        email: &email,
+                                                        password: &send_secret,
+                                                        xoauth2: use_xoauth2,
+                                                    },
+                                                    crate::smtp_send::OutgoingMessage {
+                                                        from: &email,
+                                                        to,
+                                                        cc,
+                                                        bcc,
+                                                        subject: &subject,
+                                                        format,
+                                                        html_body: &html_body,
+                                                        plain_body: &plain_body,
+                                                        attachments: &attachments,
+                                                        raw_headers: &[],
+                                                    },
                                                 )
                                                 .await
                                             }
@@ -3586,7 +3601,7 @@ async fn sync_specific_uids(
                     )
                     .bind(&action)
                     .bind(uid.to_string())
-                    .bind(&mailbox)
+                    .bind(mailbox)
                     .bind(action_payload.to_string())
                     .execute(pool)
                     .await;
@@ -4100,7 +4115,7 @@ async fn sync_single_mailbox(
                     )
                     .bind(&action)
                     .bind(uid.to_string())
-                    .bind(&mailbox)
+                    .bind(mailbox)
                     .bind(action_payload.to_string())
                     .execute(pool)
                     .await;
@@ -4376,303 +4391,6 @@ pub async fn update_blocked_sender(
     .await?;
 
     Ok(Json(record))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    fn preview(id: &str) -> MailPreview {
-        MailPreview {
-            id: id.to_string(),
-            message_id: String::new(),
-            in_reply_to: String::new(),
-            references: String::new(),
-            name: "n".to_string(),
-            address: "a@example.com".to_string(),
-            recipient_to: "me@example.com".to_string(),
-            subject: "s".to_string(),
-            date: "Mon, 01 Jan 2024 00:00:00 +0000".to_string(),
-            seen: false,
-            flagged: false,
-            size: 0,
-            importance: 1,
-            content_type: "text/plain".to_string(),
-            category: String::new(),
-            labels: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn align_previews_uses_uid_match_when_available() {
-        let chunk = vec![101, 102, 103];
-        let previews = vec![preview("103"), preview("101"), preview("102")];
-        let aligned = align_previews_to_uids(&chunk, &previews);
-        let got: Vec<u32> = aligned.iter().map(|(uid, _)| *uid).collect();
-        assert_eq!(got, chunk);
-        for (uid, p) in aligned {
-            assert_eq!(p.id, uid.to_string());
-        }
-    }
-
-    #[test]
-    fn align_previews_falls_back_to_positional_when_ids_not_uids() {
-        let chunk = vec![5001, 5002];
-        let previews = vec![preview("1"), preview("2")];
-        let aligned = align_previews_to_uids(&chunk, &previews);
-        assert_eq!(aligned.len(), 2);
-        assert_eq!(aligned[0].0, 5001);
-        assert_eq!(aligned[0].1.id, "5001");
-        assert_eq!(aligned[1].0, 5002);
-        assert_eq!(aligned[1].1.id, "5002");
-    }
-
-    #[test]
-    fn bump_max_uid_synced_tracks_processed_uids() {
-        let mut max_uid = 100;
-        max_uid = bump_max_uid_synced(max_uid, 101);
-        max_uid = bump_max_uid_synced(max_uid, 150);
-
-        assert_eq!(max_uid, 150);
-    }
-
-    #[test]
-    fn validate_offline_action_type_rejects_flag() {
-        let result = validate_offline_action_type("flag");
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
-    }
-
-    #[test]
-    fn validate_offline_action_type_rejects_unflag() {
-        let result = validate_offline_action_type("unflag");
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
-    }
-
-    #[test]
-    fn removed_flag_action_detection_matches_flag() {
-        assert!(is_removed_flag_action("flag"));
-    }
-
-    #[test]
-    fn removed_flag_action_detection_matches_unflag() {
-        assert!(is_removed_flag_action("unflag"));
-    }
-
-    #[test]
-    fn compute_local_label_mutation_adds_label_and_sets_category_when_empty() {
-        let mutation = compute_local_label_mutation("[]", None, "Work", true, "INBOX");
-        assert_eq!(mutation.labels_json, "[\"Work\"]");
-        assert_eq!(mutation.next_category.as_deref(), Some("Work"));
-        assert!(!mutation.delete_row);
-    }
-
-    #[test]
-    fn compute_local_label_mutation_removes_label_and_deletes_matching_label_mailbox_row() {
-        let mutation = compute_local_label_mutation(
-            "[\"Work\",\"Urgent\"]",
-            Some("Work"),
-            "Work",
-            false,
-            "Labels/Work",
-        );
-        assert_eq!(mutation.labels_json, "[\"Urgent\"]");
-        assert_eq!(mutation.next_category.as_deref(), Some("Urgent"));
-        assert!(mutation.delete_row);
-    }
-
-    #[test]
-    fn parse_send_format_defaults_to_plain() {
-        assert_eq!(
-            parse_send_format(&serde_json::json!({})),
-            OutgoingMailFormat::Plain
-        );
-        assert_eq!(
-            parse_send_format(&serde_json::json!({ "format": "html" })),
-            OutgoingMailFormat::Html
-        );
-    }
-
-    #[test]
-    fn parse_send_attachments_reads_attachment_payloads() {
-        let attachments = parse_send_attachments(&serde_json::json!({
-            "attachments": [
-                {
-                    "filename": "image.png",
-                    "content_type": "image/png",
-                    "data_base64": "SGVsbG8=",
-                    "disposition": "inline",
-                    "content_id": "cid-1"
-                }
-            ]
-        }));
-
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].filename, "image.png");
-        assert_eq!(attachments[0].content_id.as_deref(), Some("cid-1"));
-    }
-
-    #[tokio::test]
-    async fn apply_local_action_move_deletes_source_on_uid_collision() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path_by_name TEXT UNIQUE NOT NULL,
-                path_by_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                is_visible BOOLEAN NOT NULL DEFAULT 1
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE local_mail_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uid TEXT NOT NULL,
-                folder TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(uid, folder)
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
-            .bind("123")
-            .bind("INBOX")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
-            .bind("123")
-            .bind("Trash")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        apply_local_action_side_effects(
-            &pool,
-            "move",
-            Some("123"),
-            Some("INBOX"),
-            &serde_json::json!({ "destination": "Trash" }),
-        )
-        .await
-        .unwrap();
-
-        let inbox_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
-        )
-        .bind("123")
-        .bind("INBOX")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(inbox_count, 0);
-
-        let trash_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
-        )
-        .bind("123")
-        .bind("Trash")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(trash_count, 1);
-    }
-
-    #[test]
-    fn apply_subject_prefix_adds_prefix_once() {
-        assert_eq!(apply_subject_prefix("Fwd:", "Hello"), "Fwd: Hello");
-        assert_eq!(apply_subject_prefix("Fwd:", "Fwd: Hello"), "Fwd: Hello");
-        assert_eq!(apply_subject_prefix("Fwd:", "fwd: Hello"), "fwd: Hello");
-        assert_eq!(apply_subject_prefix("Fwd:", ""), "Fwd:");
-        assert_eq!(apply_subject_prefix("", "Hello"), "Hello");
-    }
-
-    #[test]
-    fn parse_reply_seed_from_raw_includes_reply_to() {
-        let raw = concat!(
-            "From: sender@example.com\r\n",
-            "To: me@example.com\r\n",
-            "Reply-To: Reply Person <reply@example.com>\r\n",
-            "Message-ID: <m1>\r\n",
-            "\r\n",
-            "Hello\r\n",
-        );
-        let seed = parse_reply_seed_from_raw(raw.as_bytes());
-        assert_eq!(
-            seed.get("reply_to").and_then(|v| v.as_str()).unwrap_or(""),
-            "Reply Person <reply@example.com>"
-        );
-        assert_eq!(
-            seed.get("message_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "<m1>"
-        );
-    }
-
-    #[test]
-    fn prepare_forward_from_raw_falls_back_to_eml_attachment() {
-        let prepared = prepare_forward_from_raw("1", b"", "Fwd:");
-        assert_eq!(prepared.format, OutgoingMailFormat::Plain);
-        assert_eq!(prepared.attachments.len(), 1);
-        assert_eq!(prepared.attachments[0].filename, "forwarded.eml");
-        assert_eq!(prepared.attachments[0].content_type, "message/rfc822");
-        assert_eq!(prepared.subject, "Fwd:");
-    }
-
-    #[test]
-    fn prepare_forward_downgrades_inline_attachment_without_content_id() {
-        let raw = concat!(
-            "From: sender@example.com\r\n",
-            "To: me@example.com\r\n",
-            "Subject: Hello\r\n",
-            "MIME-Version: 1.0\r\n",
-            "Content-Type: multipart/mixed; boundary=\"b\"\r\n",
-            "\r\n",
-            "--b\r\n",
-            "Content-Type: text/html; charset=utf-8\r\n",
-            "\r\n",
-            "<html><body>Hi</body></html>\r\n",
-            "--b\r\n",
-            "Content-Type: image/png\r\n",
-            "Content-Disposition: inline; filename=\"x.png\"\r\n",
-            "Content-Transfer-Encoding: base64\r\n",
-            "\r\n",
-            "aGVsbG8=\r\n",
-            "--b--\r\n",
-        );
-        let prepared = prepare_forward_from_raw("1", raw.as_bytes(), "Fwd:");
-        assert!(prepared.attachments.len() >= 1);
-        let inline = prepared
-            .attachments
-            .iter()
-            .find(|att| att.filename == "x.png")
-            .expect("expected x.png attachment");
-        assert_eq!(
-            inline.disposition,
-            OutgoingAttachmentDisposition::Attachment
-        );
-        assert!(inline.content_id.is_none());
-        assert_eq!(prepared.subject, "Fwd: Hello");
-        assert_eq!(prepared.format, OutgoingMailFormat::Html);
-    }
 }
 
 async fn cache_mail_preview(
@@ -5259,4 +4977,301 @@ fn percent_encode_filename(input: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    fn preview(id: &str) -> MailPreview {
+        MailPreview {
+            id: id.to_string(),
+            message_id: String::new(),
+            in_reply_to: String::new(),
+            references: String::new(),
+            name: "n".to_string(),
+            address: "a@example.com".to_string(),
+            recipient_to: "me@example.com".to_string(),
+            subject: "s".to_string(),
+            date: "Mon, 01 Jan 2024 00:00:00 +0000".to_string(),
+            seen: false,
+            flagged: false,
+            size: 0,
+            importance: 1,
+            content_type: "text/plain".to_string(),
+            category: String::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn align_previews_uses_uid_match_when_available() {
+        let chunk = vec![101, 102, 103];
+        let previews = vec![preview("103"), preview("101"), preview("102")];
+        let aligned = align_previews_to_uids(&chunk, &previews);
+        let got: Vec<u32> = aligned.iter().map(|(uid, _)| *uid).collect();
+        assert_eq!(got, chunk);
+        for (uid, p) in aligned {
+            assert_eq!(p.id, uid.to_string());
+        }
+    }
+
+    #[test]
+    fn align_previews_falls_back_to_positional_when_ids_not_uids() {
+        let chunk = vec![5001, 5002];
+        let previews = vec![preview("1"), preview("2")];
+        let aligned = align_previews_to_uids(&chunk, &previews);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 5001);
+        assert_eq!(aligned[0].1.id, "5001");
+        assert_eq!(aligned[1].0, 5002);
+        assert_eq!(aligned[1].1.id, "5002");
+    }
+
+    #[test]
+    fn bump_max_uid_synced_tracks_processed_uids() {
+        let mut max_uid = 100;
+        max_uid = bump_max_uid_synced(max_uid, 101);
+        max_uid = bump_max_uid_synced(max_uid, 150);
+
+        assert_eq!(max_uid, 150);
+    }
+
+    #[test]
+    fn validate_offline_action_type_rejects_flag() {
+        let result = validate_offline_action_type("flag");
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_offline_action_type_rejects_unflag() {
+        let result = validate_offline_action_type("unflag");
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn removed_flag_action_detection_matches_flag() {
+        assert!(is_removed_flag_action("flag"));
+    }
+
+    #[test]
+    fn removed_flag_action_detection_matches_unflag() {
+        assert!(is_removed_flag_action("unflag"));
+    }
+
+    #[test]
+    fn compute_local_label_mutation_adds_label_and_sets_category_when_empty() {
+        let mutation = compute_local_label_mutation("[]", None, "Work", true, "INBOX");
+        assert_eq!(mutation.labels_json, "[\"Work\"]");
+        assert_eq!(mutation.next_category.as_deref(), Some("Work"));
+        assert!(!mutation.delete_row);
+    }
+
+    #[test]
+    fn compute_local_label_mutation_removes_label_and_deletes_matching_label_mailbox_row() {
+        let mutation = compute_local_label_mutation(
+            "[\"Work\",\"Urgent\"]",
+            Some("Work"),
+            "Work",
+            false,
+            "Labels/Work",
+        );
+        assert_eq!(mutation.labels_json, "[\"Urgent\"]");
+        assert_eq!(mutation.next_category.as_deref(), Some("Urgent"));
+        assert!(mutation.delete_row);
+    }
+
+    #[test]
+    fn parse_send_format_defaults_to_plain() {
+        assert_eq!(
+            parse_send_format(&serde_json::json!({})),
+            OutgoingMailFormat::Plain
+        );
+        assert_eq!(
+            parse_send_format(&serde_json::json!({ "format": "html" })),
+            OutgoingMailFormat::Html
+        );
+    }
+
+    #[test]
+    fn parse_send_attachments_reads_attachment_payloads() {
+        let attachments = parse_send_attachments(&serde_json::json!({
+            "attachments": [
+                {
+                    "filename": "image.png",
+                    "content_type": "image/png",
+                    "data_base64": "SGVsbG8=",
+                    "disposition": "inline",
+                    "content_id": "cid-1"
+                }
+            ]
+        }));
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "image.png");
+        assert_eq!(attachments[0].content_id.as_deref(), Some("cid-1"));
+    }
+
+    #[tokio::test]
+    async fn apply_local_action_move_deletes_source_on_uid_collision() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path_by_name TEXT UNIQUE NOT NULL,
+                path_by_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                is_visible BOOLEAN NOT NULL DEFAULT 1
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            CREATE TABLE local_mail_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(uid, folder)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
+            .bind("123")
+            .bind("INBOX")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
+            .bind("123")
+            .bind("Trash")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        apply_local_action_side_effects(
+            &pool,
+            "move",
+            Some("123"),
+            Some("INBOX"),
+            &serde_json::json!({ "destination": "Trash" }),
+        )
+        .await
+        .unwrap();
+
+        let inbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
+        )
+        .bind("123")
+        .bind("INBOX")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(inbox_count, 0);
+
+        let trash_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
+        )
+        .bind("123")
+        .bind("Trash")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trash_count, 1);
+    }
+
+    #[test]
+    fn apply_subject_prefix_adds_prefix_once() {
+        assert_eq!(apply_subject_prefix("Fwd:", "Hello"), "Fwd: Hello");
+        assert_eq!(apply_subject_prefix("Fwd:", "Fwd: Hello"), "Fwd: Hello");
+        assert_eq!(apply_subject_prefix("Fwd:", "fwd: Hello"), "fwd: Hello");
+        assert_eq!(apply_subject_prefix("Fwd:", ""), "Fwd:");
+        assert_eq!(apply_subject_prefix("", "Hello"), "Hello");
+    }
+
+    #[test]
+    fn parse_reply_seed_from_raw_includes_reply_to() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: me@example.com\r\n",
+            "Reply-To: Reply Person <reply@example.com>\r\n",
+            "Message-ID: <m1>\r\n",
+            "\r\n",
+            "Hello\r\n",
+        );
+        let seed = parse_reply_seed_from_raw(raw.as_bytes());
+        assert_eq!(
+            seed.get("reply_to").and_then(|v| v.as_str()).unwrap_or(""),
+            "Reply Person <reply@example.com>"
+        );
+        assert_eq!(
+            seed.get("message_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "<m1>"
+        );
+    }
+
+    #[test]
+    fn prepare_forward_from_raw_falls_back_to_eml_attachment() {
+        let prepared = prepare_forward_from_raw("1", b"", "Fwd:");
+        assert_eq!(prepared.format, OutgoingMailFormat::Plain);
+        assert_eq!(prepared.attachments.len(), 1);
+        assert_eq!(prepared.attachments[0].filename, "forwarded.eml");
+        assert_eq!(prepared.attachments[0].content_type, "message/rfc822");
+        assert_eq!(prepared.subject, "Fwd:");
+    }
+
+    #[test]
+    fn prepare_forward_downgrades_inline_attachment_without_content_id() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: me@example.com\r\n",
+            "Subject: Hello\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n",
+            "\r\n",
+            "--b\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "\r\n",
+            "<html><body>Hi</body></html>\r\n",
+            "--b\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-Disposition: inline; filename=\"x.png\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "aGVsbG8=\r\n",
+            "--b--\r\n",
+        );
+        let prepared = prepare_forward_from_raw("1", raw.as_bytes(), "Fwd:");
+        assert!(!prepared.attachments.is_empty());
+        let inline = prepared
+            .attachments
+            .iter()
+            .find(|att| att.filename == "x.png")
+            .expect("expected x.png attachment");
+        assert_eq!(
+            inline.disposition,
+            OutgoingAttachmentDisposition::Attachment
+        );
+        assert!(inline.content_id.is_none());
+        assert_eq!(prepared.subject, "Fwd: Hello");
+        assert_eq!(prepared.format, OutgoingMailFormat::Html);
+    }
 }

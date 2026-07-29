@@ -73,16 +73,28 @@ pub async fn is_negative_cached(pool: &SqlitePool, hash: &str) -> bool {
     row.unwrap_or(false)
 }
 
+/// Where a fetched avatar gets written: the database row, the on-disk cache
+/// directory, and the key the file is encrypted with (when the account has one).
+#[derive(Clone, Copy)]
+pub struct AvatarStore<'a> {
+    pub pool: &'a SqlitePool,
+    pub cache_dir: &'a Path,
+    pub crypto: Option<&'a CryptoManager>,
+}
+
 pub async fn cache_avatar(
-    pool: &SqlitePool,
+    store: AvatarStore<'_>,
     email: &str,
     hash: &str,
     data: &[u8],
     content_type: &str,
     source: &str,
-    cache_dir: &Path,
-    crypto: Option<&CryptoManager>,
 ) -> anyhow::Result<PathBuf> {
+    let AvatarStore {
+        pool,
+        cache_dir,
+        crypto,
+    } = store;
     tokio::fs::create_dir_all(cache_dir).await?;
 
     let ext = if content_type.contains("svg") {
@@ -416,8 +428,13 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
     if let Ok(user_pool) = crate::db::get_user_db_pool(&state, account_id).await {
         if let Some((data, ct)) = try_contact(&user_pool, &email).await {
             let _ = cache_avatar(
-                pool, &email, &hash, &data, &ct, "contact", &cache_dir, crypto_opt,
-            )
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "contact",
+        )
             .await;
             return;
         }
@@ -425,7 +442,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_bimi(&client, &domain).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "bimi", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "bimi",
         )
         .await;
         return;
@@ -433,7 +455,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_google_profile(&client, &email).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "google", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "google",
         )
         .await;
         return;
@@ -441,7 +468,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_gravatar(&client, &email).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "gravatar", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "gravatar",
         )
         .await;
         return;
@@ -449,7 +481,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_clearbit(&client, &domain).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "clearbit", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "clearbit",
         )
         .await;
         return;
@@ -457,14 +494,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_google_favicon(&client, &domain).await {
         let _ = cache_avatar(
-            pool,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
             &email,
             &hash,
             &data,
             &ct,
             "google_favicon",
-            &cache_dir,
-            crypto_opt,
         )
         .await;
         return;
@@ -472,7 +507,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_og_image(&client, &domain).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "og_image", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "og_image",
         )
         .await;
         return;
@@ -480,7 +520,12 @@ pub async fn run_waterfall(email: String, account_id: i64, state: Arc<AppState>)
 
     if let Some((data, ct)) = try_favicon_ico(&client, &domain).await {
         let _ = cache_avatar(
-            pool, &email, &hash, &data, &ct, "favicon", &cache_dir, crypto_opt,
+            AvatarStore { pool, cache_dir: &cache_dir, crypto: crypto_opt },
+            &email,
+            &hash,
+            &data,
+            &ct,
+            "favicon",
         )
         .await;
         return;

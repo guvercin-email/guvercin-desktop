@@ -12,6 +12,8 @@
 // buffered in a queue and drained by whichever consumer (typically
 // DashboardPage) is ready. Listeners install once.
 
+import { invoke } from '@tauri-apps/api/core'
+
 const queue = []
 const subscribers = new Set()
 let initialized = false
@@ -80,7 +82,6 @@ export async function initEmlInbox() {
   // Files passed as launch arguments (Windows/Linux), collected by the Rust
   // side before any window existed.
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     const pending = await invoke('take_launch_files')
     handleUrls(pending)
   } catch (error) {

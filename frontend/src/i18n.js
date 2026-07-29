@@ -1,17 +1,44 @@
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
-// Use Vite's glob import to load all translation JSON files dynamically
-const modules = import.meta.glob('./locales/**/*.json', { eager: true });
-const resources = {};
+// English is the fallback, so it is the one bundle that always has to be present.
+import enTranslation from './locales/en/translation.json';
 
-for (const path in modules) {
+// The other 63 locales are ~1.7 MB of JSON in total and a user only ever reads
+// one of them, so they stay behind per-language dynamic imports. `import.meta.glob`
+// without `eager` gives us a { path: () => import(path) } map that Vite turns into
+// one chunk per locale.
+// English is excluded: it is statically imported above, and letting it match here
+// too would leave rollup with the same module reachable both ways.
+const localeLoaders = import.meta.glob(['./locales/**/*.json', '!./locales/en/**']);
+
+const LOCALE_BY_LANG = { en: null };
+for (const path in localeLoaders) {
     const parts = path.split('/');
-    if (parts.length >= 3) {
-        const lang = parts[2];
-        resources[lang] = {
-            translation: modules[path].default || modules[path]
-        };
+    if (parts.length >= 3) LOCALE_BY_LANG[parts[2]] = localeLoaders[path];
+}
+
+/**
+ * Makes sure `lang`'s bundle is registered with i18next. Safe to call repeatedly;
+ * resolves immediately once a language has been loaded. Unknown languages resolve
+ * without doing anything — i18next then falls back to English.
+ */
+export async function loadLanguage(lang) {
+    if (!lang || lang === 'en') return;
+    if (i18n.hasResourceBundle(lang, 'translation')) return;
+    const loader = LOCALE_BY_LANG[lang];
+    if (!loader) return;
+    try {
+        const mod = await loader();
+        i18n.addResourceBundle(lang, 'translation', mod.default || mod, true, true);
+    } catch (error) {
+        console.error(`Failed to load the ${lang} translation`, error);
     }
+}
+
+/** Loads `lang` before switching, so the UI never flashes the fallback text. */
+export async function changeLanguage(lang) {
+    await loadLanguage(lang);
+    return i18n.changeLanguage(lang);
 }
 
 // Languages written right-to-left. Keyed by base language so regional variants
@@ -60,7 +87,7 @@ if (!localStorage.getItem('temp_language') && !localStorage.getItem('language'))
 i18n
     .use(initReactI18next)
     .init({
-        resources,
+        resources: { en: { translation: enTranslation } },
         lng: initialLang,
         fallbackLng: "en",
         interpolation: {
@@ -71,9 +98,15 @@ i18n
 applyDocumentDirection(initialLang);
 i18n.on('languageChanged', applyDocumentDirection);
 
+/**
+ * Resolves once the startup language is usable. `main.jsx` awaits it before the
+ * first render so a non-English user never sees a frame of English.
+ */
+export const i18nReady = loadLanguage(initialLang);
+
 export default i18n;
 
-// Export available languages for UI
+/** Every language shipped, whether or not its bundle has been loaded yet. */
 export function getAvailableLanguages() {
-    return Object.keys(resources).sort();
+    return Object.keys(LOCALE_BY_LANG).sort();
 }

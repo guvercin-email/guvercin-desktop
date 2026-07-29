@@ -55,7 +55,7 @@ export function SyncChoiceModal({
           <div className="sync-opts">
             {googleAvailable && opt(
               'google',
-              <img src="/icon-google.png" alt="" width="22" height="22" />,
+              <img src="/img/icon-google.png" alt="" width="22" height="22" />,
               reconnecting ? t('Waiting for Google…') : googleTitle,
               googleDesc,
               onGoogle,

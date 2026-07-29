@@ -3,7 +3,7 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App.jsx'
 import './index.css'
-import './i18n'
+import { i18nReady } from './i18n'
 import { installTauriTerminalLogging } from './utils/tauriTerminalLogging.js'
 
 void installTauriTerminalLogging()
@@ -182,18 +182,22 @@ window.addEventListener('unhandledrejection', (event) => {
   showFatalOverlay(message, stack)
 })
 
-try {
-  ReactDOM.createRoot(document.getElementById('root')).render(
-    <React.StrictMode>
-      <ThemeProvider>
-        <OfflineSyncProvider>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
-        </OfflineSyncProvider>
-      </ThemeProvider>
-    </React.StrictMode>,
-  )
-} catch (err) {
-  showFatalOverlay(err?.message || String(err), err?.stack || '')
-}
+// The startup locale is fetched as its own chunk, so hold the first render until
+// it has landed — otherwise a non-English user sees a frame of English.
+i18nReady.finally(() => {
+  try {
+    ReactDOM.createRoot(document.getElementById('root')).render(
+      <React.StrictMode>
+        <ThemeProvider>
+          <OfflineSyncProvider>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </OfflineSyncProvider>
+        </ThemeProvider>
+      </React.StrictMode>,
+    )
+  } catch (err) {
+    showFatalOverlay(err?.message || String(err), err?.stack || '')
+  }
+})

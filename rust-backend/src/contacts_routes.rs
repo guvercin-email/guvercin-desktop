@@ -201,13 +201,15 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> ContactRecord {
 /// Reconstruct a card from the old flat columns for contacts created before the
 /// `card_json` column existed.
 fn legacy_card_from_row(row: &sqlx::sqlite::SqliteRow) -> ContactCard {
-    let mut card = ContactCard::default();
-    card.display_name = row
-        .try_get::<Option<String>, _>("display_name")
-        .ok()
-        .flatten()
-        .or_else(|| row.try_get::<Option<String>, _>("name").ok().flatten())
-        .unwrap_or_default();
+    let mut card = ContactCard {
+        display_name: row
+            .try_get::<Option<String>, _>("display_name")
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<Option<String>, _>("name").ok().flatten())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
     if let Some(mail) = row
         .try_get::<Option<String>, _>("mail_address")
         .ok()
@@ -378,22 +380,6 @@ pub async fn sync_write_contact(
         .execute(pool).await?;
         Ok(res.last_insert_rowid())
     }
-}
-
-/// Upsert a contact keyed on its stored UID — used by external (Google) sync so
-/// re-running a sync updates the same rows instead of creating duplicates.
-pub async fn upsert_contact_by_uid(pool: &SqlitePool, card: &ContactCard) -> Result<i64, AppError> {
-    let existing: Option<i64> = if card.uid.trim().is_empty() {
-        None
-    } else {
-        sqlx::query_scalar("SELECT contact_id FROM contacts WHERE uid = ? LIMIT 1")
-            .bind(&card.uid)
-            .fetch_optional(pool)
-            .await?
-    };
-    let id = upsert_card(pool, existing, card).await?;
-    reconcile_membership(pool, id, &card.categories).await?;
-    Ok(id)
 }
 
 // ─────────────────────────── Backend preference ───────────────────────────
@@ -802,7 +788,7 @@ pub async fn suggest_contacts(
 
     // The local mail cache may not exist yet on a brand-new account; degrade to an
     // empty list rather than erroring.
-    let rows = match sqlx::query(
+    let rows = sqlx::query(
         r#"
         SELECT sender_address AS email,
                COALESCE(MAX(sender_name), '') AS name,
@@ -817,10 +803,7 @@ pub async fn suggest_contacts(
     )
     .fetch_all(&pool)
     .await
-    {
-        Ok(rows) => rows,
-        Err(_) => Vec::new(),
-    };
+    .unwrap_or_default();
 
     let suggestions = rows
         .iter()

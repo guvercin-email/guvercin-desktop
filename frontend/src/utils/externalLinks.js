@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core'
+
 const WEB_FALLBACK_KEY = 'guv_link_click_behavior'
 
 function isProbablyTauri() {
@@ -36,7 +38,6 @@ function normalizeExternalUrl(input) {
 
 async function tryInvoke(command, args) {
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     return await invoke(command, args)
   } catch {
     return null

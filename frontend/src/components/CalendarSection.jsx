@@ -774,7 +774,7 @@ function CloudChoiceModal({ t, backend, googleGmail, reconnecting, onGoogle, onC
           <div className="cal-cloud-opts">
             {googleGmail && opt(
               'google',
-              <img src="/icon-google.png" alt="" width="22" height="22" />,
+              <img src="/img/icon-google.png" alt="" width="22" height="22" />,
               reconnecting ? t('Waiting for Google…') : t('Google Calendar'),
               t('Two-way sync with your Google account.'),
               onGoogle,

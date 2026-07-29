@@ -6,7 +6,6 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Datelike, Duration, NaiveDate};
-use imap;
 use native_tls::TlsConnector;
 use tracing::{error, info, warn};
 
@@ -88,11 +87,10 @@ impl ImapSession {
                     for attr in n.attributes() {
                         match attr {
                             imap::types::NameAttribute::NoSelect => selectable = false,
-                            imap::types::NameAttribute::Custom(value) => {
-                                if role.is_none() {
+                            imap::types::NameAttribute::Custom(value)
+                                if role.is_none() => {
                                     role = special_use_role(value);
                                 }
-                            }
                             _ => {}
                         }
                     }
@@ -1116,8 +1114,7 @@ pub fn set_label(
                 ImapSession::Tls(s) => s.uid_copy(uid, &folder),
             };
         }
-    } else {
-    }
+    } 
 
     Ok(())
 }
@@ -1511,21 +1508,7 @@ fn parse_labels_from_headers(headers: &[mailparse::MailHeader]) -> Vec<String> {
     vec![category]
 }
 
-#[cfg(test)]
-fn parse_importance(headers: &str) -> i32 {
-    match parse_headers(headers.as_bytes()) {
-        Ok((parsed, _)) => parse_importance_from_headers(&parsed),
-        Err(_) => 1,
-    }
-}
 
-#[cfg(test)]
-fn parse_category(headers: &str) -> String {
-    match parse_headers(headers.as_bytes()) {
-        Ok((parsed, _)) => parse_category_from_headers(&parsed),
-        Err(_) => String::new(),
-    }
-}
 
 #[cfg(test)]
 fn parse_labels(headers: &str) -> Vec<String> {
@@ -1576,16 +1559,20 @@ mod tests {
 
     #[test]
     fn build_imap_advanced_query_adds_unseen() {
-        let mut req = AdvancedSearchRequest::default();
-        req.read_status = Some(ReadStatus::Unread);
+        let req = AdvancedSearchRequest {
+            read_status: Some(ReadStatus::Unread),
+            ..Default::default()
+        };
         assert_eq!(build_imap_advanced_query(&req), "UNSEEN");
     }
 
     #[test]
     fn build_imap_advanced_query_formats_date_range_inclusive_end() {
-        let mut req = AdvancedSearchRequest::default();
-        req.date_start = Some("2026-03-01".to_string());
-        req.date_end = Some("2026-03-09".to_string());
+        let req = AdvancedSearchRequest {
+            date_start: Some("2026-03-01".to_string()),
+            date_end: Some("2026-03-09".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             build_imap_advanced_query(&req),
             "SENTSINCE 01-Mar-2026 SENTBEFORE 10-Mar-2026"
@@ -1594,8 +1581,10 @@ mod tests {
 
     #[test]
     fn build_imap_advanced_query_escapes_quotes_and_backslashes() {
-        let mut req = AdvancedSearchRequest::default();
-        req.subject = Some(r#"Hello "world" \\ test"#.to_string());
+        let req = AdvancedSearchRequest {
+            subject: Some(r#"Hello "world" \\ test"#.to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             build_imap_advanced_query(&req),
             r#"SUBJECT "Hello \"world\" \\\\ test""#

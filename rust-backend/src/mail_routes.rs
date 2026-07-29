@@ -851,6 +851,31 @@ pub async fn download_attachment(
         .into_response()
 }
 
+pub async fn disconnect_imap(
+    State(state): State<Arc<MailAppState>>,
+    Path(account_id): Path<i64>,
+) -> impl IntoResponse {
+    tokio::task::spawn_blocking({
+        let imap_state = state.imap.clone();
+        move || imap_session::disconnect(&imap_state, account_id)
+    })
+    .await
+    .ok();
+
+    (StatusCode::OK, Json(json!({"status": "disconnected"}))).into_response()
+}
+
+fn percent_encode_filename(input: &str) -> String {
+    input
+        .as_bytes()
+        .iter()
+        .map(|&b| match b {
+            0x21..=0x7e if b != b'%' && b != b'"' && b != b'\\' => (b as char).to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,29 +902,4 @@ mod tests {
             "<m1>"
         );
     }
-}
-
-pub async fn disconnect_imap(
-    State(state): State<Arc<MailAppState>>,
-    Path(account_id): Path<i64>,
-) -> impl IntoResponse {
-    tokio::task::spawn_blocking({
-        let imap_state = state.imap.clone();
-        move || imap_session::disconnect(&imap_state, account_id)
-    })
-    .await
-    .ok();
-
-    (StatusCode::OK, Json(json!({"status": "disconnected"}))).into_response()
-}
-
-fn percent_encode_filename(input: &str) -> String {
-    input
-        .as_bytes()
-        .iter()
-        .map(|&b| match b {
-            0x21..=0x7e if b != b'%' && b != b'"' && b != b'\\' => (b as char).to_string(),
-            _ => format!("%{:02X}", b),
-        })
-        .collect()
 }

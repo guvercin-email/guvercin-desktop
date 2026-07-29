@@ -5,6 +5,8 @@
 // Dolphin and Nemo. These helpers let the user put it back if they removed it,
 // or take it away if they don't want it.
 
+import { invoke } from '@tauri-apps/api/core'
+
 function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
@@ -12,7 +14,6 @@ function isTauri() {
 export async function isFileContextMenuRegistered() {
   if (!isTauri()) return false
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     return Boolean(await invoke('is_file_context_menu_registered'))
   } catch (error) {
     console.error('is_file_context_menu_registered failed:', error)
@@ -24,7 +25,6 @@ export async function isFileContextMenuRegistered() {
 export async function setFileContextMenuRegistered(enabled) {
   if (!isTauri()) return { ok: false, message: '' }
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
     await invoke(enabled ? 'register_file_context_menu' : 'unregister_file_context_menu')
     return { ok: true, message: '' }
   } catch (error) {

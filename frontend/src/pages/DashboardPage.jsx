@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
+import React, { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { apiUrl, getApiBaseUrl } from '../utils/api'
@@ -14,9 +14,11 @@ import ComposeMailContent from '../components/ComposeMailContent.jsx'
 import ComposeFormatTools from '../components/ComposeFormatTools.jsx'
 import { ComposeEditorProvider } from '../context/ComposeEditorContext.jsx'
 import MailHeadersPanel from '../components/MailHeadersPanel.jsx'
-import ContactsSection from '../components/ContactsSection.jsx'
-import CalendarSection from '../components/CalendarSection.jsx'
-import TodoSection from '../components/TodoSection.jsx'
+// The non-mail sections and the settings overlay are each mounted only when the
+// user opens them, so they are split out of the dashboard bundle.
+const ContactsSection = lazy(() => import('../components/ContactsSection.jsx'))
+const CalendarSection = lazy(() => import('../components/CalendarSection.jsx'))
+const TodoSection = lazy(() => import('../components/TodoSection.jsx'))
 import {
     buildDraftSavePayload,
     getComposeTitle,
@@ -67,7 +69,8 @@ import {
 } from '../utils/defaultMailClient.js'
 import { saveWindowPreferences, markAuthenticationComplete, shouldUseFullscreen } from '../utils/windowPreferences.js'
 import './DashboardPage.css'
-import SettingsPage from './SettingsPage.jsx'
+const SettingsPage = lazy(() => import('./SettingsPage.jsx'))
+import { invoke } from '@tauri-apps/api/core'
 
 const EMPTY_OBJECT = Object.freeze({})
 const TOOLBAR_STYLE_DEFAULT = 'icon_text_small'
@@ -1015,10 +1018,7 @@ async function saveBlobWithPicker(blob, options) {
     const { suggestedName, types } = options
 
     try {
-        const [{ save }, { invoke }] = await Promise.all([
-            import('@tauri-apps/plugin-dialog'),
-            import('@tauri-apps/api/core'),
-        ])
+        const { save } = await import('@tauri-apps/plugin-dialog')
         const filters = Array.isArray(types)
             ? types.map((entry) => ({
                 name: entry.description || 'File',
@@ -2370,7 +2370,7 @@ const DashboardPage = () => {
     }
     openMailRef.current = openMail
 
-    const queueAction = async (actionType, targetUid, payload = {}, targetFolderOverride = null) => {
+    const queueAction = useCallback(async (actionType, targetUid, payload = {}, targetFolderOverride = null) => {
         if (!accountId || !backendReachable) return
         const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
             method: 'POST',
@@ -2392,7 +2392,7 @@ const DashboardPage = () => {
             flushQueue(accountId)
         }
         return responseBody
-    }
+    }, [accountId, backendReachable, flushQueue, networkOnline, refreshStatus, selectedFolder])
 
     const dismissActionNotice = useCallback((noticeId) => {
         setActionNotices((prev) => prev.filter((notice) => notice.id !== noticeId))
@@ -2615,7 +2615,6 @@ const DashboardPage = () => {
     const detachMailToWindow = async () => {
         if (!selectedMail) return
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             nextMailWindowId.current += 1
             const mailWindowLabel = `mail-${nextMailWindowId.current}`
             const mailbox = selectedMail?.mailbox || selectedFolder || 'INBOX'
@@ -2652,7 +2651,6 @@ const DashboardPage = () => {
             }
             if (res.ok) content = await res.json()
 
-            const { invoke } = await import('@tauri-apps/api/core')
             nextMailWindowId.current += 1
             const mailWindowLabel = `mail-${nextMailWindowId.current}`
             const mailData = {
@@ -3230,9 +3228,11 @@ const DashboardPage = () => {
                 <div className={`db-main-container${(activeSection === 'contacts' || activeSection === 'calendar' || activeSection === 'todo') ? ' db-main-container--flush' : ''}`}>
                     <div className="db-content-area">
                         <div className="db-section-area">
-                            {activeSection === 'calendar' && <CalendarSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
-                            {activeSection === 'contacts' && <ContactsSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
-                            {activeSection === 'todo' && <TodoSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
+                            <Suspense fallback={null}>
+                                {activeSection === 'calendar' && <CalendarSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
+                                {activeSection === 'contacts' && <ContactsSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
+                                {activeSection === 'todo' && <TodoSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
+                            </Suspense>
                         </div>
                     </div>
                 </div>
@@ -3510,11 +3510,13 @@ const DashboardPage = () => {
                 </div>
             )}
             {settingsPageOpen && (
-                <SettingsPage 
-                    onClose={() => setSettingsPageOpen(false)} 
-                    accountId={accountId} 
-                    onRefreshAccount={() => fetchAccount(accountId)}
-                />
+                <Suspense fallback={null}>
+                    <SettingsPage
+                        onClose={() => setSettingsPageOpen(false)}
+                        accountId={accountId}
+                        onRefreshAccount={() => fetchAccount(accountId)}
+                    />
+                </Suspense>
             )}
         </div>
     )
@@ -3535,7 +3537,7 @@ function MailSection({
     onSelectFolder,
 	    ensureImapConnected,
 	    folders, labels, mailboxRoles = {}, noselectMailboxes = [], selectedFolder, setSelectedFolder, mails, setMails,
-	    selectedMail, setSelectedMail, mailContent, setMailContent, loadingMails, loadingContent, setLoadingContent,
+    selectedMail, setSelectedMail, mailContent, setMailContent, loadingMails, loadingContent, setLoadingContent,
 	    connecting, loadMailsFromCache, syncMailsFromRemote, prefetchInlineAssets, isSyncing, setIsSyncing,
 	    openMail, detachMailToWindow, detachMailToWindowFromList, iframeRef, getShortTime,
     currentPage, setCurrentPage, maxPage: _maxPage, perPage, setPerPage,
@@ -3780,8 +3782,14 @@ function MailSection({
     const filteredMaxPage = Math.max(1, Math.ceil(itemCount / perPageValue))
     const displayPage = Math.min(currentPage, filteredMaxPage)
     const pageStart = (displayPage - 1) * perPageValue
-    const pagedVisibleMails = threadedEnabled ? [] : visibleMails.slice(pageStart, pageStart + perPageValue)
-    const pagedVisibleThreads = threadedEnabled ? visibleThreads.slice(pageStart, pageStart + perPageValue) : []
+    const pagedVisibleMails = useMemo(
+        () => (threadedEnabled ? [] : visibleMails.slice(pageStart, pageStart + perPageValue)),
+        [pageStart, perPageValue, threadedEnabled, visibleMails],
+    )
+    const pagedVisibleThreads = useMemo(
+        () => (threadedEnabled ? visibleThreads.slice(pageStart, pageStart + perPageValue) : []),
+        [pageStart, perPageValue, threadedEnabled, visibleThreads],
+    )
     const selectedGlobalIndex = useMemo(() => {
         if (!selectedMail) return -1
         const selectedKey = String(selectedMail?.id ?? '')
@@ -3925,7 +3933,9 @@ function MailSection({
     const forwardSelectionTitle = canForwardActionMail ? undefined : (hasAnyActionMail ? 'Select a single mail to forward' : selectionRequiredTitle)
     const openActionTitle = canOpenActionMail ? undefined : (hasAnyActionMail ? 'Select a single mail to open' : selectionRequiredTitle)
 
-    const formatMailDateLong = (dateValue) => {
+    // Memoised: six of the callbacks below list it as a dependency, so a fresh
+    // identity each render would rebuild all of them every time.
+    const formatMailDateLong = useCallback((dateValue) => {
         if (!dateValue) return ''
         const dt = new Date(dateValue)
         if (Number.isNaN(dt.getTime())) return dateValue
@@ -3941,7 +3951,7 @@ function MailSection({
         if (typeof hour12 === 'boolean') options.hour12 = hour12
 
         return new Intl.DateTimeFormat(undefined, options).format(dt)
-    }
+    }, [])
 
     const createEmptyComposeDraft = useCallback((draft = {}) => normalizeComposeDraft(draft), [])
     const closeComposeExitPrompt = useCallback(() => {
@@ -4114,7 +4124,6 @@ function MailSection({
     const openComposeWindow = useCallback(async (sessionOrDraft, fallbackSource = 'new') => {
         if (!accountId) return false
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             nextComposeWindowId.current += 1
             const label = `compose-${nextComposeWindowId.current}`
             const source = sessionOrDraft?.source || fallbackSource
@@ -4385,7 +4394,7 @@ function MailSection({
             intent,
             pendingMail,
         })
-    }, [closeComposeTarget, openMailOrDraft, setMailContent, setSelectedMail])
+    }, [closeComposeTarget, openMailOrDraft, setLoadingContent, setMailContent, setSelectedMail])
 
     const continueComposeExitIntent = useCallback(async (prompt) => {
         if (prompt?.intent === 'open_mail' && prompt.pendingMail) {
@@ -4396,7 +4405,7 @@ function MailSection({
             setMailContent(null)
             setLoadingContent(false)
         }
-    }, [openMailOrDraft, setMailContent, setSelectedMail])
+    }, [openMailOrDraft, setLoadingContent, setMailContent, setSelectedMail])
 
     const handleComposeExitAction = useCallback(async (action) => {
         if (!composeExitPrompt) return
@@ -4503,7 +4512,7 @@ function MailSection({
             intent: 'select_mail',
             pendingMail: mail,
         })
-    }, [inlineComposeSession, setInlineComposeSession, setMailContent, setSelectedMail])
+    }, [inlineComposeSession, setInlineComposeSession, setLoadingContent, setMailContent, setSelectedMail])
 
     const composeDraft = useCallback((draft, source = 'new') => {
         openInlineCompose({ source, draft })
@@ -5147,7 +5156,6 @@ function MailSection({
     const detachImportedMailToWindow = useCallback(async (mail, content) => {
         if (!accountId || !mail || !content) return
         try {
-            const { invoke } = await import('@tauri-apps/api/core')
             nextImportedMailWindowId.current += 1
             const mailWindowLabel = `import-mail-${nextImportedMailWindowId.current}`
             const mailbox = mail?.mailbox || selectedFolder || 'Imported'
@@ -5258,6 +5266,10 @@ function MailSection({
             }
         })
         return () => window.cancelAnimationFrame(raf)
+        // mailItemMenu?.style is read but deliberately not a dependency: this
+        // effect writes that same style back, so listing it would re-trigger the
+        // measurement on every clamp.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [clampFloatingMenuPosition, mailItemMenu?.labelMenuOpen, mailItemMenu?.mail, mailItemMenu?.moveMenuOpen])
 
     const toggleMailItemMoveMenu = useCallback((event) => {
@@ -5386,7 +5398,6 @@ function MailSection({
         if (!accountId) return undefined
         const unsubscribe = subscribeEml(async (filePath) => {
             try {
-                const { invoke } = await import('@tauri-apps/api/core')
                 const base64 = await invoke('read_eml_file', { path: filePath })
                 const binary = atob(base64)
                 const bytes = new Uint8Array(binary.length)

@@ -108,7 +108,7 @@ pub async fn setup_account(
         let imap_server = form.imap_server.trim().to_string();
         let password = form.password.trim().to_string();
         let (ok, msg) =
-            imap_client::authorize(&imap_server, &email, &password, imap_port, false, &ssl_mode)
+            imap_client::authorize(&imap_server, &email, &password, imap_port, false, ssl_mode)
                 .await;
         (ok, msg)
     };

@@ -22,6 +22,7 @@ import {
   mailHeadersKey,
 } from '../utils/mailHeaders.js'
 import './DashboardPage.css'
+import { invoke } from '@tauri-apps/api/core'
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes === 0) return '0 B'
@@ -228,11 +229,11 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     [folders],
   )
 
-  const patchMail = (patch) => {
+  const patchMail = useCallback((patch) => {
     setData((prev) => (
       prev?.mail ? { ...prev, mail: { ...prev.mail, ...patch } } : prev
     ))
-  }
+  }, [])
 
   const syncPopoverPosition = useCallback((menuRef, setStyle) => {
     const node = menuRef.current
@@ -254,7 +255,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     })
   }, [])
 
-  const queueAction = async (actionType, payload = {}) => {
+  const queueAction = useCallback(async (actionType, payload = {}) => {
     if (!accountId || !mail?.id) return
     await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
       method: 'POST',
@@ -266,7 +267,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
         payload,
       }),
     })
-  }
+  }, [accountId, mail?.id, mailbox])
 
   useEffect(() => {
     document.body.style.padding = '0'
@@ -301,7 +302,6 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     let active = true
     const fetchData = async () => {
       try {
-        const { invoke } = await import('@tauri-apps/api/core')
         const json = await invoke('get_mail_window_data', { label: windowLabel })
         if (!active) return
         if (json) {
@@ -410,7 +410,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
   useEffect(() => {
     if (!mail?.id || mail.seen === true || loading) return
     queueAction('mark_read').then(() => patchMail({ seen: true })).catch(() => {})
-  }, [loading, mail?.id, mail?.seen])
+  }, [loading, mail?.id, mail?.seen, patchMail, queueAction])
 
   useEffect(() => {
     if (!isMoveMenuOpen) {
@@ -439,7 +439,6 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
 
   const closeWindow = async () => {
     try {
-      const { invoke } = await import('@tauri-apps/api/core')
       if (!windowLabel) {
         window.close()
         return

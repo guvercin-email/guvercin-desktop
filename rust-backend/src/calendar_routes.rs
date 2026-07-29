@@ -517,20 +517,6 @@ async fn fetch_card(pool: &SqlitePool, id: i64) -> Result<Option<(i64, EventCard
     Ok(row.map(|r| row_to_card(&r)))
 }
 
-/// Upsert an event keyed on its stored UID — used by external (Google) sync so
-/// re-running a sync updates the same rows instead of creating duplicates.
-pub async fn upsert_event_by_uid(pool: &SqlitePool, card: &EventCard) -> Result<i64, AppError> {
-    let existing: Option<i64> = if card.uid.trim().is_empty() {
-        None
-    } else {
-        sqlx::query_scalar("SELECT event_id FROM events WHERE uid = ? LIMIT 1")
-            .bind(&card.uid)
-            .fetch_optional(pool)
-            .await?
-    };
-    upsert_event(pool, existing, card).await
-}
-
 /// Find or create a calendar by name, keeping its color in sync. Used to mirror
 /// remote (Google) calendars into local ones.
 pub async fn ensure_named_calendar(

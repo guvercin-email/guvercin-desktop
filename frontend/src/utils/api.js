@@ -10,6 +10,8 @@
 //   4. `apiReady()` returns a Promise that resolves once the real port is known,
 //      so critical initialisation code can await it before the first fetch.
 
+import { invoke } from '@tauri-apps/api/core'
+
 const _fallback = import.meta.env.VITE_API_URL || 'http://127.0.0.1:5000';
 
 // Start with the fallback; replaced as soon as the real port arrives.
@@ -19,7 +21,6 @@ export const apiReady = new Promise(res => { _readyResolve = res; });
 
 (async () => {
   try {
-    const { invoke } = await import('@tauri-apps/api/core');
     for (let i = 0; i < 50; i++) {
       const port = await invoke('get_backend_port');
       if (port) {
