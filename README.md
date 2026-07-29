@@ -22,7 +22,10 @@ smtp, no database, no account — nothing leaves the tab, and a reload resets it
 
 <br>
 
-<img src="docs/shot-mail.svg" alt="the mail view: a folder tree on the left, a message list in the middle, and the selected message open in a reading pane on the right" width="880">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/shot-mail-dark.webp">
+  <img src="docs/shot-mail-light.webp" alt="the mail view: a folder tree on the left, a message list in the middle, and the selected message open in a reading pane on the right" width="880">
+</picture>
 
 </div>
 
@@ -74,9 +77,18 @@ imported from a json file, a per-account compose font, and every keyboard shortc
 rebindable. 64 interface languages ship with the app.
 
 <div align="center">
-<img src="docs/shot-calendar.svg" alt="the calendar view, showing a month grid with events" width="270">
-<img src="docs/shot-contacts.svg" alt="the contacts view, showing a contact list beside a contact card" width="270">
-<img src="docs/shot-tasks.svg" alt="the tasks view, showing a task list with due dates and subtasks" width="270">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/shot-calendar-dark.webp">
+  <img src="docs/shot-calendar-light.webp" alt="the calendar view, showing a month grid with events" width="270">
+</picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/shot-contacts-dark.webp">
+  <img src="docs/shot-contacts-light.webp" alt="the contacts view, showing a contact list beside a contact card" width="270">
+</picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/shot-tasks-dark.webp">
+  <img src="docs/shot-tasks-light.webp" alt="the tasks view, showing a task list with due dates and subtasks" width="270">
+</picture>
 </div>
 
 ---
