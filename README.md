@@ -1,3 +1,5 @@
+<div align="right"><strong>English</strong> · <a href="README.tr.md">Türkçe</a></div>
+
 <div align="center">
 
 <picture>
