@@ -1,0 +1,18 @@
+{
+  "mainBinaryName": "guvercin",
+  "bundle": {
+    "targets": [
+      "deb",
+      "rpm",
+      "appimage"
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "guvercin.desktop.template"
+      },
+      "rpm": {
+        "desktopTemplate": "guvercin.desktop.template"
+      }
+    }
+  }
+}

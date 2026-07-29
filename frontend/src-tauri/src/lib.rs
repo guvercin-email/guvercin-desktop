@@ -229,6 +229,51 @@ fn is_message_file(path: &str) -> bool {
   lower.ends_with(".eml") || lower.ends_with(".msg")
 }
 
+/// Turns a `file://` argument into the plain path it names, percent-decoding it.
+///
+/// The desktop entry declares `%U` because `mailto:` is the association that
+/// matters most, and `%U` is what carries a URL — but the same field is what a
+/// file manager uses to open a `.eml`, and with `%U` it hands over a `file://`
+/// URL rather than a path. Windows and macOS both deliver something the app can
+/// open directly (an argument path, and a deep link the plugin resolves), so
+/// without this a double-clicked message would fail to open on Linux alone.
+/// Anything that is not a `file://` URL is returned unchanged.
+fn decode_file_url(arg: &str) -> String {
+  let Some(rest) = arg.strip_prefix("file://") else {
+    return arg.to_string();
+  };
+  // file:///path — the authority is empty for local files; a non-empty one
+  // (a remote host) names nothing this process can read, so it is left alone.
+  let Some(encoded) = rest.strip_prefix('/') else {
+    return arg.to_string();
+  };
+
+  let bytes = encoded.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 1);
+  out.push(b'/');
+  let mut i = 0;
+  while i < bytes.len() {
+    // A percent escape is three bytes; anything else is taken literally, which
+    // keeps a malformed trailing '%' from being swallowed.
+    if bytes[i] == b'%' && i + 2 < bytes.len() {
+      let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+        .ok()
+        .and_then(|h| u8::from_str_radix(h, 16).ok());
+      if let Some(byte) = hex {
+        out.push(byte);
+        i += 3;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+
+  // A path is not required to be UTF-8, but the rest of the app carries paths as
+  // strings; an undecodable name is left as the original URL rather than lost.
+  String::from_utf8(out).unwrap_or_else(|_| arg.to_string())
+}
+
 /// Splits a process argument list into `(message files, attachment paths)`.
 ///
 /// Windows and Linux hand both kinds of request over as arguments — Explorer
@@ -264,6 +309,9 @@ where
       collecting_attachments = false;
       continue;
     }
+    // A file manager launching us through the desktop entry's `%U` sends paths
+    // as `file://` URLs; everything downstream works on plain paths.
+    let arg = decode_file_url(&arg);
     if collecting_attachments {
       if !arg.trim().is_empty() {
         attachments.push(arg);
@@ -1509,6 +1557,31 @@ mod tests {
     let (files, attachments) = parse_launch_args(args(&["guvercin", "--file-attachment"]));
     assert!(files.is_empty());
     assert!(attachments.is_empty());
+  }
+
+  #[test]
+  fn launch_args_accept_the_file_urls_a_desktop_entry_sends() {
+    // `%U` in the desktop entry means a double-clicked message arrives as a URL.
+    let (files, _) = parse_launch_args(args(&["guvercin", "file:///home/u/a%20note.eml"]));
+    assert_eq!(files, vec!["/home/u/a note.eml".to_string()]);
+
+    // Non-ASCII names survive: they are percent-encoded UTF-8 bytes.
+    let (files, _) = parse_launch_args(args(&["guvercin", "file:///tmp/%C3%BCst.eml"]));
+    assert_eq!(files, vec!["/tmp/üst.eml".to_string()]);
+
+    // Attachments come through the same path.
+    let (_, attachments) = parse_launch_args(args(&[
+      "guvercin",
+      "--file-attachment",
+      "file:///tmp/report%202.pdf",
+    ]));
+    assert_eq!(attachments, vec!["/tmp/report 2.pdf".to_string()]);
+
+    // A plain path is untouched, and a remote URL names nothing we can read.
+    assert_eq!(decode_file_url("/tmp/plain.eml"), "/tmp/plain.eml");
+    assert_eq!(decode_file_url("file://host/share.eml"), "file://host/share.eml");
+    // A malformed escape is kept rather than swallowed.
+    assert_eq!(decode_file_url("file:///tmp/100%.eml"), "/tmp/100%.eml");
   }
 
   #[test]

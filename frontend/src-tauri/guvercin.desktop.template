@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name={{name}}
+GenericName=Mail Client
+Comment={{comment}}
+Keywords=Email;E-mail;Mail;Calendar;Contacts;Tasks;IMAP;SMTP;
+Exec={{exec}} %U
+Icon={{icon}}
+Terminal=false
+StartupNotify=true
+StartupWMClass={{exec}}
+Categories=Office;Network;Email;
+MimeType={{mime_type}}
+X-GNOME-UsesNotifications=true
