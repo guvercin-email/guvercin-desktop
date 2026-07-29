@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { hydrateAccountSession } from '../utils/accountStorage.js'
+import { openExternalUrl, copyTextToClipboard } from '../utils/externalLinks.js'
 import LanguageSelector from '../components/LanguageSelector.jsx'
 import './LoginPage.css'
 
@@ -405,6 +406,12 @@ function LoginPage() {
     const [activeAutoIndex, setActiveAutoIndex] = useState(0)
     const [passwordVisible, setPasswordVisible] = useState(false)
     const [googleBusy, setGoogleBusy] = useState(false)
+    // The Google consent URL is shown to the user rather than opened for them,
+    // so they can see where they are being sent before they go.
+    const [googleAuthUrl, setGoogleAuthUrl] = useState(null)
+    const [googleLinkCopied, setGoogleLinkCopied] = useState(false)
+    // Flipped by "Cancel" to stop the status poll that is already in flight.
+    const googleCancelledRef = useRef(false)
 
     const [formData, setFormData] = useState(() => {
         const fromState = location?.state?.formData
@@ -481,6 +488,7 @@ function LoginPage() {
     const handleGoogleSignIn = async () => {
         if (googleBusy) return
         setResponseMessage(null)
+        googleCancelledRef.current = false
         setGoogleBusy(true)
 
         try {
@@ -503,21 +511,26 @@ function LoginPage() {
             }
 
             const flowId = beginData.flow_id
-            setResponseMessage({
-                type: 'info',
-                text: t('Complete sign-in in your browser, then return here…'),
-            })
+            // Show the consent link instead of opening it. The backend's
+            // redirect catcher is already listening, so polling can start now —
+            // whether the user opens the link from here or pastes it into a
+            // browser themselves, the same loopback finishes the flow.
+            setGoogleLinkCopied(false)
+            setGoogleAuthUrl(beginData.auth_url || null)
 
             // Poll the backend until the loopback exchange completes. The
             // backend enforces its own timeout; we cap polling to ~5 minutes.
             const deadline = Date.now() + 5 * 60 * 1000
             while (Date.now() <= deadline) {
                 await new Promise((r) => setTimeout(r, 1500))
+                // Cancelled from the dialog while this poll was in flight.
+                if (googleCancelledRef.current) return
 
                 const statusResp = await fetch(
                     apiUrl(`/api/oauth/google/status/${encodeURIComponent(flowId)}`),
                 )
                 const statusData = await statusResp.json().catch(() => ({}))
+                if (googleCancelledRef.current) return
 
                 if (statusData.status === 'pending') continue
                 if (statusData.status === 'ready') {
@@ -539,6 +552,7 @@ function LoginPage() {
                         localStorage.getItem('language') || 'en',
                     )
                     clearDraft()
+                    setGoogleAuthUrl(null)
                     setGoogleBusy(false)
                     navigate('/theme')
                     return
@@ -550,6 +564,8 @@ function LoginPage() {
             }
             throw new Error(t('Google sign-in timed out. Please try again.'))
         } catch (err) {
+            if (googleCancelledRef.current) return
+            setGoogleAuthUrl(null)
             setResponseMessage({
                 type: 'error',
                 text: err?.message || t('Google sign-in failed. Please try again.'),
@@ -558,11 +574,30 @@ function LoginPage() {
         }
     }
 
-    const handleMicrosoftStub = () => {
+    // Opens the consent page in the real browser. The loopback listener stays
+    // up, so the poll already running finishes the flow when the user returns.
+    const handleGoogleOpenLink = async () => {
+        if (!googleAuthUrl) return
+        await openExternalUrl(googleAuthUrl)
+        setGoogleAuthUrl(null)
         setResponseMessage({
-            type: 'error',
-            text: t('Microsoft sign-in is not available yet.'),
+            type: 'info',
+            text: t('Complete sign-in in your browser, then return here…'),
         })
+    }
+
+    const handleGoogleCopyLink = async () => {
+        if (!googleAuthUrl) return
+        await copyTextToClipboard(googleAuthUrl)
+        setGoogleLinkCopied(true)
+    }
+
+    const handleGoogleCancel = () => {
+        googleCancelledRef.current = true
+        setGoogleAuthUrl(null)
+        setGoogleLinkCopied(false)
+        setGoogleBusy(false)
+        setResponseMessage(null)
     }
 
     const handleManualSetup = () => {
@@ -832,10 +867,6 @@ function LoginPage() {
                                     <img src="/icon-google.png" alt="Google Icon" className="button-icon" />
                                     {googleBusy ? t('Signing in…') : t('Continue with Google')}
                                 </button>
-                                <button type="button" className="shortcut-button shortcut-button--alt" onClick={handleMicrosoftStub}>
-                                    <img src="/icon-microsoft.png" alt="Microsoft Icon" className="button-icon" />
-                                    {t('Continue with Microsoft')}
-                                </button>
                             </div>
                         )}
                     </div>
@@ -971,10 +1002,6 @@ function LoginPage() {
                                         <button type="button" className="shortcut-button shortcut-button--alt" onClick={handleGoogleSignIn} disabled={googleBusy}>
                                             <img src="/icon-google.png" alt="Google Icon" className="button-icon" />
                                             {googleBusy ? t('Signing in…') : t('Continue with Google')}
-                                        </button>
-                                        <button type="button" className="shortcut-button shortcut-button--alt" onClick={handleMicrosoftStub}>
-                                            <img src="/icon-microsoft.png" alt="Microsoft Icon" className="button-icon" />
-                                            {t('Continue with Microsoft')}
                                         </button>
                                     </div>
                                 </>
@@ -1123,6 +1150,51 @@ function LoginPage() {
                                 <span>{account.email_address}</span>
                             </div>
                         ))}
+                    </div>
+                </div>
+            )}
+
+            {googleAuthUrl && (
+                <div
+                    className="google-link-overlay"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="google-link-title"
+                >
+                    <div className="google-link-dialog">
+                        <h3 id="google-link-title" className="google-link-dialog__title">
+                            {t('Open this link to continue with Google')}
+                        </h3>
+                        <p className="google-link-dialog__hint">
+                            {t(
+                                'Check the address before you open it, or copy it into a browser you trust.',
+                            )}
+                        </p>
+                        {/* The whole URL is shown — a truncated one cannot be checked. */}
+                        <p className="google-link-dialog__url">{googleAuthUrl}</p>
+                        <div className="google-link-dialog__actions">
+                            <button
+                                type="button"
+                                className="google-link-dialog__button google-link-dialog__button--open"
+                                onClick={handleGoogleOpenLink}
+                            >
+                                {t('Open link')}
+                            </button>
+                            <button
+                                type="button"
+                                className="google-link-dialog__button"
+                                onClick={handleGoogleCopyLink}
+                            >
+                                {googleLinkCopied ? t('Copied') : t('Copy')}
+                            </button>
+                            <button
+                                type="button"
+                                className="google-link-dialog__button"
+                                onClick={handleGoogleCancel}
+                            >
+                                {t('Cancel')}
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}

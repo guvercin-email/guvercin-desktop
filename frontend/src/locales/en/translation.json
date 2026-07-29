@@ -490,5 +490,9 @@
   "{{n}} imported": "{{n}} imported",
   "{{n}} min before": "{{n}} min before",
   "{{n}} skipped": "{{n}} skipped",
-  "{{n}} updated": "{{n}} updated"
+  "{{n}} updated": "{{n}} updated",
+  "Open this link to continue with Google": "Open this link to continue with Google",
+  "Check the address before you open it, or copy it into a browser you trust.": "Check the address before you open it, or copy it into a browser you trust.",
+  "Open link": "Open link",
+  "Copied": "Copied"
 }

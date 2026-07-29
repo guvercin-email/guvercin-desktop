@@ -256,10 +256,11 @@ pub async fn begin_flow() -> Result<BeginResult, String> {
         );
     }
 
-    // Open the browser. If this fails the frontend still shows the URL.
-    if let Err(e) = open::that_detached(&auth_url) {
-        warn!("Could not open system browser for Google sign-in: {e}");
-    }
+    // The browser is deliberately *not* opened here. The consent URL is handed
+    // back to the frontend, which shows it to the user and lets them open it,
+    // copy it, or cancel — sending someone to an external site is their call to
+    // make, and the URL is worth seeing before it is followed. The redirect
+    // catcher below is already listening either way.
 
     // Spawn the redirect catcher.
     let flow_id_task = flow_id.clone();

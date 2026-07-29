@@ -490,5 +490,9 @@
   "{{n}} imported": "{{n}} içe aktarıldı",
   "{{n}} min before": "{{n}} dakika önce",
   "{{n}} skipped": "{{n}} atlandı",
-  "{{n}} updated": "{{n}} güncellendi"
+  "{{n}} updated": "{{n}} güncellendi",
+  "Open this link to continue with Google": "Google ile devam etmek için bu bağlantıyı açın",
+  "Check the address before you open it, or copy it into a browser you trust.": "Açmadan önce adresi kontrol edin veya güvendiğiniz bir tarayıcıya kopyalayın.",
+  "Open link": "Bağlantıyı aç",
+  "Copied": "Kopyalandı"
 }
