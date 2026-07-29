@@ -88,6 +88,13 @@ grab an installer from the
 a `.dmg` on macos, an `.exe` on windows, a `.deb`, `.rpm` or `.appimage` on linux.
 there is no separate backend to install or run — it is compiled into the binary.
 
+the builds are **unsigned** — a code-signing certificate is a yearly cost this
+project does not carry yet — so the first launch is refused. on macos the app is
+reported as "damaged": right-click it in Applications, choose **open**, then
+**open** again, and macos remembers. on windows, smartscreen offers **more info**
+→ **run anyway**. linux does not complain. if you would rather not take that
+trade, [build from source](#build-from-source) instead.
+
 the same desktop integrations are set up on all three: guvercin can become your
 default `mailto:` and `.eml` handler, installs *send with guvercin* into the file
 manager on first launch (a finder quick action, an explorer context-menu entry,
