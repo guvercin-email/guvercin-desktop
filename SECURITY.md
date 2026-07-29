@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Do not open a public issue. Use GitHub's
-[private vulnerability reporting](https://github.com/herdem-herdem/guvercin-desktop/security/advisories/new)
+[private vulnerability reporting](https://github.com/guvercin-email/guvercin-desktop/security/advisories/new)
 for anything that affects the confidentiality or integrity of a user's mail,
 credentials or local databases.
 

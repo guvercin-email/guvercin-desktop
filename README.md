@@ -12,7 +12,7 @@
 a source-available desktop mail client for macOS, windows and linux — with a
 calendar, contacts and tasks built in. your mail lives on your machine, not on ours.
 
-**[download](https://github.com/herdem-herdem/guvercin-desktop/releases/latest)**
+**[download](https://github.com/guvercin-email/guvercin-desktop/releases/latest)**
 · [guvercin.email](https://guvercin.email)
 · [try it in your browser](https://try.guvercin.email)
 · [build from source](#build-from-source)
@@ -84,7 +84,7 @@ rebindable. 64 interface languages ship with the app.
 ## install
 
 grab an installer from the
-[latest release](https://github.com/herdem-herdem/guvercin-desktop/releases/latest):
+[latest release](https://github.com/guvercin-email/guvercin-desktop/releases/latest):
 a `.dmg` on macos, an `.exe` on windows, a `.deb`, `.rpm` or `.appimage` on linux.
 there is no separate backend to install or run — it is compiled into the binary.
 
@@ -116,7 +116,7 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev
 **then**
 
 ```bash
-git clone https://github.com/herdem-herdem/guvercin-desktop.git
+git clone https://github.com/guvercin-email/guvercin-desktop.git
 cd guvercin-desktop
 npm install && npm --prefix frontend install
 npm run app:build

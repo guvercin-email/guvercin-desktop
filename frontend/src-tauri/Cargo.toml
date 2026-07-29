@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "guvercin — a local-first desktop mail, calendar, contacts and tasks client"
 authors = ["Hidayet Erdem"]
 license = "Apache-2.0 WITH Commons-Clause"
-repository = "https://github.com/herdem-herdem/guvercin-desktop"
+repository = "https://github.com/guvercin-email/guvercin-desktop"
 edition = "2021"
 rust-version = "1.77.2"
 
