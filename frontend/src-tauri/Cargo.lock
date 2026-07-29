@@ -4196,7 +4196,6 @@ dependencies = [
  "md5",
  "native-tls",
  "once_cell",
- "open",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "scraper",
