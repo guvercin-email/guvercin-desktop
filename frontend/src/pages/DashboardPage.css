@@ -3950,3 +3950,7 @@ body.resizing * {
   left: auto;
   right: 0;
 }
+.dashboard-page :is(button, a, input, select, textarea, [role="button"], [tabindex]):focus-visible {
+    outline: 2px solid var(--c-primary, #4f46e5);
+    outline-offset: 2px;
+}

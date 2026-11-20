@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useComposeEditorContext } from '../context/ComposeEditorContext.jsx'
+import ComposeIcon from './ComposeIcon.jsx'
 import './ComposeFormatTools.css'
 
 const FONT_FAMILIES = [
@@ -16,21 +17,6 @@ const FONT_FAMILIES = [
 
 const FONT_SIZES = ['10px','11px','12px','13px','14px','16px','18px','20px','24px','28px','32px','36px']
 const LINE_SPACINGS = ['1.0', '1.15', '1.4', '1.6', '2.0', '2.5', '3.0']
-
-/* ── Inline monochrome icons (no emoji) ── */
-const ico = { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }
-const HighlightIcon = () => (
-    <svg {...ico}><path d="M4 11l5-5 3 3-5 5H4v-3z" /><path d="M9 6l1.5-1.5a1.5 1.5 0 0 1 2 2L11 8" /><path d="M3 14h10" strokeWidth="2" /></svg>
-)
-const LinkIcon = () => (
-    <svg {...ico}><path d="M6.5 9.5l3-3" /><path d="M7 4.5l1-1a2.5 2.5 0 0 1 3.5 3.5l-1 1" /><path d="M9 11.5l-1 1A2.5 2.5 0 0 1 4.5 9l1-1" /></svg>
-)
-const EraserIcon = () => (
-    <svg {...ico}><path d="M4 12l6-6a1.5 1.5 0 0 1 2 0l1 1a1.5 1.5 0 0 1 0 2l-5 5H6l-2-2z" /><path d="M3 14h8" /></svg>
-)
-const ImageIcon = () => (
-    <svg {...ico}><rect x="2.5" y="3.5" width="11" height="9" rx="1.5" /><circle cx="6" cy="7" r="1" /><path d="M3.5 12l3-3 2 2 2-2 2 2.5" /></svg>
-)
 
 /**
  * The mail formatting toolbar, rendered outside the editor (in the app ribbon
@@ -114,69 +100,69 @@ export default function ComposeFormatTools() {
     // ── Tool groups (each stays intact; overflow moves whole groups) ──
     const groups = [
         <div className="ce-toolbar-group" key="history">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.undo())} title={t('Undo')}>↶</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.redo())} title={t('Redo')}>↷</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.undo())} title={t('Undo')} aria-label={t('Undo')}><ComposeIcon name="undo" /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.redo())} title={t('Redo')} aria-label={t('Redo')}><ComposeIcon name="redo" /></button>
         </div>,
         <div className="ce-toolbar-group" key="font">
-            <select value={fontFamily} disabled={disabled} onChange={(e) => run(() => controller.setFontFamily(e.target.value))} title={t('Font Family')}>
+            <select value={fontFamily} disabled={disabled} onChange={(e) => run(() => controller.setFontFamily(e.target.value))} title={t('Font Family')} aria-label={t('Font Family')}>
                 {FONT_FAMILIES.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
             </select>
         </div>,
         <div className="ce-toolbar-group" key="size">
-            <select value={fontSize} disabled={disabled} onChange={(e) => run(() => controller.setFontSize(e.target.value))} title={t('Font Size')}>
+            <select value={fontSize} disabled={disabled} onChange={(e) => run(() => controller.setFontSize(e.target.value))} title={t('Font Size')} aria-label={t('Font Size')}>
                 {FONT_SIZES.map((s) => <option key={s} value={s}>{parseInt(s, 10)}</option>)}
             </select>
         </div>,
         <div className="ce-toolbar-group" key="marks">
-            <button type="button" disabled={disabled} className={active.strong ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleBold())} title={t('Bold')}><b>B</b></button>
-            <button type="button" disabled={disabled} className={active.em ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleItalic())} title={t('Italic')}><i>I</i></button>
-            <button type="button" disabled={disabled} className={active.underline ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleUnderline())} title={t('Underline')}><u>U</u></button>
-            <button type="button" disabled={disabled} className={active.strikethrough ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleStrike())} title={t('Strikethrough')}><s>S</s></button>
+            <button type="button" disabled={disabled} className={active.strong ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleBold())} title={t('Bold')} aria-label={t('Bold')}><ComposeIcon name="bold" /></button>
+            <button type="button" disabled={disabled} className={active.em ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleItalic())} title={t('Italic')} aria-label={t('Italic')}><ComposeIcon name="italic" /></button>
+            <button type="button" disabled={disabled} className={active.underline ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleUnderline())} title={t('Underline')} aria-label={t('Underline')}><ComposeIcon name="underline" /></button>
+            <button type="button" disabled={disabled} className={active.strikethrough ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleStrike())} title={t('Strikethrough')} aria-label={t('Strikethrough')}><ComposeIcon name="strike" /></button>
         </div>,
         <div className="ce-toolbar-group" key="color">
-            <div className="ce-color-wrap">
-                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title={t('Text Color')} style={{ color: textColor }}>A</button>
-                <input type="color" value={textColor} disabled={disabled} onChange={(e) => run(() => controller.setTextColor(e.target.value))} title={t('Text Color')} />
-            </div>
-            <div className="ce-color-wrap">
-                <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} title={t('Highlight Color')} style={{ color: highlight }}><HighlightIcon /></button>
-                <input type="color" value={highlight} disabled={disabled} onChange={(e) => run(() => controller.setHighlight(e.target.value))} title={t('Highlight Color')} />
-            </div>
+            <label className="ce-color-wrap" title={t('Text Color')} aria-label={t('Text Color')}>
+                <ComposeIcon name="textColor" swatch={textColor} />
+                <input type="color" value={textColor} disabled={disabled} onChange={(e) => run(() => controller.setTextColor(e.target.value))} aria-label={t('Text Color')} />
+            </label>
+            <label className="ce-color-wrap" title={t('Highlight Color')} aria-label={t('Highlight Color')}>
+                <ComposeIcon name="highlight" swatch={highlight} />
+                <input type="color" value={highlight} disabled={disabled} onChange={(e) => run(() => controller.setHighlight(e.target.value))} aria-label={t('Highlight Color')} />
+            </label>
         </div>,
         <div className="ce-toolbar-group" key="align">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('left'))} title={t('Align Left')}>⯇</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('center'))} title={t('Center')}>≡</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('right'))} title={t('Align Right')}>⯈</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('left'))} title={t('Align Left')} aria-label={t('Align Left')}><ComposeIcon name="alignLeft" /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('center'))} title={t('Center')} aria-label={t('Center')}><ComposeIcon name="alignCenter" /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.align('right'))} title={t('Align Right')} aria-label={t('Align Right')}><ComposeIcon name="alignRight" /></button>
         </div>,
         <div className="ce-toolbar-group" key="lists">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.orderedList())} title={t('Numbered List')}>1.</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.bulletList())} title={t('Bullet List')}>•</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.orderedList())} title={t('Numbered List')} aria-label={t('Numbered List')}><ComposeIcon name="numberedList" /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.bulletList())} title={t('Bullet List')} aria-label={t('Bullet List')}><ComposeIcon name="bulletList" /></button>
         </div>,
         <div className="ce-toolbar-group" key="indent">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.outdent())} title={t('Decrease Indent')}>⇤</button>
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.indent())} title={t('Increase Indent')}>⇥</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.outdent())} title={t('Decrease Indent')} aria-label={t('Decrease Indent')}><ComposeIcon name="outdent" /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.indent())} title={t('Increase Indent')} aria-label={t('Increase Indent')}><ComposeIcon name="indent" /></button>
         </div>,
         <div className="ce-toolbar-group" key="quote">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.blockquote())} title={t('Quote')}>❝</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.blockquote())} title={t('Quote')} aria-label={t('Quote')}><ComposeIcon name="quote" /></button>
         </div>,
         <div className="ce-toolbar-group" key="link">
-            <button type="button" disabled={disabled} className={`cf-popup-trigger ${active.link ? 'active' : ''}`} onMouseDown={(e) => e.preventDefault()} onClick={openLink} title={t('Insert Link')}><LinkIcon /></button>
+            <button type="button" disabled={disabled} className={`cf-popup-trigger ${active.link ? 'active' : ''}`} onMouseDown={(e) => e.preventDefault()} onClick={openLink} title={t('Insert Link')} aria-label={t('Insert Link')}><ComposeIcon name="link" /></button>
         </div>,
         <div className="ce-toolbar-group" key="clear">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.clearFormatting())} title={t('Clear Formatting')}><EraserIcon /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.clearFormatting())} title={t('Clear Formatting')} aria-label={t('Clear Formatting')}><ComposeIcon name="clear" /></button>
         </div>,
         <div className="ce-toolbar-group" key="case">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.changeCase())} title={t('Change Case')}>aA</button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.changeCase())} title={t('Change Case')} aria-label={t('Change Case')}><ComposeIcon name="changeCase" /></button>
         </div>,
         <div className="ce-toolbar-group" key="spacing">
-            <button type="button" disabled={disabled} className="cf-popup-trigger" onMouseDown={(e) => e.preventDefault()} onClick={openSpacing} title={t('Line Spacing')}>↕</button>
+            <button type="button" disabled={disabled} className="cf-popup-trigger" onMouseDown={(e) => e.preventDefault()} onClick={openSpacing} title={t('Line Spacing')} aria-label={t('Line Spacing')}><ComposeIcon name="lineSpacing" /></button>
         </div>,
         <div className="ce-toolbar-group" key="script">
-            <button type="button" disabled={disabled} className={active.subscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSubscript())} title={t('Subscript')}>x₂</button>
-            <button type="button" disabled={disabled} className={active.superscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSuperscript())} title={t('Superscript')}>x²</button>
+            <button type="button" disabled={disabled} className={active.subscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSubscript())} title={t('Subscript')} aria-label={t('Subscript')}><ComposeIcon name="subscript" /></button>
+            <button type="button" disabled={disabled} className={active.superscript ? 'active' : ''} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.toggleSuperscript())} title={t('Superscript')} aria-label={t('Superscript')}><ComposeIcon name="superscript" /></button>
         </div>,
         <div className="ce-toolbar-group" key="image">
-            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.insertImage())} title={t('Insert Image')}><ImageIcon /></button>
+            <button type="button" disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={() => run(() => controller.insertImage())} title={t('Insert Image')} aria-label={t('Insert Image')}><ComposeIcon name="image" /></button>
         </div>,
     ]
 
@@ -235,9 +221,10 @@ export default function ComposeFormatTools() {
                         className="db-submenu-more-btn cf-popup-trigger"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setMoreOpen((v) => !v)}
-                        title={t('More')}
+                        title={t('More')} aria-label={t('More')}
+                        aria-expanded={moreOpen}
                     >
-                        <img src="/img/icons/three-point.svg" className="svg-icon-inline" />
+                        <ComposeIcon name="more" />
                     </button>
                     {moreOpen && (
                         <div className="db-overflow-menu cf-overflow-menu">

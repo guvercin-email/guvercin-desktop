@@ -12,6 +12,7 @@ import { inputRules, wrappingInputRule, smartQuotes, emDash, ellipsis } from 'pr
 import { gapCursor } from 'prosemirror-gapcursor'
 import { wrapInList, splitListItem, liftListItem, sinkListItem } from 'prosemirror-schema-list'
 import { useComposeEditorContext } from '../context/ComposeEditorContext.jsx'
+import ComposeIcon from './ComposeIcon.jsx'
 import './ComposeEditor.css'
 
 /* ─── Emoji palette ─── */
@@ -680,8 +681,8 @@ export default function ComposeEditor({
                 <div className="ce-toolbar">
                 {/* Undo / Redo */}
                 <div className="ce-toolbar-group">
-                    <button type="button" onClick={() => exec(undo)} title={t('Undo')}>↩</button>
-                    <button type="button" onClick={() => exec(redo)} title={t('Redo')}>↪</button>
+                    <button type="button" onClick={() => exec(undo)} title={t('Undo')}><ComposeIcon name="undo" /></button>
+                    <button type="button" onClick={() => exec(redo)} title={t('Redo')}><ComposeIcon name="redo" /></button>
                 </div>
 
                 {/* Font family */}
@@ -723,44 +724,44 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.strong)}
                         title={t('Bold')}
-                    ><b>B</b></button>
+                    ><ComposeIcon name="bold" /></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.em) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.em)}
                         title={t('Italic')}
-                    ><i>I</i></button>
+                    ><ComposeIcon name="italic" /></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.underline) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.underline)}
                         title={t('Underline')}
-                    ><u>U</u></button>
+                    ><ComposeIcon name="underline" /></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.strikethrough) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.strikethrough)}
                         title={t('Strikethrough')}
-                    ><s>S</s></button>
+                    ><ComposeIcon name="strike" /></button>
                 </div>
 
                 {/* Text color & Highlight */}
                 <div className="ce-toolbar-group">
-                    <div className="ce-color-wrap">
-                        <button type="button" onMouseDown={(e) => e.preventDefault()} title={t('Text Color')} style={{ color: currentTextColor }}>A</button>
-                        <input type="color" value={currentTextColor} onChange={handleTextColor} title={t('Text Color')} />
-                    </div>
-                    <div className="ce-color-wrap">
-                        <button type="button" onMouseDown={(e) => e.preventDefault()} title={t('Highlight Color')} style={{ backgroundColor: currentHighlight, color: '#333' }}>🖍</button>
-                        <input type="color" value={currentHighlight} onChange={handleHighlight} title={t('Highlight Color')} />
-                    </div>
+                    <label className="ce-color-wrap" title={t('Text Color')}>
+                        <ComposeIcon name="textColor" swatch={currentTextColor} />
+                        <input type="color" value={currentTextColor} onChange={handleTextColor} aria-label={t('Text Color')} />
+                    </label>
+                    <label className="ce-color-wrap" title={t('Highlight Color')}>
+                        <ComposeIcon name="highlight" swatch={currentHighlight} />
+                        <input type="color" value={currentHighlight} onChange={handleHighlight} aria-label={t('Highlight Color')} />
+                    </label>
                 </div>
 
                 {/* Alignment */}
                 <div className="ce-toolbar-group">
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('left')} title={t('Align Left')}>⫷</button>
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('center')} title={t('Center')}>☰</button>
-                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('right')} title={t('Align Right')}>⫸</button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('left')} title={t('Align Left')}><ComposeIcon name="alignLeft" /></button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('center')} title={t('Center')}><ComposeIcon name="alignCenter" /></button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('right')} title={t('Align Right')}><ComposeIcon name="alignRight" /></button>
                 </div>
 
                 {/* Lists */}
@@ -769,12 +770,12 @@ export default function ComposeEditor({
                         onClick={() => exec(wrapInList(schema.nodes.ordered_list))}
                         onMouseDown={(e) => e.preventDefault()}
                         title={t('Numbered List')}
-                    >1.</button>
+                    ><ComposeIcon name="numberedList" /></button>
                     <button type="button"
                         onClick={() => exec(wrapInList(schema.nodes.bullet_list))}
                         onMouseDown={(e) => e.preventDefault()}
                         title={t('Bullet List')}
-                    >•</button>
+                    ><ComposeIcon name="bulletList" /></button>
                 </div>
 
                 {/* Indent */}
@@ -783,12 +784,12 @@ export default function ComposeEditor({
                         onClick={() => exec(liftListItem(schema.nodes.list_item))}
                         onMouseDown={(e) => e.preventDefault()}
                         title={t('Decrease Indent')}
-                    >⇤</button>
+                    ><ComposeIcon name="outdent" /></button>
                     <button type="button"
                         onClick={() => exec(sinkListItem(schema.nodes.list_item))}
                         onMouseDown={(e) => e.preventDefault()}
                         title={t('Increase Indent')}
-                    >⇥</button>
+                    ><ComposeIcon name="indent" /></button>
                 </div>
 
                 {/* Blockquote */}
@@ -797,7 +798,7 @@ export default function ComposeEditor({
                         onClick={() => exec(wrapIn(schema.nodes.blockquote))}
                         onMouseDown={(e) => e.preventDefault()}
                         title={t('Quote')}
-                    >❝</button>
+                    ><ComposeIcon name="quote" /></button>
                 </div>
 
                 {/* Link */}
@@ -813,7 +814,7 @@ export default function ComposeEditor({
                             }
                         }}
                         title={t('Insert Link')}
-                    >🔗</button>
+                    ><ComposeIcon name="link" /></button>
                     {showLink && (
                         <div className="ce-link-dialog">
                             <input
@@ -845,7 +846,7 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setShowEmoji(!showEmoji)}
                         title={t('Emoji')}
-                    >😊</button>
+                    ><ComposeIcon name="emoji" /></button>
                     {showEmoji && (
                         <div className="ce-emoji-popup">
                             {EMOJIS.map((emoji) => (
@@ -863,7 +864,7 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => exec(clearFormatting)}
                         title={t('Clear Formatting')}
-                    >🧹</button>
+                    ><ComposeIcon name="clear" /></button>
                 </div>
 
                 {/* Case change */}
@@ -872,7 +873,7 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => exec(changeCaseCommand)}
                         title={t('Change Case')}
-                    >aA</button>
+                    ><ComposeIcon name="changeCase" /></button>
                 </div>
 
                 {/* Line spacing */}
@@ -881,7 +882,7 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => setShowLineSpacing(!showLineSpacing)}
                         title={t('Line Spacing')}
-                    >⇕</button>
+                    ><ComposeIcon name="lineSpacing" /></button>
                     {showLineSpacing && (
                         <div className="ce-linespacing-popup">
                             {['1.0', '1.15', '1.4', '1.6', '2.0', '2.5', '3.0'].map((s) => (
@@ -903,13 +904,13 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.subscript)}
                         title={t('Subscript')}
-                    >x₂</button>
+                    ><ComposeIcon name="subscript" /></button>
                     <button type="button"
                         className={isMarkActive(schema.marks.superscript) ? 'active' : ''}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => toggleMarkCmd(schema.marks.superscript)}
                         title={t('Superscript')}
-                    >x²</button>
+                    ><ComposeIcon name="superscript" /></button>
                 </div>
 
                 {/* Insert image */}
@@ -918,7 +919,7 @@ export default function ComposeEditor({
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={handleInsertImage}
                         title={t('Insert Image')}
-                    >🖼️</button>
+                    ><ComposeIcon name="image" /></button>
                 </div>
                 </div>
             )}

@@ -35,7 +35,8 @@
     border-inline-start: 1px solid var(--c-border-1, #d8d8d8);
 }
 
-.ce-toolbar button {
+:is(.ce-toolbar, .cf-overflow-row) button,
+.ce-color-wrap {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -52,23 +53,25 @@
     transition: background 0.12s, border-color 0.12s;
 }
 
-.ce-toolbar button:hover {
+:is(.ce-toolbar, .cf-overflow-row) button:hover,
+.ce-color-wrap:hover {
     background: var(--c-surface-3, #e8e8e8);
     border-color: var(--c-border-1, #d0d0d0);
 }
 
-.ce-toolbar button.active {
+:is(.ce-toolbar, .cf-overflow-row) button.active {
     background: var(--c-primary-bg, #dbeafe);
     border-color: var(--c-primary, #3b82f6);
     color: var(--c-primary, #3b82f6);
 }
 
-.ce-toolbar button:disabled {
+:is(.ce-toolbar, .cf-overflow-row) button:disabled,
+.ce-color-wrap:has(input:disabled) {
     opacity: 0.4;
     cursor: default;
 }
 
-.ce-toolbar select {
+:is(.ce-toolbar, .cf-overflow-row) select {
     height: 28px;
     padding: 2px 4px;
     border: 1px solid var(--c-border-1, #d0d0d0);
@@ -80,36 +83,36 @@
     outline: none;
 }
 
-.ce-toolbar select:focus {
+:is(.ce-toolbar, .cf-overflow-row) select:focus {
     border-color: var(--c-primary, #3b82f6);
 }
 
-/* Color input wrapper */
+.ce-toolbar-group > button > svg,
+.ce-color-wrap > svg {
+    flex: none;
+    pointer-events: none;
+}
+
 .ce-color-wrap {
     position: relative;
-    display: inline-flex;
-    align-items: center;
+    box-sizing: border-box;
+}
+
+.ce-color-wrap:focus-within {
+    outline: 2px solid var(--c-primary, #3b82f6);
+    outline-offset: 1px;
 }
 
 .ce-color-wrap input[type="color"] {
     position: absolute;
-    bottom: -4px;
-    inset-inline-start: 0;
+    inset: 0;
     width: 100%;
-    height: 5px;
+    height: 100%;
+    margin: 0;
     padding: 0;
-    border: none;
-    cursor: pointer;
-    opacity: 0.8;
-}
-
-.ce-color-wrap input[type="color"]::-webkit-color-swatch-wrapper {
-    padding: 0;
-}
-
-.ce-color-wrap input[type="color"]::-webkit-color-swatch {
-    border: none;
-    border-radius: 0 0 3px 3px;
+    border: 0;
+    opacity: 0;
+    cursor: inherit;
 }
 
 /* ── Emoji picker popup ── */

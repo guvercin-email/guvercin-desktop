@@ -1281,6 +1281,17 @@ const DashboardPage = () => {
         refreshStatus,
         flushQueue,
     } = useOfflineSync()
+    const syncSummary = !networkOnline
+        ? t('Offline. Check your internet connection.')
+        : /auth|credential|token|password/i.test(lastError || '')
+            ? t('Sign in to your account again.')
+            : !backendReachable || !imapReachable
+                ? t('Mail server connection unavailable. Check account settings or reconnect.')
+                : syncState === 'syncing'
+                    ? t('{{count}} messages are syncing.', { count: queueDepth || 1 })
+                    : queueDepth > 0
+                        ? t('{{count}} messages are waiting to sync.', { count: queueDepth })
+                        : t('Messages are up to date.')
 
     const [activeSection, setActiveSection] = useState('mail')
     // Shared search box for the non-mail workspaces (Contacts / Calendar / Todo).
@@ -2924,7 +2935,7 @@ const DashboardPage = () => {
                             )}
                         </div>
                         <div className={`db-sync-indicator ${syncState === 'syncing' ? 'is-syncing' : ''}`}>
-                            <button type="button" className="db-icon-btn db-sync-indicator__btn" aria-label="Sync and network status">
+                            <button type="button" className="db-icon-btn db-sync-indicator__btn" aria-label={t('Sync and network status: {{status}}', { status: syncSummary })}>
                                 {networkOnline && canUseRemoteMail ? <img src="/img/icons/online.svg" className="svg-icon-inline" /> : (networkOnline ? <img src="/img/icons/online-but-problem.svg" className="svg-icon-inline" /> : <img src="/img/icons/offline.svg" className="svg-icon-inline" />)}
                                 <span
                                     className={`db-sync-indicator__dot ${canUseRemoteMail ? 'live' : 'offline'} ${syncState === 'syncing' ? 'syncing' : ''}`}
@@ -2932,14 +2943,15 @@ const DashboardPage = () => {
                                 />
                             </button>
                             <div className="db-sync-popover" role="tooltip">
-                                <div className="db-sync-popover__title">Network</div>
-                                <div className="db-sync-popover__row">Internet: {networkOnline ? 'online' : 'offline'}</div>
-                                <div className="db-sync-popover__row">Mode: {canUseRemoteMail ? 'Live' : 'Offline Cache'}</div>
-                                <div className="db-sync-popover__row">Sync: {syncState}</div>
-                                <div className="db-sync-popover__row">Queue: {queueDepth}</div>
-                                <div className="db-sync-popover__row">Backend: {backendReachable ? 'reachable' : 'down'}</div>
-                                <div className="db-sync-popover__row">IMAP: {imapReachable ? 'reachable' : 'down'}</div>
-                                <div className="db-sync-popover__row">SMTP: {smtpReachable ? 'configured' : 'not set'}</div>
+                                <div className="db-sync-popover__title">{syncSummary}</div>
+                                <div className="db-sync-popover__row" role="status" aria-live="polite">{t('Network details')}</div>
+                                <div className="db-sync-popover__row">{t('Internet')}: {networkOnline ? t('Online') : t('Offline')}</div>
+                                <div className="db-sync-popover__row">{t('Mode')}: {canUseRemoteMail ? t('Live') : t('Offline cache')}</div>
+                                <div className="db-sync-popover__row">{t('Sync')}: {t(syncState)}</div>
+                                <div className="db-sync-popover__row">{t('Queue')}: {queueDepth}</div>
+                                <div className="db-sync-popover__row">{t('Backend')}: {backendReachable ? t('Reachable') : t('Unavailable')}</div>
+                                <div className="db-sync-popover__row">IMAP: {imapReachable ? t('Reachable') : t('Unavailable')}</div>
+                                <div className="db-sync-popover__row">SMTP: {smtpReachable ? t('Configured') : t('Not configured')}</div>
                                 <button
                                     type="button"
                                     className="db-sync-popover__action"
@@ -4105,7 +4117,16 @@ function MailSection({
 
     const openComposeInTab = useCallback((sessionOrDraft, fallbackSource = 'new') => {
         const source = sessionOrDraft?.source || fallbackSource
-        const normalizedDraft = createEmptyComposeDraft(sessionOrDraft?.draft || sessionOrDraft)
+        let recoveredDraft = sessionOrDraft?.draft || sessionOrDraft
+        try {
+            const key = `compose_recovery_${accountId || 'default'}_tab`
+            const recovered = JSON.parse(localStorage.getItem(key) || 'null')
+            if (!isComposeDraftDirty(recoveredDraft) && recovered?.draft && Date.now() - Number(recovered.savedAt || 0) < 7 * 86400000) {
+                if (window.confirm(t('A recovered draft is available. Restore it?'))) recoveredDraft = recovered.draft
+                else localStorage.removeItem(key)
+            }
+        } catch { /* recovery is best effort */ }
+        const normalizedDraft = createEmptyComposeDraft(recoveredDraft)
         const draft = { ...normalizedDraft, composeSurface: 'tab' }
         const sourceId = sessionOrDraft?.id || null
         nextTabId.current += 1
@@ -4119,7 +4140,7 @@ function MailSection({
         if (sourceId && inlineComposeSession?.id === sourceId) {
             setInlineComposeSession(null)
         }
-    }, [createEmptyComposeDraft, inlineComposeSession, nextTabId, setActiveTabId, setInlineComposeSession, setMailContent, setSelectedMail, setTabs])
+    }, [accountId, createEmptyComposeDraft, inlineComposeSession, nextTabId, setActiveTabId, setInlineComposeSession, setMailContent, setSelectedMail, setTabs, t])
 
     const openComposeWindow = useCallback(async (sessionOrDraft, fallbackSource = 'new') => {
         if (!accountId) return false
@@ -4174,7 +4195,17 @@ function MailSection({
             openComposeInTab(inlineComposeSession, inlineComposeSession.source)
         }
 
-        const normalizedDraft = createEmptyComposeDraft(draft)
+        let composeDraft = draft
+        try {
+            const recoveryKey = `compose_recovery_${accountId || 'default'}_inline`
+            const recovery = JSON.parse(localStorage.getItem(recoveryKey) || 'null')
+            const isBlank = !isComposeDraftDirty(draft)
+            if (isBlank && recovery?.draft && Date.now() - Number(recovery.savedAt || 0) < 7 * 86400000) {
+                if (window.confirm(t('A recovered draft is available. Restore it?'))) composeDraft = recovery.draft
+                else localStorage.removeItem(recoveryKey)
+            }
+        } catch { /* recovery is best effort */ }
+        const normalizedDraft = createEmptyComposeDraft(composeDraft)
         setInlineComposeSession({
             id: createComposeSessionId(),
             kind: 'compose',
@@ -4188,7 +4219,7 @@ function MailSection({
         if (isMailFullscreen) {
             toggleMailFullscreen()
         }
-    }, [createEmptyComposeDraft, inlineComposeSession, isMailFullscreen, openComposeInTab, setActiveTabId, setInlineComposeSession, setMailContent, setSelectedMail, toggleMailFullscreen])
+    }, [accountId, createEmptyComposeDraft, inlineComposeSession, isMailFullscreen, openComposeInTab, setActiveTabId, setInlineComposeSession, setMailContent, setSelectedMail, t, toggleMailFullscreen])
 
     const openImportedMailInCompose = useCallback((content) => {
         if (!content) return
@@ -4336,6 +4367,7 @@ function MailSection({
                         restoreComposeTarget(target, draft)
                         return
                     }
+                    try { localStorage.removeItem(`compose_recovery_${accountId || 'default'}_${target?.type === 'inline' ? 'inline' : 'tab'}`) } catch { /* ignore */ }
                     await onCommitted?.()
                 } catch (error) {
                     window.alert(error?.message || 'Failed to send email.')
@@ -4365,6 +4397,7 @@ function MailSection({
                     restoreComposeTarget(target, draft)
                     return
                 }
+                try { localStorage.removeItem(`compose_recovery_${accountId || 'default'}_${target?.type === 'inline' ? 'inline' : 'tab'}`) } catch { /* ignore */ }
                 await onCommitted?.()
             },
         })
@@ -4434,6 +4467,7 @@ function MailSection({
 
             if (action === 'discard') {
                 closeComposeTarget(prompt.target)
+                try { localStorage.removeItem(`compose_recovery_${accountId || 'default'}_${prompt.target?.type === 'inline' ? 'inline' : 'tab'}`) } catch { /* ignore */ }
                 closeComposeExitPrompt()
                 await continueComposeExitIntent(prompt)
                 return
@@ -4442,6 +4476,7 @@ function MailSection({
             if (action === 'save') {
                 await saveComposeDraft(prompt.draft)
                 closeComposeTarget(prompt.target)
+                try { localStorage.removeItem(`compose_recovery_${accountId || 'default'}_${prompt.target?.type === 'inline' ? 'inline' : 'tab'}`) } catch { /* ignore */ }
                 closeComposeExitPrompt()
                 await continueComposeExitIntent(prompt)
             }
@@ -4451,7 +4486,7 @@ function MailSection({
         } finally {
             setComposeActionBusy(false)
         }
-    }, [closeComposeExitPrompt, closeComposeTarget, composeExitPrompt, continueComposeExitIntent, enqueueDelayedSend, saveComposeDraft])
+    }, [accountId, closeComposeExitPrompt, closeComposeTarget, composeExitPrompt, continueComposeExitIntent, enqueueDelayedSend, saveComposeDraft])
 
     const attemptOpenMail = useCallback(async (mail) => {
         if (!mail) return
@@ -6522,6 +6557,35 @@ function MailSection({
     // without restarting the interval on every keystroke.
     const inlineComposeSessionRef = useRef(null)
     inlineComposeSessionRef.current = inlineComposeSession
+    const activeComposeTabRef = useRef(null)
+    activeComposeTabRef.current = activeComposeTab
+
+    // Frequent local recovery is independent from the optional server autosave.
+    useEffect(() => {
+        const sessionId = inlineComposeSession?.id
+        if (!sessionId || !accountId) return undefined
+        const recoveryKey = `compose_recovery_${accountId}_inline`
+        const timer = window.setInterval(() => {
+            const session = inlineComposeSessionRef.current
+            if (!session || !isComposeDraftDirty(session.draft)) return
+            try { localStorage.setItem(recoveryKey, JSON.stringify({ savedAt: Date.now(), draft: session.draft })) }
+            catch (error) { console.warn('Could not persist compose recovery copy:', error) }
+        }, 1500)
+        return () => window.clearInterval(timer)
+    }, [accountId, inlineComposeSession?.id])
+
+    useEffect(() => {
+        const tabId = activeComposeTab?.id
+        if (!tabId || !accountId) return undefined
+        const key = `compose_recovery_${accountId}_tab`
+        const timer = window.setInterval(() => {
+            const tab = activeComposeTabRef.current
+            if (!tab || !isComposeDraftDirty(tab.draft)) return
+            try { localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), draft: tab.draft })) }
+            catch (error) { console.warn('Could not persist compose recovery copy:', error) }
+        }, 1500)
+        return () => window.clearInterval(timer)
+    }, [accountId, activeComposeTab?.id])
 
     // Periodically auto-save the active inline draft when enabled in settings.
     useEffect(() => {
@@ -6558,7 +6622,7 @@ function MailSection({
 
     const handleInlineComposeSend = async (draft) => {
         if (!inlineComposeSession) return
-        enqueueDelayedSend({
+        return enqueueDelayedSend({
             draft: draft || inlineComposeSession.draft,
             target: { type: 'inline', id: inlineComposeSession.id, source: inlineComposeSession.source },
         })
@@ -7100,6 +7164,7 @@ function MailSection({
                             })}
                             onOpenInWindow={() => openComposeWindow(activeComposeTab, activeComposeTab.source)}
                             accountEmail={accountEmail}
+                            accountId={accountId}
                             showTopDiscard={false}
                         />
                     ) : activeTab ? (
@@ -8118,6 +8183,7 @@ function MailSection({
                                         onOpenInTab={() => openComposeInTab(inlineComposeSession, inlineComposeSession.source)}
                                         onOpenInWindow={() => openComposeWindow(inlineComposeSession, inlineComposeSession.source)}
                                         accountEmail={accountEmail}
+                                        accountId={accountId}
                                         showTopDiscard={true}
                                     />
                                 ) : importPreview ? (

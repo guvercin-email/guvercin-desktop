@@ -33,11 +33,6 @@
     flex: 0 0 auto;
 }
 
-.cf-tools .ce-toolbar button svg {
-    display: block;
-    pointer-events: none;
-}
-
 .cf-tools--disabled {
     opacity: 0.55;
 }
@@ -86,4 +81,12 @@
 .cf-popup {
     position: fixed;
     z-index: 6000;
+}
+
+.cf-tools button:focus-visible,
+.cf-more > button:focus-visible,
+.cf-popup button:focus-visible,
+.cf-popup input:focus-visible {
+    outline: 2px solid var(--c-primary, #4f46e5);
+    outline-offset: 2px;
 }

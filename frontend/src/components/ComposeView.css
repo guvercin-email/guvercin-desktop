@@ -1,3 +1,12 @@
+.db-mail-action-btn.cv-header-action {
+    display: inline-grid;
+    place-items: center;
+}
+
+.db-mail-action-btn.cv-header-action:hover {
+    color: var(--c-text-1);
+}
+
 /* ─── ComposeView.css ─── */
 
 .compose-view {
@@ -54,6 +63,14 @@
 .cv-segment__item.is-active {
     background: var(--c-accent-2, #2596be);
     color: var(--c-text-inverse-soft, #f8fafc);
+}
+
+.cv-toolbar-btn,
+.cv-send-btn,
+.cv-discard-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
 }
 
 .cv-toolbar-btn {
@@ -252,6 +269,41 @@
     flex: 1;
     min-width: 0;
     padding: 2px 0;
+}
+
+.cv-field--recipients { position: relative; }
+.cv-recipient-suggestions {
+    position: absolute;
+    z-index: 30;
+    top: calc(100% - 1px);
+    inset-inline-start: 54px;
+    width: min(420px, calc(100% - 54px));
+    max-height: 240px;
+    overflow: auto;
+    border: 1px solid var(--c-border-1, #d9e2ec);
+    border-radius: 8px;
+    background: var(--c-surface-1, #fff);
+    box-shadow: 0 8px 24px #0002;
+}
+.cv-recipient-suggestion {
+    display: flex;
+    width: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 9px 12px;
+    border: 0;
+    background: transparent;
+    color: var(--c-text-1, #111827);
+    text-align: start;
+    cursor: pointer;
+}
+.cv-recipient-suggestion small { color: var(--c-text-2, #6b7280); }
+.cv-recipient-suggestion:hover, .cv-recipient-suggestion.is-active { background: var(--c-surface-2, #f1f5f9); }
+.cv-recipient-suggestion:focus-visible { outline: 2px solid var(--c-accent, #4f46e5); outline-offset: -2px; }
+.compose-view :is(button, input, select, textarea, iframe, [tabindex]):focus-visible {
+    outline: 2px solid var(--c-accent, #4f46e5);
+    outline-offset: 2px;
 }
 
 .cv-recipient-list {

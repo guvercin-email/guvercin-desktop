@@ -1,8 +1,11 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import Editor from '@monaco-editor/react'
 import ComposeEditor from './ComposeEditor.jsx'
+import ComposeIcon from './ComposeIcon.jsx'
 import { buildComposePreviewDocument, escapeHtml, seedHtmlFromPlainText } from '../utils/composeHtml.js'
 import { composeRecipientsToString, ensureHtmlDraftSeed } from '../utils/compose.js'
+import { fetchContacts, displayNameOf } from '../utils/contactsApi.js'
 import './ComposeView.css'
 
 function createClientId(prefix) {
@@ -47,11 +50,12 @@ function SegmentSwitch({ value, options, onChange }) {
 }
 
 function ComposeAttachmentList({ attachments, onRemove }) {
+    const { t } = useTranslation()
     if (attachments.length === 0) return null
 
     return (
         <div className="cv-attachments">
-            <div className="cv-attachments__header">Attachments</div>
+            <div className="cv-attachments__header">{t('Attachments')}</div>
             <div className="cv-attachments__list">
                 {attachments.map((attachment) => (
                     <div key={attachment.id} className="cv-attachments__item">
@@ -66,7 +70,7 @@ function ComposeAttachmentList({ attachments, onRemove }) {
                             className="cv-attachments__remove"
                             onClick={() => onRemove(attachment.id)}
                         >
-                            Remove
+                            {t('Remove')}
                         </button>
                     </div>
                 ))}
@@ -75,9 +79,10 @@ function ComposeAttachmentList({ attachments, onRemove }) {
     )
 }
 
-function RecipientField({ label, recipients, onChange, placeholder, trailingActions = null }) {
+function RecipientField({ label, recipients, onChange, placeholder, trailingActions = null, suggestions = [] }) {
     const [draftToken, setDraftToken] = useState('')
     const [hoveredIndex, setHoveredIndex] = useState(null)
+    const [activeSuggestion, setActiveSuggestion] = useState(0)
     const inputRef = useRef(null)
 
     const focusInput = useCallback(() => {
@@ -97,9 +102,33 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
 
         commitRecipients([...recipients, ...parts])
         setDraftToken('')
-    }, [commitRecipients, draftToken, recipients])
+    }, [commitRecipients, draftToken, recipients, setDraftToken])
+
+    const matches = useMemo(() => draftToken.trim() ? suggestions.filter((item) => `${item.name} ${item.email}`.toLocaleLowerCase().includes(draftToken.trim().toLocaleLowerCase())).slice(0, 6) : [], [draftToken, suggestions])
+    const chooseSuggestion = useCallback((item) => {
+        if (!item?.email) return
+        commitRecipients([...recipients, item.email])
+        setDraftToken('')
+        setActiveSuggestion(0)
+        inputRef.current?.focus()
+    }, [commitRecipients, recipients, setDraftToken, setActiveSuggestion])
 
     const handleKeyDown = useCallback((event) => {
+        if (matches.length && event.key === 'ArrowDown') {
+            event.preventDefault()
+            setActiveSuggestion((index) => (index + 1) % matches.length)
+            return
+        }
+        if (matches.length && event.key === 'ArrowUp') {
+            event.preventDefault()
+            setActiveSuggestion((index) => (index - 1 + matches.length) % matches.length)
+            return
+        }
+        if (matches.length && event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault()
+            chooseSuggestion(matches[activeSuggestion] || matches[0])
+            return
+        }
         if (event.key === 'Enter' || event.key === 'Tab' || event.key === ',' || event.key === ';') {
             if (draftToken.trim()) {
                 event.preventDefault()
@@ -118,7 +147,7 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
                 setDraftToken(last)
             }
         }
-    }, [commitRecipients, draftToken, finalizeToken, recipients])
+    }, [activeSuggestion, chooseSuggestion, commitRecipients, draftToken, finalizeToken, matches, recipients, setActiveSuggestion])
 
     const handleChange = useCallback((event) => {
         const nextValue = event.target.value
@@ -128,7 +157,7 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
         }
 
         setDraftToken(nextValue)
-    }, [finalizeToken])
+    }, [finalizeToken, setDraftToken])
 
     const handleBlur = useCallback(() => {
         if (draftToken.trim()) {
@@ -147,7 +176,7 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
         commitRecipients([...remaining, ...pending])
         setDraftToken(clicked)
         focusInput()
-    }, [commitRecipients, draftToken, focusInput, recipients])
+    }, [commitRecipients, draftToken, focusInput, recipients, setDraftToken])
 
     const handleRemove = useCallback((index) => {
         const nextRecipients = recipients.filter((_, recipientIndex) => recipientIndex !== index)
@@ -179,7 +208,7 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
                                     handleRemove(index)
                                 }}
                             >
-                                <img src="/img/icons/close.svg" className="svg-icon-inline" />
+                                <ComposeIcon name="close" size={12} />
                             </span>
                         </button>
                     ))}
@@ -195,17 +224,44 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
                     />
                 </div>
             </div>
+            {matches.length > 0 && (
+                <div className="cv-recipient-suggestions" role="listbox" aria-label={`${label} suggestions`}>
+                    {matches.map((item, index) => <button key={`${item.email}-${index}`} type="button" role="option" aria-selected={index === activeSuggestion} className={`cv-recipient-suggestion${index === activeSuggestion ? ' is-active' : ''}`} onMouseDown={(event) => event.preventDefault()} onClick={() => chooseSuggestion(item)}>
+                        <span>{item.name || item.email}</span><small>{item.email}</small>
+                    </button>)}
+                </div>
+            )}
             {trailingActions}
         </div>
     )
 }
 
-export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, accountEmail, sending = false }) {
+export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, accountEmail, accountId, sending = false }) {
+    const { t } = useTranslation()
+    const [addressSuggestions, setAddressSuggestions] = useState([])
+    useEffect(() => {
+        if (!accountId) return
+        let live = true
+        fetchContacts(accountId).then((cards) => {
+            if (!live) return
+            const contacts = (Array.isArray(cards) ? cards : []).flatMap((record) => {
+                const card = record?.card || record
+                return (card.emails || []).map((entry) => ({ name: displayNameOf(card), email: `${entry.value || ''}`.trim() }))
+            })
+            let recent = []
+            try { recent = JSON.parse(localStorage.getItem(`recent_recipients_${accountId}`) || '[]') } catch { /* ignore */ }
+            const unique = new Map()
+            ;[...contacts, ...(Array.isArray(recent) ? recent : [])].forEach((item) => { if (item?.email && !unique.has(item.email.toLowerCase())) unique.set(item.email.toLowerCase(), item) })
+            setAddressSuggestions([...unique.values()])
+        }).catch(() => {})
+        return () => { live = false }
+    }, [accountId])
     const forwardCount = Array.isArray(draft?.forwardTargets) ? draft.forwardTargets.length : 0
     const isForwardMode = forwardCount > 0
     const bulkReplyCount = Array.isArray(draft?.bulkReplyTargets) ? draft.bulkReplyTargets.length : 0
     const isBulkReplyMode = bulkReplyCount > 0
     const recipientCount = (draft?.toRecipients || []).length + (draft?.ccRecipients || []).length + (draft?.bccRecipients || []).length
+    const recipients = useMemo(() => [...(draft?.toRecipients || []), ...(draft?.ccRecipients || []), ...(draft?.bccRecipients || [])], [draft?.bccRecipients, draft?.ccRecipients, draft?.toRecipients])
     const manualAttachments = (draft?.attachments || []).filter((attachment) => attachment.disposition !== 'inline')
     const fileInputRef = useRef(null)
     const inlineImageInputRef = useRef(null)
@@ -238,11 +294,36 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
 
     const handleSend = useCallback(async () => {
         if (!isBulkReplyMode && recipientCount === 0) return
-        await onSend?.({
+        const invalid = recipients.find((entry) => !/^[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+$/.test(`${entry || ''}`.trim()))
+        if (invalid) {
+            window.alert(t('Check the recipient address: {{address}}', { address: invalid }))
+            return
+        }
+        const body = `${draft?.plainBody || ''} ${draft?.htmlBody || ''}`.replace(/<[^>]*>/g, ' ').toLocaleLowerCase()
+        const mentionsAttachment = /\b(attach(?:ed|ment)?|enclos(?:ed|ure)|dosya(?:yı|yı)? ek|ekli dosya|ekte)\b/i.test(body)
+        if (mentionsAttachment && !(draft?.attachments || []).some((attachment) => attachment.disposition !== 'inline')) {
+            if (!window.confirm(t('Your message mentions an attachment, but no file is attached. Send anyway?'))) return
+        }
+        if (!(draft?.subject || '').trim() && !window.confirm(t('The subject is empty. Send anyway?'))) return
+        const sent = await onSend?.({
             ...draft,
             from: accountEmail || '',
         })
-    }, [accountEmail, draft, isBulkReplyMode, onSend, recipientCount])
+        if (sent && accountId) {
+            try {
+                const key = `recent_recipients_${accountId}`
+                const previous = JSON.parse(localStorage.getItem(key) || '[]')
+                const current = recipients.map((email) => ({ name: '', email: `${email}`.trim() }))
+                const seen = new Set()
+                localStorage.setItem(key, JSON.stringify([...current, ...(Array.isArray(previous) ? previous : [])].filter((entry) => {
+                    const normalized = `${entry.email || ''}`.toLowerCase()
+                    if (!normalized || seen.has(normalized)) return false
+                    seen.add(normalized)
+                    return true
+                }).slice(0, 30)))
+            } catch { /* recent recipient history is best effort */ }
+        }
+    }, [accountEmail, accountId, draft, isBulkReplyMode, onSend, recipientCount, recipients, t])
 
     const previewDocument = useMemo(
         () => buildComposePreviewDocument(draft?.htmlBody || ''),
@@ -390,8 +471,8 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                         value={bodyView}
                         onChange={handleBodyViewChange}
                         options={[
-                            { value: 'rich', label: 'Text' },
-                            { value: 'html', label: 'HTML' },
+                            { value: 'rich', label: t('Text') },
+                            { value: 'html', label: t('HTML') },
                         ]}
                     />
                     {bodyView === 'html' && (
@@ -399,8 +480,8 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                             value={draft?.htmlMode || 'edit'}
                             onChange={(value) => patchDraft({ htmlMode: value })}
                             options={[
-                                { value: 'edit', label: 'Edit' },
-                                { value: 'preview', label: 'Preview' },
+                                { value: 'edit', label: t('Edit') },
+                                { value: 'preview', label: t('Preview') },
                             ]}
                         />
                     )}
@@ -411,7 +492,8 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                         className="cv-toolbar-btn"
                         onClick={() => fileInputRef.current?.click()}
                     >
-                        Add attachment
+                        <ComposeIcon name="attachment" />
+                        {t('Add attachment')}
                     </button>
                     {bodyView === 'html' && draft?.htmlMode === 'edit' && (
                         <button
@@ -419,7 +501,8 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                             className="cv-toolbar-btn"
                             onClick={() => inlineImageInputRef.current?.click()}
                         >
-                            Insert image
+                            <ComposeIcon name="image" />
+                            {t('Insert image')}
                         </button>
                     )}
                 </div>
@@ -427,31 +510,31 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
 
             {isForwardMode && (
                 <div className="cv-banner">
-                    <div className="cv-banner__title">Forwarding message</div>
+                <div className="cv-banner__title">{t('Forwarding message')}</div>
                     <div className="cv-banner__row">
                         <button
                             type="button"
                             className="cv-toggle-btn"
                             onClick={() => setShowForwardAdvanced((prev) => !prev)}
                         >
-                            {showForwardAdvanced ? 'Hide advanced' : 'Advanced'}
+                            {showForwardAdvanced ? t('Hide advanced') : t('Advanced')}
                         </button>
                     </div>
                     {showForwardAdvanced && (
                         <div className="cv-forward-advanced">
                             <label className="cv-banner__label">
-                                Style
+                                {t('Style')}
                                 <select
                                     className="cv-input"
                                     value={draft?.forwardOptions?.forwardStyle || 'copy'}
                                     onChange={(e) => patchForwardOptions({ forwardStyle: e.target.value })}
                                 >
-                                    <option value="copy">Inline (body + attachments)</option>
-                                    <option value="eml">Attach original email</option>
+                                    <option value="copy">{t('Inline (body + attachments)')}</option>
+                                    <option value="eml">{t('Attach original email')}</option>
                                 </select>
                             </label>
                             <label className="cv-banner__label">
-                                Subject prefix
+                                {t('Subject prefix')}
                                 <input
                                     className="cv-input"
                                     type="text"
@@ -462,17 +545,17 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                         </div>
                     )}
                     <div className="cv-banner__hint">
-                        {`${(draft?.subject || '').trim() ? 'Subject overrides the original subject.' : 'Leave Subject empty to keep the original subject.'}`}
+                        {(draft?.subject || '').trim() ? t('Subject overrides the original subject.') : t('Leave Subject empty to keep the original subject.')}
                     </div>
                 </div>
             )}
 
             {isBulkReplyMode && (
                 <div className="cv-banner cv-banner--warning">
-                    <div className="cv-banner__title">Sending {bulkReplyCount} separate repl{bulkReplyCount === 1 ? 'y' : 'ies'}</div>
+                    <div className="cv-banner__title">{t('Sending {{count}} separate replies', { count: bulkReplyCount })}</div>
                     <div className="cv-banner__row">
                         <label className="cv-banner__label">
-                            Mode
+                            {t('Mode')}
                             <select
                                 className="cv-input"
                                 value={draft?.bulkReplyOptions?.mode || 'reply'}
@@ -487,27 +570,28 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                                 checked={draft?.bulkReplyOptions?.includeQuote !== false}
                                 onChange={(e) => patchBulkReplyOptions({ includeQuote: e.target.checked })}
                             />
-                            Include quoted original
+                            {t('Include quoted original')}
                         </label>
                     </div>
                     <div className="cv-banner__hint">
-                        The message you write below will be sent to each selected email as a separate reply.
+                        {t('The message you write below will be sent to each selected email as a separate reply.')}
                     </div>
                 </div>
             )}
 
             <div className="cv-header">
                 <div className="cv-field">
-                    <label className="cv-label">From</label>
+                    <label className="cv-label">{t('From')}</label>
                     <div className="cv-from-value">{accountEmail || '—'}</div>
                 </div>
                 {!isBulkReplyMode && (
                     <>
                         <RecipientField
-                            label="To"
+                            label={t('To')}
                             recipients={draft?.toRecipients || []}
                             onChange={(recipients) => patchRecipients('to', recipients)}
                             placeholder="recipient@example.com"
+                            suggestions={addressSuggestions}
                             trailingActions={(
                                 <>
                                     {!draft?.showCc && (
@@ -521,25 +605,27 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                         />
                         {draft?.showCc && (
                             <RecipientField
-                                label="CC"
+                                label={t('CC')}
                                 recipients={draft?.ccRecipients || []}
                                 onChange={(recipients) => patchRecipients('cc', recipients)}
                                 placeholder="cc@example.com"
+                                suggestions={addressSuggestions}
                             />
                         )}
                         {draft?.showBcc && (
                             <RecipientField
-                                label="BCC"
+                                label={t('BCC')}
                                 recipients={draft?.bccRecipients || []}
                                 onChange={(recipients) => patchRecipients('bcc', recipients)}
                                 placeholder="bcc@example.com"
+                                suggestions={addressSuggestions}
                             />
                         )}
                     </>
                 )}
                 {!isBulkReplyMode && (
                     <div className="cv-field">
-                        <label className="cv-label">Subject</label>
+                        <label className="cv-label">{t('Subject')}</label>
                         <input
                             className="cv-input"
                             type="text"
@@ -601,19 +687,19 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                     onClick={handleSend}
                     disabled={sending || (!isBulkReplyMode && recipientCount === 0)}
                 >
-                    {sending ? '⏳ Sending...'
+                    {sending ? <><ComposeIcon name="clock" /> {t('Sending...')}</>
                         : isBulkReplyMode
-                            ? <><img src="/img/icons/reply.svg" className="svg-icon-inline" /> Send replies ({bulkReplyCount})</>
+                            ? <><ComposeIcon name="reply" /> {t('Send replies ({{count}})', { count: bulkReplyCount })}</>
                             : isForwardMode
-                                ? <><img src="/img/icons/forward.svg" className="svg-icon-inline" /> Forward</>
-                                : <><img src="/img/icons/mail.svg" className="svg-icon-inline" /> Send</>}
+                                ? <><ComposeIcon name="forward" /> {t('Forward')}</>
+                                : <><ComposeIcon name="send" /> {t('Send')}</>}
                 </button>
                 <button
                     type="button"
                     className="cv-discard-btn"
                     onClick={onDiscard}
                 >
-                    <img src="/img/icons/close.svg" className="svg-icon-inline" /> Discard
+                    <ComposeIcon name="discard" /> {t('Discard')}
                 </button>
             </div>
         </div>

@@ -1,3 +1,4 @@
+import ComposeIcon from './ComposeIcon.jsx'
 import ComposeView from './ComposeView.jsx'
 import { getComposeTitle } from '../utils/compose.js'
 
@@ -9,6 +10,7 @@ export default function ComposeMailContent({
     onOpenInTab,
     onOpenInWindow,
     accountEmail,
+    accountId,
     sending = false,
     showTopDiscard = true,
 }) {
@@ -22,29 +24,35 @@ export default function ComposeMailContent({
                 <div className="db-mail-content-actions">
                     {onOpenInTab && (
                         <button
-                            className="db-mail-action-btn"
+                            type="button"
+                            className="db-mail-action-btn cv-header-action"
                             onClick={onOpenInTab}
                             title="Open in new tab"
+                            aria-label="Open in new tab"
                         >
-                            <img src="/img/icons/open-in-new-tab.svg" className="svg-icon-inline" />
+                            <ComposeIcon name="openTab" />
                         </button>
                     )}
                     {onOpenInWindow && (
                         <button
-                            className="db-mail-action-btn"
+                            type="button"
+                            className="db-mail-action-btn cv-header-action"
                             onClick={onOpenInWindow}
                             title="Open in new window"
+                            aria-label="Open in new window"
                         >
-                            <img src="/img/icons/open-in-new-window.svg" className="svg-icon-inline" />
+                            <ComposeIcon name="openWindow" />
                         </button>
                     )}
                     {onDiscard && showTopDiscard && (
                         <button
-                            className="db-mail-action-btn"
+                            type="button"
+                            className="db-mail-action-btn cv-header-action"
                             onClick={onDiscard}
                             title="Close"
+                            aria-label="Close compose"
                         >
-                            <img src="/img/icons/close.svg" className="svg-icon-inline" />
+                            <ComposeIcon name="close" />
                         </button>
                     )}
                 </div>
@@ -56,6 +64,7 @@ export default function ComposeMailContent({
                     onSend={onSend}
                     onDiscard={onDiscard}
                     accountEmail={accountEmail}
+                    accountId={accountId}
                     sending={sending}
                 />
             </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { apiUrl } from '../utils/api'
 import ComposeMailContent from '../components/ComposeMailContent.jsx'
 import ComposeFormatTools from '../components/ComposeFormatTools.jsx'
@@ -10,6 +11,7 @@ import {
     normalizeComposeDraft,
 } from '../utils/compose.js'
 import { queueComposeSend } from '../utils/composeSend.js'
+import { getComposeSettings } from '../utils/composeSettings.js'
 import './DashboardPage.css'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -49,6 +51,7 @@ function getDetachedLabelHint() {
 }
 
 export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
+    const { t } = useTranslation()
     const [windowLabel, setWindowLabel] = useState(() => initialLabel || getDetachedLabelHint())
     const [data, setData] = useState(null)
     const [baselineDraft, setBaselineDraft] = useState(() => normalizeComposeDraft())
@@ -66,6 +69,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     const draftRef = useRef(draft)
     const baselineDraftRef = useRef(baselineDraft)
     const sentRef = useRef(sent)
+    const recoveryKey = `compose_recovery_${data?.accountId || 'default'}_detached`
 
     useEffect(() => { dataRef.current = data }, [data])
     useEffect(() => { draftRef.current = draft }, [draft])
@@ -206,6 +210,26 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         setDraft(normalizeComposeDraft(draftSource))
     }, [data])
 
+    // Persist locally before the server draft queue runs; attachment payloads
+    // are included so a crash can restore the complete composition.
+    useEffect(() => {
+        if (!data || !windowLabel || sent || !isComposeDraftDirty(draft)) return undefined
+        const timer = window.setTimeout(() => {
+            try { localStorage.setItem(recoveryKey, JSON.stringify({ savedAt: Date.now(), draft })) }
+            catch (error) { console.warn('Could not persist compose recovery copy:', error) }
+        }, 1200)
+        return () => window.clearTimeout(timer)
+    }, [data, draft, recoveryKey, sent, windowLabel])
+
+    useEffect(() => {
+        if (!data || !windowLabel) return
+        try {
+            const stored = safeParse(localStorage.getItem(recoveryKey) || '')
+            if (!stored?.draft || Date.now() - Number(stored.savedAt || 0) > 7 * 86400000) return
+            if (!isComposeDraftDirty(data.draft) && isComposeDraftDirty(stored.draft)) setDraft(normalizeComposeDraft(stored.draft))
+        } catch { /* recovery is best effort */ }
+    }, [data, recoveryKey, windowLabel])
+
     useEffect(() => () => {
         if (sendTimeoutRef.current) {
             window.clearTimeout(sendTimeoutRef.current)
@@ -279,6 +303,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
 
             setPendingSend(null)
             setSent(true)
+            try { localStorage.removeItem(recoveryKey) } catch { /* ignore */ }
             setTimeout(() => closeWindow(), 1500)
             return true
         } catch (error) {
@@ -288,7 +313,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         } finally {
             setSending(false)
         }
-    }, [accountId, accountEmail, closeWindow, queueOfflineAction])
+    }, [accountId, accountEmail, closeWindow, queueOfflineAction, recoveryKey])
 
     const handleSaveDraft = useCallback(async (composed) => {
         const payload = buildDraftSavePayload(composed, accountEmail)
@@ -317,7 +342,11 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
             }
 
             clearPendingSend()
-            const durationMs = 10_000
+            const durationMs = getComposeSettings(data?.accountId).undoSendSeconds * 1000
+            if (durationMs <= 0) {
+                void handleSendNow(normalized)
+                return true
+            }
             const nextPending = {
                 draft: normalized,
                 durationMs,
@@ -336,7 +365,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
             window.alert(error?.message || 'Failed to schedule send.')
             return false
         }
-    }, [clearPendingSend, handleSendNow])
+    }, [clearPendingSend, data?.accountId, handleSendNow])
 
     const handleSend = useCallback((composed) => {
         startDelayedSend(composed)
@@ -375,12 +404,14 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 return
             }
             if (action === 'discard') {
+                try { localStorage.removeItem(recoveryKey) } catch { /* ignore */ }
                 await closeWindow()
                 return
             }
 
             if (action === 'save') {
                 await handleSaveDraft(draft)
+                try { localStorage.removeItem(recoveryKey) } catch { /* ignore */ }
                 await closeWindow()
             }
         } catch (error) {
@@ -389,7 +420,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         } finally {
             setActionBusy(false)
         }
-    }, [closeWindow, draft, handleSaveDraft, handleSendNow, startDelayedSend])
+    }, [closeWindow, draft, handleSaveDraft, handleSendNow, recoveryKey, startDelayedSend])
 
     if (sent) {
         return (
@@ -432,7 +463,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                     <div className="db-section-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <div className="db-empty-state">
                             <div className="db-empty-icon">✉️</div>
-                            <div className="db-empty-text">Mail will be sent in 10 seconds.</div>
+                        <div className="db-empty-text">{t('Mail will be sent in {{count}} seconds.', { count: Math.max(0, Math.ceil((pendingSend.expiresAt - noticeNow) / 1000)) })}</div>
                         </div>
                     </div>
                 ) : (
@@ -443,6 +474,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                         onDiscard={handleDiscard}
                     showTopDiscard={true}
                     accountEmail={accountEmail}
+                        accountId={accountId}
                         sending={sending}
                     />
                 )}
