@@ -8,7 +8,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Datelike, Duration, NaiveDate};
 use native_tls::TlsConnector;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::mail_models::{
     merge_mailbox_label_into_preview, AdvancedSearchRequest, AttachmentInfo, MailboxEntry,
@@ -151,6 +151,7 @@ impl ImapSession {
                 .iter()
                 .map(|n| {
                     let name = crate::imap_utf7::decode(n.name());
+                    let name = crate::mail_models::mailbox_identity(&name).to_string();
                     let mut role = None;
                     let mut selectable = true;
                     for attr in n.attributes() {
@@ -179,10 +180,6 @@ impl ImapSession {
                 vec![]
             }
         }
-    }
-
-    fn select_mailbox(&mut self, name: &str) -> Result<u32, String> {
-        self.select_mailbox_info(name).map(|mailbox| mailbox.exists)
     }
 
     fn select_mailbox_info(&mut self, name: &str) -> Result<imap::types::Mailbox, String> {
@@ -384,24 +381,16 @@ impl ImapSession {
         }
     }
 
-    fn search_new_uids(&mut self, since_uid: u32) -> Vec<u32> {
+    fn search_new_uids(&mut self, since_uid: u32) -> Result<Vec<u32>, String> {
         let Some(first_uid) = since_uid.checked_add(1) else {
-            return vec![];
+            return Ok(vec![]);
         };
-        let query = format!("UID {first_uid}:*");
-        match self.uid_search_query(&query) {
-            Ok(mut uids) => {
-                // IMAP sequence ranges are bidirectional. When first_uid is
-                // beyond the highest UID, '*' can still match the last message.
-                uids.retain(|uid| *uid >= first_uid);
-                uids.reverse();
-                uids
-            }
-            Err(error) => {
-                warn!("UID SEARCH error: {error}");
-                vec![]
-            }
-        }
+        let mut uids = self.uid_search_query(&format!("UID {first_uid}:*"))?;
+        // IMAP sequence ranges are bidirectional. '*' can match the last
+        // message even when first_uid is beyond the highest UID.
+        uids.retain(|uid| *uid >= first_uid);
+        uids.reverse();
+        Ok(uids)
     }
 
     fn uid_search_query(&mut self, query: &str) -> Result<Vec<u32>, String> {
@@ -708,38 +697,34 @@ pub fn list_mailboxes_detailed(state: &Arc<ImapState>, account_id: i64) -> Vec<M
     }
 }
 
+pub struct MailboxPage {
+    pub generation: u32,
+    pub total: usize,
+    pub previews: Vec<MailPreview>,
+}
+
 pub fn fetch_mail_list(
     state: &Arc<ImapState>,
     account_id: i64,
     mailbox: &str,
     page: usize,
     per_page: usize,
-) -> (usize, Vec<MailPreview>) {
+    expected_generation: Option<u32>,
+) -> Result<MailboxPage, String> {
     let mut sessions = state.sessions.lock().unwrap();
-    let session = match sessions.get_mut(&account_id) {
-        Some(s) => s,
-        None => {
-            warn!("No IMAP session for account {account_id}");
-            return (0, vec![]);
-        }
-    };
-
-    let selected = match session.select_mailbox_info(mailbox) {
-        Ok(mailbox) => mailbox,
-        Err(e) => {
-            error!("select_mailbox {mailbox}: {e}");
-            return (0, vec![]);
-        }
-    };
-
-    let total = selected.exists as usize;
-    if total == 0 {
-        return (0, vec![]);
+    let session = sessions.get_mut(&account_id).ok_or("No IMAP session")?;
+    let selected = session.select_mailbox_info(mailbox)?;
+    let generation = selected.uid_validity.filter(|value| *value > 0)
+        .ok_or("Mailbox UIDVALIDITY is unavailable")?;
+    if expected_generation.is_some_and(|expected| expected != generation) {
+        return Err("Mailbox UIDVALIDITY changed during refresh".into());
     }
 
-    let start_from_end = (page.saturating_sub(1)) * per_page;
+    let per_page = per_page.max(1);
+    let total = selected.exists as usize;
+    let start_from_end = page.saturating_sub(1).saturating_mul(per_page);
     if start_from_end >= total {
-        return (total, vec![]);
+        return Ok(MailboxPage { generation, total, previews: vec![] });
     }
 
     let hi = total - start_from_end;
@@ -763,7 +748,7 @@ pub fn fetch_mail_list(
             .then_with(|| uid_num(&b.id).cmp(&uid_num(&a.id)))
             .then_with(|| b.id.cmp(&a.id))
     });
-    (total, previews)
+    Ok(MailboxPage { generation, total, previews })
 }
 
 fn quote_imap_string(value: &str) -> String {
@@ -964,6 +949,7 @@ pub fn advanced_search(
             .cmp(&date_ms(&a.mail.date))
             .then_with(|| uid_num(&b.mail.id).cmp(&uid_num(&a.mail.id)))
             .then_with(|| b.mail.id.cmp(&a.mail.id))
+            .then_with(|| a.mailbox.cmp(&b.mailbox))
     });
 
     Ok(results)
@@ -974,8 +960,9 @@ pub fn fetch_mail_raw_in_mailbox(
     account_id: i64,
     mailbox: &str,
     uid: &str,
+    expected_validity: Option<u32>,
 ) -> Option<Vec<u8>> {
-    fetch_mail_raw_with_validity(state, account_id, mailbox, uid).map(|(raw, _)| raw)
+    fetch_mail_raw_with_validity(state, account_id, mailbox, uid, expected_validity).map(|(raw, _)| raw)
 }
 
 pub fn fetch_mail_raw_with_validity(
@@ -983,10 +970,14 @@ pub fn fetch_mail_raw_with_validity(
     account_id: i64,
     mailbox: &str,
     uid: &str,
+    expected_validity: Option<u32>,
 ) -> Option<(Vec<u8>, Option<u32>)> {
     let mut sessions = state.sessions.lock().unwrap();
     let session = sessions.get_mut(&account_id)?;
     let selected = session.select_mailbox_info(mailbox).ok()?;
+    if expected_validity.is_some_and(|expected| expected == 0 || selected.uid_validity != Some(expected)) {
+        return None;
+    }
     session.fetch_mail_raw(uid).map(|raw| (raw, selected.uid_validity))
 }
 
@@ -994,31 +985,20 @@ pub fn fetch_new_uids_since(
     state: &Arc<ImapState>,
     account_id: i64,
     mailbox: &str,
-    since_uid: u32,
-) -> (usize, Vec<u32>) {
+    checkpoint: (u32, u32),
+) -> Result<(u32, u32, Vec<u32>), String> {
     let mut sessions = state.sessions.lock().unwrap();
-    let session = match sessions.get_mut(&account_id) {
-        Some(s) => s,
-        None => {
-            warn!("No IMAP session for account {account_id}");
-            return (0, vec![]);
-        }
+    let session = sessions.get_mut(&account_id).ok_or("No IMAP session")?;
+    let selected = session.select_mailbox_info(mailbox)?;
+    let generation = selected.uid_validity.filter(|value| *value > 0)
+        .ok_or("Mailbox UIDVALIDITY is unavailable")?;
+    let since_uid = if generation == checkpoint.1 { checkpoint.0 } else { 0 };
+    let uids = if selected.exists == 0 {
+        vec![]
+    } else {
+        session.search_new_uids(since_uid)?
     };
-
-    let total = match session.select_mailbox(mailbox) {
-        Ok(n) => n as usize,
-        Err(e) => {
-            error!("select_mailbox {mailbox}: {e}");
-            return (0, vec![]);
-        }
-    };
-
-    if total == 0 {
-        return (0, vec![]);
-    }
-
-    let new_uids = session.search_new_uids(since_uid);
-    (total, new_uids)
+    Ok((generation, since_uid, uids))
 }
 
 pub fn fetch_headers_for_uids(
@@ -1026,6 +1006,7 @@ pub fn fetch_headers_for_uids(
     account_id: i64,
     mailbox: &str,
     uids: &[u32],
+    expected_validity: u32,
 ) -> Vec<MailPreview> {
     if uids.is_empty() {
         return vec![];
@@ -1043,6 +1024,10 @@ pub fn fetch_headers_for_uids(
             return vec![];
         }
     };
+
+    if selected.uid_validity != Some(expected_validity) {
+        return vec![];
+    }
 
     let uid_set: String = uids
         .iter()
@@ -1243,27 +1228,13 @@ pub fn create_mailbox(
     result.map(|_| ()).map_err(|e| format!("{e}"))
 }
 
-pub fn delete_mail(
-    state: &Arc<ImapState>,
-    account_id: i64,
-    mailbox: &str,
-    uid: &str,
-) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get_mut(&account_id)
-        .ok_or_else(|| format!("No IMAP session for account {account_id}"))?;
-    session.select_mailbox(mailbox)?;
-    session.uid_delete(uid)
-}
-
 pub fn append_draft(
     state: &Arc<ImapState>,
     account_id: i64,
     mailbox: &str,
     raw: &[u8],
     tracking_key: &str,
-) -> Result<String, String> {
+) -> Result<(String, u32), String> {
     let mut sessions = state.sessions.lock().unwrap();
     let session = sessions
         .get_mut(&account_id)
@@ -1277,22 +1248,18 @@ pub fn append_draft(
     };
     append_result.map_err(|e| format!("{e}"))?;
 
-    session.select_mailbox(mailbox)?;
+    let generation = session.select_mailbox_info(mailbox)?.uid_validity
+        .filter(|value| *value > 0)
+        .ok_or("Draft was appended but the mailbox UIDVALIDITY is unavailable")?;
     let query = format!(
         "HEADER X-GUVERCIN-DRAFT-KEY {}",
         quote_imap_string(tracking_key),
     );
-    let tracked_uids = session.uid_search_query(&query).unwrap_or_default();
-    if let Some(uid) = tracked_uids.into_iter().max() {
-        return Ok(uid.to_string());
+    let tracked_uids = session.uid_search_query(&query)?;
+    match tracked_uids.as_slice() {
+        [uid] => Ok((uid.to_string(), generation)),
+        _ => Err("Draft was appended but its UID could not be identified".to_string()),
     }
-
-    let all_uids = session.uid_search_query("ALL")?;
-    all_uids
-        .into_iter()
-        .max()
-        .map(|uid| uid.to_string())
-        .ok_or_else(|| "Draft append succeeded but appended UID could not be resolved".to_string())
 }
 
 fn build_mail_content(uid: String, parsed: &ParsedMail) -> MailContent {
@@ -1677,7 +1644,7 @@ mod tests {
         let commands = record_imap_commands("UIDPLUS", Some("SELECT"), |session| {
             let state = std::sync::Arc::new(super::ImapState::new());
             state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
-            assert!(super::fetch_headers_for_uids(&state, 1, "Missing folder", &[42]).is_empty());
+            assert!(super::fetch_headers_for_uids(&state, 1, "Missing folder", &[42], 7).is_empty());
         });
         assert_eq!(commands, ["SELECT \"Missing folder\""]);
     }
@@ -1686,9 +1653,9 @@ mod tests {
     fn incremental_uid_search_ignores_the_old_last_uid_and_handles_exhaustion() {
         let commands = record_imap_commands("UIDPLUS", None, |session| {
             let mut session = super::ImapSession::Plain(session);
-            assert!(session.search_new_uids(42).is_empty());
-            assert_eq!(session.search_new_uids(40), vec![42, 41]);
-            assert!(session.search_new_uids(u32::MAX).is_empty());
+            assert!(session.search_new_uids(42).unwrap().is_empty());
+            assert_eq!(session.search_new_uids(40).unwrap(), vec![42, 41]);
+            assert!(session.search_new_uids(u32::MAX).unwrap().is_empty());
         });
         assert_eq!(commands, ["UID SEARCH UID 43:*", "UID SEARCH UID 41:*"]);
     }
@@ -1717,12 +1684,184 @@ mod tests {
         ]);
     }
 
+    #[test]
+    fn replaced_generation_searches_below_the_old_checkpoint() {
+        let commands = record_imap_commands("UIDPLUS", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+            assert_eq!(
+                super::fetch_new_uids_since(&state, 1, "INBOX", (900, 6)).unwrap(),
+                (7, 0, vec![42, 41]),
+            );
+            assert_eq!(
+                super::fetch_new_uids_since(&state, 1, "INBOX", (42, 7)).unwrap(),
+                (7, 42, vec![]),
+            );
+            assert!(super::fetch_new_uids_since(&state, 1, "Unknown validity", (42, 7)).is_err());
+        });
+        assert_eq!(commands, [
+            "SELECT \"INBOX\"",
+            "UID SEARCH UID 1:*",
+            "SELECT \"INBOX\"",
+            "UID SEARCH UID 43:*",
+            "SELECT \"Unknown validity\"",
+        ]);
+    }
+
+    #[test]
+    fn refresh_replaces_a_generation_without_retargeting_queued_or_open_mail() {
+        use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, Json};
+        use std::sync::Arc;
+
+        use crate::{db, mail_routes::{self, MailAppState}, offline_routes};
+
+        let commands = record_imap_commands("UIDPLUS", None, |session| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let dir = std::env::temp_dir().join(format!("guvercin-uid-{}-{timestamp}", std::process::id()));
+                struct ScratchDirectory(std::path::PathBuf);
+                impl Drop for ScratchDirectory {
+                    fn drop(&mut self) {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                    }
+                }
+                std::fs::create_dir(&dir).unwrap();
+                let _scratch = ScratchDirectory(dir.clone());
+                std::fs::write(dir.join("security_settings.json"), r#"{"data_encrypted":false}"#).unwrap();
+
+                let db = Arc::new(db::AppState::initialize(Some(dir.clone())).await.unwrap());
+                let imap = Arc::new(super::ImapState::new());
+                imap.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+                let state = Arc::new(MailAppState {
+                    _db: db.clone(),
+                    imap,
+                    sync_locks: Default::default(),
+                });
+                let pool = db::get_user_db_pool(&db, 1).await.unwrap();
+                sqlx::query("INSERT INTO sync_checkpoints (folder_path, last_synced_uid, last_uid_validity) VALUES ('INBOX', 900, 6)")
+                    .execute(&pool).await.unwrap();
+                sqlx::query(
+                    "INSERT INTO local_mail_cache (uid, folder, uid_validity, subject, plain_body) VALUES
+                     ('42', 'INBOX', 6, 'Old subject', 'Old body'),
+                     ('900', 'INBOX', 6, 'Old cached message', 'Old body'),
+                     ('901', 'inbox', 6, 'Old alias message', 'Old body'),
+                     ('42', 'Projects', 6, 'Other folder', ''),
+                     ('42', 'projects', 6, 'Case distinct folder', '')",
+                ).execute(&pool).await.unwrap();
+                let other = db::get_user_db_pool(&db, 2).await.unwrap();
+                sqlx::query("INSERT INTO local_mail_cache (uid, folder, uid_validity) VALUES ('42', 'INBOX', 6)")
+                    .execute(&other).await.unwrap();
+
+                let action = serde_json::from_value(serde_json::json!({
+                    "action_type": "delete", "target_uid": "42", "target_folder": "INBOX", "uid_validity": 6,
+                })).unwrap();
+                let _ = offline_routes::post_offline_action(State(state.clone()), Path(1), Json(action)).await.unwrap();
+
+                let refresh = || serde_json::from_value(serde_json::json!({"mailbox": "inbox"})).unwrap();
+                let _ = offline_routes::sync_mailbox(State(state.clone()), Path(1), Query(refresh())).await.unwrap();
+                let local_query = |generation| serde_json::from_value(serde_json::json!({
+                    "mailbox": "INBOX", "uid_validity": generation,
+                })).unwrap();
+                let old = offline_routes::get_local_mail_content(State(state.clone()), Path((1, "42".into())), Query(local_query(6)))
+                    .await.into_response();
+                assert_eq!(old.status(), StatusCode::NOT_FOUND);
+                let new = offline_routes::get_local_mail_content(State(state.clone()), Path((1, "42".into())), Query(local_query(7)))
+                    .await.into_response();
+                assert_eq!(new.status(), StatusCode::NOT_FOUND, "replacement headers must not inherit the old body");
+                let old_remote = mail_routes::get_mail_content(State(state.clone()), Path((1, "42".into())), Query(mail_routes::MailContentQuery {
+                    mailbox: "INBOX".into(), uid_validity: Some(6),
+                })).await.into_response();
+                assert_eq!(old_remote.status(), StatusCode::NOT_FOUND);
+                let new_remote = mail_routes::get_mail_content(State(state.clone()), Path((1, "42".into())), Query(mail_routes::MailContentQuery {
+                    mailbox: "INBOX".into(), uid_validity: Some(7),
+                })).await.into_response();
+                assert_eq!(new_remote.status(), StatusCode::OK);
+                let local = offline_routes::get_local_mail_content(State(state.clone()), Path((1, "42".into())), Query(local_query(7)))
+                    .await.into_response();
+                let body = axum::body::to_bytes(local.into_body(), 4096).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["plain_body"].as_str().unwrap().trim(), "Replacement body");
+
+                let rows: Vec<(String, String, u32, String, Option<String>)> = sqlx::query_as(
+                    "SELECT folder, uid, uid_validity, subject, plain_body FROM local_mail_cache ORDER BY folder",
+                ).fetch_all(&pool).await.unwrap();
+                assert_eq!(rows, [
+                    ("INBOX".into(), "42".into(), 7, "Replacement".into(), Some(body["plain_body"].as_str().unwrap().into())),
+                    ("Projects".into(), "42".into(), 6, "Other folder".into(), Some(String::new())),
+                    ("projects".into(), "42".into(), 6, "Case distinct folder".into(), Some(String::new())),
+                ]);
+                assert_eq!(sqlx::query_scalar::<_, u32>("SELECT uid_validity FROM local_mail_cache").fetch_one(&other).await.unwrap(), 6);
+                sqlx::query(
+                    "INSERT INTO local_mail_cache (uid, folder, uid_validity) VALUES
+                     ('2', 'Projects', 6), ('10', 'Projects', 6)",
+                ).execute(&pool).await.unwrap();
+                let search = serde_json::from_value(serde_json::json!({
+                    "scope": "mailboxes", "mailboxes": ["Projects"],
+                })).unwrap();
+                let Json(results) = offline_routes::search_advanced(State(state.clone()), Path(1), Json(search))
+                    .await.unwrap();
+                assert_eq!(results.total_count, 3);
+                assert_eq!(results.mails.into_iter().map(|mail| mail.mail.id).collect::<Vec<_>>(), ["42", "10", "2"]);
+                sqlx::query("UPDATE sync_checkpoints SET last_synced_uid = 40 WHERE folder_path = 'INBOX'")
+                    .execute(&pool).await.unwrap();
+                let Json(sync) = offline_routes::sync_now(State(state.clone()), Path(1)).await.unwrap();
+                assert_eq!(sync.failed, 1);
+
+                drop(state);
+                pool.close().await;
+                other.close().await;
+                drop(db);
+                let reopened = db::AppState::initialize(Some(dir)).await.unwrap();
+                let pool = db::get_user_db_pool(&reopened, 1).await.unwrap();
+                let checkpoint: (u32, u32) = sqlx::query_as(
+                    "SELECT last_synced_uid, last_uid_validity FROM sync_checkpoints WHERE folder_path = 'INBOX'",
+                ).fetch_one(&pool).await.unwrap();
+                assert_eq!(checkpoint, (40, 7));
+                let queued: (u32, String) = sqlx::query_as("SELECT uid_validity, status FROM offline_sync_queue")
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(queued, (6, "dead".into()));
+                pool.close().await;
+            });
+        });
+        let commands: Vec<_> = commands.iter().filter(|command| *command != "NOOP").collect();
+        assert_eq!(commands.len(), 11, "{commands:?}");
+        assert_eq!(commands[0], "SELECT \"INBOX\"");
+        assert!(commands[1].starts_with("FETCH 1:1 "));
+        assert_eq!(commands[2], "SELECT \"INBOX\"");
+        assert_eq!(commands[3], "SELECT \"INBOX\"");
+        assert!(commands[4].starts_with("UID FETCH 42 (UID BODY.PEEK[]"));
+        assert_eq!(commands[5], "SELECT \"INBOX\"");
+        assert!(commands[6].starts_with("LIST "));
+        assert_eq!(commands[7], "SELECT \"INBOX\"");
+        assert_eq!(commands[8], "UID SEARCH UID 41:*");
+        assert_eq!(commands[9], "SELECT \"INBOX\"");
+        assert!(commands[10].starts_with("UID FETCH 41,42 "));
+
+    }
+
+    #[test]
+    fn appended_draft_requires_one_tracking_match_and_carries_its_generation() {
+        let commands = record_imap_commands("UIDPLUS", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+            let raw = b"Subject: Fixture\r\n\r\nDraft body";
+            let valid = super::append_draft(&state, 1, "Drafts", raw, "unique").unwrap();
+            assert_eq!(valid, ("42".into(), 7));
+            for key in ["missing", "ambiguous"] {
+                assert!(super::append_draft(&state, 1, "Drafts", raw, key).is_err());
+            }
+        });
+        assert_eq!(commands.iter().filter(|command| command.starts_with("APPEND ")).count(), 3);
+        assert_eq!(commands.iter().filter(|command| command.starts_with("UID SEARCH HEADER ")).count(), 3);
+        assert!(commands.iter().all(|command| command != "UID SEARCH ALL"));
+    }
+
     fn record_imap_commands(
         capability: &'static str,
         reject_prefix: Option<&'static str>,
         action: impl FnOnce(imap::Session<std::net::TcpStream>),
     ) -> Vec<String> {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::time::Duration;
 
@@ -1752,15 +1891,43 @@ mod tests {
                     cmd if cmd.starts_with("LOGIN ") => {}
                     cmd => {
                         commands.push(cmd.to_string());
+                        if cmd.starts_with("APPEND ") {
+                            let (_, size) = cmd.rsplit_once('{').unwrap();
+                            let size = size.trim_end_matches('}').parse::<usize>().unwrap();
+                            write!(stream, "+ ready\r\n").unwrap();
+                            let mut literal = vec![0; size + 2];
+                            reader.read_exact(&mut literal).unwrap();
+                        }
                         if cmd.starts_with("UID SEARCH ") {
-                            write!(stream, "* SEARCH 41 42\r\n").unwrap();
+                            let result = if cmd.ends_with("\"unique\"") {
+                                " 42"
+                            } else if cmd.ends_with("\"missing\"") {
+                                ""
+                            } else {
+                                " 41 42"
+                            };
+                            write!(stream, "* SEARCH{result}\r\n").unwrap();
                         }
                         if reject_prefix.is_some_and(|prefix| cmd.starts_with(prefix)) {
                             write!(stream, "{tag} NO fixture rejection\r\n").unwrap();
                             continue;
                         }
                         if cmd.starts_with("SELECT ") {
-                            write!(stream, "* 1 EXISTS\r\n* OK [UIDVALIDITY 7] fixture\r\n").unwrap();
+                            write!(stream, "* 1 EXISTS\r\n").unwrap();
+                            if cmd != "SELECT \"Unknown validity\"" {
+                                write!(stream, "* OK [UIDVALIDITY 7] fixture\r\n").unwrap();
+                            }
+                        }
+                        if cmd.starts_with("LIST ") {
+                            write!(stream, "* LIST () \"/\" \"INBOX\"\r\n").unwrap();
+                        }
+                        if cmd.starts_with("UID FETCH 42 (UID BODY.PEEK[]") {
+                            let raw = "Subject: Replacement\r\nFrom: fixture@example.test\r\n\r\nReplacement body\r\n";
+                            write!(stream, "* 1 FETCH (UID 42 BODY[] {{{}}}\r\n{})\r\n", raw.len(), raw).unwrap();
+                        }
+                        if cmd.starts_with("FETCH 1:1 ") || cmd.starts_with("UID FETCH 41,42 ") {
+                            let headers = "Subject: Replacement\r\nFrom: fixture@example.test\r\n\r\n";
+                            write!(stream, "* 1 FETCH (UID 42 FLAGS () RFC822.SIZE 100 BODY[HEADER.FIELDS (SUBJECT FROM)] {{{}}}\r\n{})\r\n", headers.len(), headers).unwrap();
                         }
                     }
                 }

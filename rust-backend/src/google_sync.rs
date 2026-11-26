@@ -62,6 +62,44 @@ async fn google_get<T: DeserializeOwned>(
     google_send(http, Method::GET, url, token, None).await
 }
 
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct GooglePage<T> {
+    #[serde(default, alias = "connections")]
+    items: Vec<T>,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+async fn google_pages<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    token: &str,
+    endpoint: &str,
+    parameters: &[(&str, &str)],
+    page_limit: usize,
+) -> Result<Vec<T>, AppError> {
+    let mut base = Url::parse(endpoint)
+        .map_err(|error| AppError::BadRequest(format!("Invalid Google endpoint: {error}")))?;
+    base.query_pairs_mut().extend_pairs(parameters.iter().copied());
+    let mut page_token: Option<String> = None;
+    let mut items = Vec::new();
+    for _ in 0..page_limit {
+        let mut url = base.clone();
+        if let Some(page_token) = &page_token {
+            url.query_pairs_mut().append_pair("pageToken", page_token);
+        }
+        let page: GooglePage<T> = google_get(http, url.as_str(), token).await?;
+        items.extend(page.items);
+        page_token = page.next_page_token.filter(|value| !value.is_empty());
+        if page_token.is_none() {
+            return Ok(items);
+        }
+    }
+    Err(AppError::BadRequest(
+        "Google returned more pages than the sync limit. Existing items were kept.".into(),
+    ))
+}
+
 async fn google_send<T: DeserializeOwned>(
     http: &reqwest::Client,
     method: Method,
@@ -250,11 +288,6 @@ pub async fn tasks_access(
 // ─────────────────────────── Calendar ───────────────────────────
 
 #[derive(Deserialize, Default)]
-struct CalListResp {
-    #[serde(default)]
-    items: Vec<CalListItem>,
-}
-#[derive(Deserialize, Default)]
 struct CalListItem {
     #[serde(default)]
     id: String,
@@ -264,13 +297,6 @@ struct CalListItem {
     background_color: Option<String>,
     #[serde(default, rename = "accessRole")]
     access_role: Option<String>,
-}
-#[derive(Deserialize, Default)]
-struct EventsResp {
-    #[serde(default)]
-    items: Vec<GEvent>,
-    #[serde(default, rename = "nextPageToken")]
-    next_page_token: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct GEvent {
@@ -477,9 +503,9 @@ pub async fn sync_calendar(
     let win_to = naive_now + 365 * DAY_MS;
 
     // 1. Mirror remote calendars → local, recording remote ids.
-    let cal_list: CalListResp = google_get(&http, CAL_LIST_URL, &token).await?;
+    let calendars = google_pages::<CalListItem>(&http, &token, CAL_LIST_URL, &[], 20).await?;
     let mut gcal_to_local: HashMap<String, i64> = HashMap::new();
-    for item in &cal_list.items {
+    for item in &calendars {
         if item.access_role.as_deref() == Some("freeBusyReader") {
             continue;
         }
@@ -493,37 +519,18 @@ pub async fn sync_calendar(
     // 2. Fetch all remote events (per calendar), remember which gcal each came from.
     let mut remote: Vec<(String, GEvent)> = Vec::new();
     for gcal in gcal_to_local.keys() {
-        let mut page: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            pages += 1;
-            if pages > 20 {
-                break;
-            }
-            let mut url = Url::parse(&events_url(gcal, None)).unwrap();
-            {
-                let mut qp = url.query_pairs_mut();
-                qp.append_pair("timeMin", &time_min);
-                qp.append_pair("timeMax", &time_max);
-                qp.append_pair("singleEvents", "false");
-                qp.append_pair("maxResults", "2500");
-                qp.append_pair("showDeleted", "false");
-                if let Some(t) = &page {
-                    qp.append_pair("pageToken", t);
-                }
-            }
-            let resp: EventsResp = google_get(&http, url.as_str(), &token).await?;
-            for gev in resp.items {
-                if gev.recurring_event_id.is_some() || gev.status.as_deref() == Some("cancelled") {
-                    continue;
-                }
-                remote.push((gcal.clone(), gev));
-            }
-            page = resp.next_page_token;
-            if page.is_none() {
-                break;
-            }
-        }
+        let events = google_pages::<GEvent>(
+            &http, &token, &events_url(gcal, None),
+            &[
+                ("timeMin", &time_min), ("timeMax", &time_max),
+                ("singleEvents", "false"), ("maxResults", "2500"), ("showDeleted", "false"),
+            ],
+            20,
+        ).await?;
+        remote.extend(events.into_iter()
+            .filter(|event| event.recurring_event_id.is_none() && event.status.as_deref() != Some("cancelled"))
+            .map(|event| (gcal.clone(), event)));
+
     }
 
     // 3. Load local events.
@@ -602,12 +609,15 @@ pub async fn sync_calendar(
         }
     }
 
+    let synced_calendars: HashSet<_> = gcal_to_local.values().copied().collect();
+
     // 5. Orphans: local events with no matching remote item this round.
     for (i, local) in locals.iter().enumerate() {
         if seen.contains(&i) {
             continue;
         }
-        let in_scope = !local.recurs && local.scope_ms >= win_from && local.scope_ms < win_to;
+        let in_scope = synced_calendars.contains(&local.aux)
+            && !local.recurs && local.scope_ms >= win_from && local.scope_ms < win_to;
         match reconcile_orphan(local.state, in_scope) {
             OrphanAction::Noop => {}
             OrphanAction::DropLocal | OrphanAction::DeleteLocal => {
@@ -634,13 +644,6 @@ pub async fn sync_calendar(
 
 // ─────────────────────────── Contacts (People) ───────────────────────────
 
-#[derive(Deserialize, Default)]
-struct ConnResp {
-    #[serde(default)]
-    connections: Vec<Person>,
-    #[serde(default, rename = "nextPageToken")]
-    next_page_token: Option<String>,
-}
 #[derive(Deserialize, Default)]
 struct Person {
     #[serde(default, rename = "resourceName")]
@@ -801,30 +804,9 @@ pub async fn sync_contacts(
     let http = reqwest::Client::new();
 
     // 1. Fetch all remote connections.
-    let mut remote: Vec<Person> = Vec::new();
-    let mut page: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        pages += 1;
-        if pages > 25 {
-            break;
-        }
-        let mut url = Url::parse(PEOPLE_URL).unwrap();
-        {
-            let mut qp = url.query_pairs_mut();
-            qp.append_pair("personFields", PERSON_FIELDS);
-            qp.append_pair("pageSize", "1000");
-            if let Some(t) = &page {
-                qp.append_pair("pageToken", t);
-            }
-        }
-        let resp: ConnResp = google_get(&http, url.as_str(), &token).await?;
-        remote.extend(resp.connections);
-        page = resp.next_page_token;
-        if page.is_none() {
-            break;
-        }
-    }
+    let remote = google_pages::<Person>(
+        &http, &token, PEOPLE_URL, &[("personFields", PERSON_FIELDS), ("pageSize", "1000")], 25,
+    ).await?;
 
     // 2. Load local contacts.
     let rows = sqlx::query(
@@ -927,23 +909,11 @@ pub async fn sync_contacts(
 // ─────────────────────────── Tasks ───────────────────────────
 
 #[derive(Deserialize, Default)]
-struct TaskListsResp {
-    #[serde(default)]
-    items: Vec<GTaskList>,
-}
-#[derive(Deserialize, Default)]
 struct GTaskList {
     #[serde(default)]
     id: String,
     #[serde(default)]
     title: String,
-}
-#[derive(Deserialize, Default)]
-struct TasksResp {
-    #[serde(default)]
-    items: Vec<GTask>,
-    #[serde(default, rename = "nextPageToken")]
-    next_page_token: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct GTask {
@@ -1030,9 +1000,9 @@ pub async fn sync_tasks(
     let http = reqwest::Client::new();
 
     // 1. Mirror remote task lists → local, recording remote ids.
-    let lists: TaskListsResp = google_get(&http, TASKLISTS_URL, &token).await?;
+    let lists = google_pages::<GTaskList>(&http, &token, TASKLISTS_URL, &[], 20).await?;
     let mut gl_to_local: HashMap<String, i64> = HashMap::new();
-    for gl in &lists.items {
+    for gl in &lists {
         let title = if gl.title.trim().is_empty() { "Tasks".to_string() } else { gl.title.clone() };
         let local_list = todo::ensure_named_list(&pool, &format!("{title} (Google)")).await?;
         set_remote_id(&pool, "task_lists", "list_id", local_list, &gl.id).await;
@@ -1042,32 +1012,12 @@ pub async fn sync_tasks(
     // 2. Fetch all remote tasks.
     let mut remote: Vec<(String, GTask)> = Vec::new();
     for gl in gl_to_local.keys() {
-        let mut page: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            pages += 1;
-            if pages > 20 {
-                break;
-            }
-            let mut url = Url::parse(&tasks_url(gl, None)).unwrap();
-            {
-                let mut qp = url.query_pairs_mut();
-                qp.append_pair("showCompleted", "true");
-                qp.append_pair("showHidden", "true");
-                qp.append_pair("maxResults", "100");
-                if let Some(t) = &page {
-                    qp.append_pair("pageToken", t);
-                }
-            }
-            let resp: TasksResp = google_get(&http, url.as_str(), &token).await?;
-            for gt in resp.items {
-                remote.push((gl.clone(), gt));
-            }
-            page = resp.next_page_token;
-            if page.is_none() {
-                break;
-            }
-        }
+        let tasks = google_pages::<GTask>(
+            &http, &token, &tasks_url(gl, None),
+            &[("showCompleted", "true"), ("showHidden", "true"), ("maxResults", "100")], 20,
+        ).await?;
+        remote.extend(tasks.into_iter().map(|task| (gl.clone(), task)));
+
     }
 
     // 3. Load local tasks.
@@ -1143,12 +1093,14 @@ pub async fn sync_tasks(
         }
     }
 
+    let synced_lists: HashSet<_> = gl_to_local.values().copied().collect();
+
     // 5. Orphans.
     for (i, local) in locals.iter().enumerate() {
         if seen.contains(&i) {
             continue;
         }
-        match reconcile_orphan(local.state, true) {
+        match reconcile_orphan(local.state, synced_lists.contains(&local.aux)) {
             OrphanAction::Noop => {}
             OrphanAction::DropLocal | OrphanAction::DeleteLocal => {
                 cal::sync_hard_delete(&pool, "tasks", "task_id", local.id).await?;
@@ -1170,4 +1122,39 @@ pub async fn sync_tasks(
     }
 
     Ok(Json(json!({ "pulled": pulled, "pushed": pushed, "deletedRemote": deleted_remote })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Router};
+
+    #[tokio::test]
+    async fn incomplete_google_pages_never_return_a_partial_snapshot() {
+        let app = Router::new().route(
+            "/fixture",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                assert_eq!(params.get("pageSize").map(String::as_str), Some("2"));
+                match params.get("pageToken").map(String::as_str) {
+                    None => Json(json!({ "connections": ["first"], "nextPageToken": "second+/=" })),
+                    Some("second+/=") => Json(json!({ "connections": ["last"] })),
+                    _ => panic!("Unexpected page token"),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/fixture", listener.local_addr().unwrap());
+        let server = tokio::spawn(async { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let parameters = [("pageSize", "2")];
+
+        let incomplete = google_pages::<String>(&client, "fixture", &endpoint, &parameters, 1).await;
+        assert!(incomplete.is_err());
+        let complete = google_pages::<String>(&client, "fixture", &endpoint, &parameters, 2)
+            .await
+            .unwrap();
+        assert_eq!(complete, ["first", "last"]);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 }

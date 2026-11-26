@@ -19,6 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
+    error::AppError,
     imap_session::{self, ImapState},
     mail_models::{
         merge_mailbox_label_into_preview, AdvancedSearchRequest, AdvancedSearchResponse,
@@ -30,6 +31,12 @@ pub struct MailAppState {
     pub _db: Arc<crate::db::AppState>,
     pub imap: Arc<ImapState>,
     pub sync_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+}
+
+impl MailAppState {
+    pub(crate) async fn account_sync_lock(&self, account_id: i64) -> Arc<Mutex<()>> {
+        self.sync_locks.lock().await.entry(account_id).or_default().clone()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -482,6 +489,7 @@ fn default_per_page() -> usize {
 pub struct MailContentQuery {
     #[serde(default = "default_inbox")]
     pub mailbox: String,
+    pub uid_validity: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -493,29 +501,30 @@ pub async fn get_mail_list(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
     Query(q): Query<MailListQuery>,
-) -> impl IntoResponse {
-    let (total, mut mails) = tokio::task::spawn_blocking({
-        let imap_state = state.imap.clone();
-        let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, q.page, q.per_page)
-    })
-    .await
-    .unwrap_or_default();
+) -> Result<Json<MailListResponse>, AppError> {
+    let sync_lock = state.account_sync_lock(account_id).await;
+    let _guard = sync_lock.lock().await;
+    let mailbox = crate::mail_models::mailbox_identity(&q.mailbox).to_string();
+    let imap_session::MailboxPage { generation, total, mut previews } =
+        tokio::task::spawn_blocking({
+            let imap_state = state.imap.clone();
+            let mailbox = mailbox.clone();
+            move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, q.page, q.per_page, None)
+        })
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .map_err(AppError::BadRequest)?;
 
-    mails
-        .iter_mut()
-        .for_each(|mail| merge_mailbox_label_into_preview(mail, &q.mailbox));
+    previews.iter_mut().for_each(|mail| merge_mailbox_label_into_preview(mail, &mailbox));
 
     if let Ok(pool) = crate::db::get_user_db_pool(&state._db, account_id).await {
-        for mail in &mails {
-            let _ = crate::offline_routes::cache_mail_preview(&pool, &q.mailbox, mail).await;
+        crate::offline_routes::record_mailbox_generation(&pool, &mailbox, generation).await?;
+        for mail in &previews {
+            let _ = crate::offline_routes::cache_mail_preview(&pool, &mailbox, mail).await;
         }
     }
 
-    Json(MailListResponse {
-        total_count: total,
-        mails,
-    })
+    Ok(Json(MailListResponse { total_count: total, mails: previews }))
 }
 
 pub async fn search_advanced(
@@ -587,7 +596,7 @@ pub async fn get_mail_content(
         let imap_state = state.imap.clone();
         let uid = uid.clone();
         let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_raw_with_validity(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_mail_raw_with_validity(&imap_state, account_id, &mailbox, &uid, q.uid_validity)
     })
     .await
     .ok()
@@ -655,7 +664,7 @@ pub async fn get_mail_raw(
         let imap_state = state.imap.clone();
         let uid = uid.clone();
         let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid, q.uid_validity)
     })
     .await
     .ok()
@@ -734,7 +743,7 @@ pub async fn get_reply_seed(
         let imap_state = state.imap.clone();
         let uid = uid.clone();
         let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid, q.uid_validity)
     })
     .await
     .ok()
@@ -760,7 +769,7 @@ pub async fn download_attachment(
         let imap_state = state.imap.clone();
         let uid = uid.clone();
         let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid, q.uid_validity)
     })
     .await
     .ok()

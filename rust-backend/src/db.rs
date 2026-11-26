@@ -1312,3 +1312,51 @@ pub async fn set_backend_pref(
     .await?;
     Ok(backend)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_sqlcipher_queue_keeps_unknown_uid_validity_after_reopening() {
+        let dir = std::env::temp_dir().join(format!("guvercin-legacy-db-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        struct ScratchDirectory(PathBuf);
+        impl Drop for ScratchDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _scratch = ScratchDirectory(dir.clone());
+        let path = dir.join("legacy.db");
+        let key = "01".repeat(32);
+
+        let pool = connect_sqlcipher(&path, &key).await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        for query in [
+            "ALTER TABLE offline_sync_queue DROP COLUMN uid_validity",
+            "ALTER TABLE local_mail_cache DROP COLUMN uid_validity",
+            "INSERT INTO offline_sync_queue (action_type, target_uid, target_folder) VALUES ('delete', '42', 'INBOX')",
+            "INSERT INTO local_mail_cache (uid, folder, plain_body) VALUES ('42', 'INBOX', 'Legacy body')",
+            "INSERT INTO sync_checkpoints (folder_path, last_synced_uid) VALUES ('INBOX', 900)",
+        ] {
+            sqlx::query(query).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        assert!(!is_plaintext_sqlite(&path).await);
+        let pool = connect_sqlcipher(&path, &key).await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        crate::offline_routes::record_mailbox_generation(&pool, "INBOX", 7).await.unwrap();
+        let queued: (Option<u32>, String) = sqlx::query_as("SELECT uid_validity, status FROM offline_sync_queue")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(queued, (None, "pending".into()));
+        let checkpoint: (u32, u32) = sqlx::query_as("SELECT last_synced_uid, last_uid_validity FROM sync_checkpoints")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(checkpoint, (0, 7));
+        let legacy_body: String = sqlx::query_scalar("SELECT plain_body FROM local_mail_cache")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(legacy_body, "Legacy body");
+        pool.close().await;
+    }
+}

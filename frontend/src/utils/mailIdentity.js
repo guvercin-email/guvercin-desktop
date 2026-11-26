@@ -14,7 +14,7 @@ export function dedupeMailboxes(mailboxes) {
 
 export function mailKey(mail, fallbackMailbox = 'INBOX') {
   if (mail?.id == null || mail.id === '') return ''
-  return JSON.stringify([mail.mailbox || fallbackMailbox || 'INBOX', String(mail.id)])
+  return JSON.stringify([mailboxIdentity(mail.mailbox || fallbackMailbox || 'INBOX'), String(mail.id), mail.uid_validity ?? 0])
 }
 
 export function sameMail(first, second, fallbackMailbox) {
@@ -24,8 +24,12 @@ export function sameMail(first, second, fallbackMailbox) {
 export async function queueMailActions(keys, queueAction, type, payload = {}) {
   const uniqueKeys = [...new Set(keys.filter(Boolean))]
   const results = await Promise.allSettled(uniqueKeys.map(async (key) => {
-    const [mailbox, uid] = JSON.parse(key)
-    await queueAction(type, uid, payload, mailbox)
+    const [mailbox, uid, uidValidity = 0] = JSON.parse(key)
+    await queueAction(type, uid, payload, mailbox, uidValidity)
   }))
   return uniqueKeys.filter((_, index) => results[index].status === 'rejected')
+}
+
+export function mailQuery(mailbox, uidValidity) {
+  return new URLSearchParams({ mailbox: mailbox || 'INBOX', uid_validity: String(uidValidity ?? 0) }).toString()
 }

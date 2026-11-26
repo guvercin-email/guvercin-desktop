@@ -60,7 +60,7 @@ import { subscribeMailto, requestNewCompose } from '../utils/mailtoInbox.js'
 import { subscribeNavigate, requestNewEvent, requestNewTask } from '../utils/crossLinks.js'
 import { subscribeEml } from '../utils/emlInbox.js'
 import { notifyNewMail, setUnreadBadge, subscribeNotificationOpen, dismissNotificationForMail } from '../utils/notifications.js'
-import { dedupeMailboxes, mailboxIdentity, mailKey, sameMail, queueMailActions } from '../utils/mailIdentity.js'
+import { dedupeMailboxes, mailboxIdentity, mailKey, mailQuery, sameMail, queueMailActions } from '../utils/mailIdentity.js'
 import { getNotificationSettings, shouldNotifyForMail } from '../utils/notificationSettings.js'
 import {
     isDefaultMailClient,
@@ -382,11 +382,11 @@ function formatBytes(bytes) {
     return `${bytes.toFixed(1)} ${units[index]}`
 }
 
-function attachmentUrl(accountId, uid, attachmentId, mailbox, online) {
+function attachmentUrl(accountId, uid, attachmentId, mailbox, online, uidValidity) {
     const path = online
         ? `/api/mail/${accountId}/content/${encodeURIComponent(uid)}/attachments/${attachmentId}`
         : `/api/offline/${accountId}/local-content/${encodeURIComponent(uid)}/attachments/${attachmentId}`
-    return apiUrl(`${path}?mailbox=${encodeURIComponent(mailbox)}`)
+    return apiUrl(`${path}?${mailQuery(mailbox, uidValidity)}`)
 }
 
 function systemHour12Preference() {
@@ -490,8 +490,8 @@ function isMoveTargetMailbox(value) {
     return !isLabelMailbox(mailbox)
 }
 
-async function fetchMessageContent(accountId, mailId, mailbox, canUseRemoteMail, signal) {
-    const query = `${encodeURIComponent(mailId)}?mailbox=${encodeURIComponent(mailbox)}`
+async function fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail, signal) {
+    const query = `${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`
     const options = { cache: 'no-store', signal }
     let response = await fetch(apiUrl(`/api/offline/${accountId}/local-content/${query}`), options)
     if (!response.ok && canUseRemoteMail) {
@@ -1343,6 +1343,8 @@ const DashboardPage = () => {
     const remoteMailAvailableRef = useRef(false)
     const mailsRef = useRef(mails)
     const mailLoadRequestIdRef = useRef(0)
+    const cacheListRequestIdRef = useRef(0)
+    const searchNetworkOnlineRef = useRef(networkOnline)
     const searchRequestRef = useRef(null)
     const activeSearchRef = useRef(activeSearch)
 
@@ -1816,7 +1818,8 @@ const DashboardPage = () => {
         if (listModeRef.current === 'search') return 0
         if (!accountId) return 0
         const mailbox = (folder || '').toString()
-        if (!mailbox) return 0
+        if (!mailbox || mailboxIdentity(mailbox) !== mailboxIdentity(selectedFolderRef.current)) return 0
+        const requestId = ++cacheListRequestIdRef.current
         try {
             const pageSize = 250
             const allMails = []
@@ -1827,14 +1830,14 @@ const DashboardPage = () => {
                     apiUrl(`/api/offline/${accountId}/local-list?mailbox=${encodeURIComponent(mailbox)}&page=${nextPage}&per_page=${pageSize}`),
                     { cache: 'no-store' },
                 )
-                if (!res.ok) break
+                if (!res.ok || requestId !== cacheListRequestIdRef.current) return 0
 
                 const data = await res.json()
                 const chunk = Array.isArray(data.mails) ? data.mails : []
                 const chunkWithMailbox = chunk.map(m => ({ ...m, mailbox }))
                 allMails.push(...chunkWithMailbox)
                 
-                if (chunk.length < pageSize) break
+                if (chunk.length < pageSize || (Number.isInteger(data.total_count) && allMails.length >= data.total_count)) break
                 nextPage++
             }
             
@@ -1842,7 +1845,8 @@ const DashboardPage = () => {
             const currentSelectedFolder = selectedFolderRef.current
 
             if (
-                currentAccountId === accountId
+                requestId === cacheListRequestIdRef.current
+                && currentAccountId === accountId
                 && listModeRef.current !== 'search'
                 && currentSelectedFolder
                 && mailboxIdentity(currentSelectedFolder) === mailboxIdentity(mailbox)
@@ -2165,6 +2169,12 @@ const DashboardPage = () => {
         setSelectedFolder(backFolder)
     }, [exitSearchMode, selectedFolder])
 
+    useEffect(() => {
+        if (searchNetworkOnlineRef.current === networkOnline) return
+        searchNetworkOnlineRef.current = networkOnline
+        if (searchRequestRef.current) clearAdvancedSearch()
+    }, [clearAdvancedSearch, networkOnline])
+
     const handleSelectFolder = useCallback((folder) => {
         const nextFolder = (folder || '').toString()
         if (!nextFolder) return
@@ -2172,6 +2182,7 @@ const DashboardPage = () => {
             exitSearchMode()
         }
         if (nextFolder !== selectedFolderRef.current) {
+            cacheListRequestIdRef.current += 1
             selectedFolderRef.current = nextFolder
             setSelectedMail(null)
             setMailContent(null)
@@ -2247,6 +2258,7 @@ const DashboardPage = () => {
         searchRequestRef.current = controller
         const { signal } = controller
         mailLoadRequestIdRef.current += 1
+        cacheListRequestIdRef.current += 1
         listModeRef.current = 'search'
 
         setActiveSection('mail')
@@ -2339,12 +2351,12 @@ const DashboardPage = () => {
     }
 
     const prefetchInlineAssets = useCallback(
-        async (uid, mailbox) => {
+        async (uid, mailbox, uidValidity) => {
             if (!accountId || !backendReachable || !networkOnline) return null
             try {
                 const res = await fetch(
                     apiUrl(
-                        `/api/offline/${accountId}/local-content/${uid}/prefetch-inline?mailbox=${encodeURIComponent(mailbox)}`,
+                        `/api/offline/${accountId}/local-content/${encodeURIComponent(uid)}/prefetch-inline?${mailQuery(mailbox, uidValidity)}`,
                     ),
                     { method: 'POST', cache: 'no-store' },
                 )
@@ -2379,11 +2391,11 @@ const DashboardPage = () => {
         previewRequestRef.current = controller
         const { signal } = controller
         try {
-            const data = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail, signal)
+            const data = await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail, signal)
             if (!data || signal.aborted) return
             setMailContent(data)
 
-            void prefetchInlineAssets(mail.id, mailbox).then((html) => {
+            void prefetchInlineAssets(mail.id, mailbox, mail.uid_validity).then((html) => {
                 if (html && !signal.aborted) {
                     setMailContent((prev) => (prev ? { ...prev, html_body: html } : prev))
                 }
@@ -2399,8 +2411,6 @@ const DashboardPage = () => {
     const queueAction = useCallback(async (actionType, targetUid, payload = {}, targetFolderOverride = null, uidValidity) => {
         if (!accountId || !backendReachable) throw new Error('Mail service is unavailable.')
         const mailbox = targetFolderOverride || selectedFolder || 'INBOX'
-        const targetKey = mailKey({ id: targetUid, mailbox })
-        const target = targetKey && mailsRef.current.find((mail) => mailKey(mail, selectedFolder) === targetKey)
         const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2408,7 +2418,7 @@ const DashboardPage = () => {
                 action_type: actionType,
                 target_uid: targetUid || null,
                 target_folder: mailbox,
-                uid_validity: uidValidity ?? (target ? target.uid_validity ?? 0 : undefined),
+                uid_validity: uidValidity,
                 payload,
             }),
         })
@@ -2483,21 +2493,15 @@ const DashboardPage = () => {
             (sourceMode !== 'search' || activeSearchRef.current === sourceSearch)
         )
         const affectedMails = mails.filter((mail) => affected.has(mailKey(mail, sourceFolder)))
-        const activeMail = tabs.find((tab) => tab.id === activeTabId)?.mail || selectedMail
-        const validityByKey = new Map(affectedMails.map((mail) => [mailKey(mail, sourceFolder), mail.uid_validity ?? 0]))
-        if (activeMail) validityByKey.set(mailKey(activeMail, sourceFolder), activeMail.uid_validity ?? 0)
-        const queueFromSnapshot = (action, uid, payload, mailbox) => queueAction(
-            action, uid, payload, mailbox, validityByKey.get(mailKey({ id: uid, mailbox })),
-        )
         const restoreRows = (restoreKeys) => {
             if (!inSourceView()) return
             const restoring = new Set(restoreKeys)
             setMails((prev) => {
-                const existing = new Set(prev.map((mail) => mailKey(mail, sourceFolder)))
-                return [...prev, ...affectedMails.filter((mail) => {
-                    const key = mailKey(mail, sourceFolder)
-                    return restoring.has(key) && !existing.has(key)
-                })]
+                const identityWithoutGeneration = (mail) => mailKey({ ...mail, uid_validity: 0 }, sourceFolder)
+                const existing = new Set(prev.map(identityWithoutGeneration))
+                return [...prev, ...affectedMails.filter((mail) => (
+                    restoring.has(mailKey(mail, sourceFolder)) && !existing.has(identityWithoutGeneration(mail))
+                ))]
             })
         }
         const count = affected.size
@@ -2514,7 +2518,7 @@ const DashboardPage = () => {
             },
             undo: () => restoreRows(affected),
             commit: async () => {
-                const failed = await queueMailActions([...affected], queueFromSnapshot, destination ? 'move' : 'delete', destination ? { destination } : {})
+                const failed = await queueMailActions([...affected], queueAction, destination ? 'move' : 'delete', destination ? { destination } : {})
                 if (failed.length > 0) {
                     restoreRows(failed)
                     window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
@@ -2529,7 +2533,8 @@ const DashboardPage = () => {
     }
 
     const setMailsSeenState = useCallback(async (keys, seen, uidValidity) => {
-        const action = (type, uid, payload, mailbox) => queueAction(type, uid, payload, mailbox, uidValidity)
+        const action = (type, uid, payload, mailbox, generation) =>
+            queueAction(type, uid, payload, mailbox, uidValidity ?? generation)
         const failed = await queueMailActions(keys, action, seen ? 'mark_read' : 'mark_unread')
         if (accountIdRef.current !== accountId) return
         const successful = new Set(keys.filter((key) => !failed.includes(key)))
@@ -2642,12 +2647,16 @@ const DashboardPage = () => {
 
     const saveComposeDraft = useCallback(async (composed) => {
         const payload = buildDraftSavePayload(composed, email || accountEmailLabel)
-        const response = await queueAction('save_draft', payload.draft_id, payload, 'Drafts')
+        const response = await queueAction('save_draft', payload.draft_id, payload, composed.draftMailbox || 'Drafts', composed.draftUidValidity)
         await loadFolders()
         if (mailboxRoles[selectedFolder] === 'drafts' || folderInfo(selectedFolder || '').label === 'Drafts') {
             await loadMailsFromCache(selectedFolder || 'Drafts', 1, perPage)
         }
-        return response?.draft_id || payload.draft_id || null
+        return response?.draft_id ? {
+            draftId: response.draft_id,
+            draftMailbox: response.draft_mailbox,
+            draftUidValidity: response.draft_uid_validity,
+        } : null
     }, [accountEmailLabel, email, loadFolders, loadMailsFromCache, mailboxRoles, perPage, queueAction, selectedFolder])
 
     const detachMailToWindow = async () => {
@@ -2680,7 +2689,7 @@ const DashboardPage = () => {
         try {
 
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            const content = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+            const content = await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail)
 
             nextMailWindowId.current += 1
             const mailWindowLabel = `mail-${nextMailWindowId.current}`
@@ -3839,9 +3848,9 @@ function MailSection({
         if (!mail || !accountId || !backendReachable) return null
         try {
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            let data = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+            let data = await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail)
             if (!data) return null
-            const html = await prefetchInlineAssets(mail.id, mailbox)
+            const html = await prefetchInlineAssets(mail.id, mailbox, mail.uid_validity)
             if (html) data = { ...data, html_body: html }
             return data
         } catch {
@@ -3992,7 +4001,7 @@ function MailSection({
 
         try {
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            return await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+            return await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail)
         } catch {
             return null
         }
@@ -4003,12 +4012,12 @@ function MailSection({
         const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
         const candidates = canUseRemoteMail
             ? [
-                `/api/mail/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
-                `/api/offline/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
+                `/api/mail/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
+                `/api/offline/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
             ]
             : [
-                `/api/offline/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
-                `/api/mail/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
+                `/api/offline/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
+                `/api/mail/${accountId}/reply-seed/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
             ]
 
         for (const endpoint of candidates) {
@@ -4025,6 +4034,8 @@ function MailSection({
 
     const hydrateComposeDraftFromSavedMail = useCallback((mail, content) => createEmptyComposeDraft({
         draftId: content?.id || mail?.id,
+        draftMailbox: mail?.mailbox || selectedFolder,
+        draftUidValidity: mail?.uid_validity,
         source: 'draft',
         composeSurface: 'inline',
         from: content?.from_address || accountEmail || '',
@@ -4049,7 +4060,7 @@ function MailSection({
             : [],
         showCc: !!(content?.cc || '').trim(),
         showBcc: !!(content?.bcc || '').trim(),
-    }), [accountEmail, createEmptyComposeDraft])
+    }), [accountEmail, createEmptyComposeDraft, selectedFolder])
 
     const closeComposeTab = useCallback((tabId) => {
         setTabs((prev) => prev.filter((tab) => tab.id !== tabId))
@@ -4376,11 +4387,11 @@ function MailSection({
         }
 
         enqueueUndoableAction({
-            label: `Mail will be sent in ${undoSeconds} second${undoSeconds === 1 ? '' : 's'}`,
+            label: t('Mail will be sent in {{count}} seconds.', { count: undoSeconds }),
             variant: 'warning',
             durationMs: undoSeconds * 1000,
-            commitLabel: 'Send now',
-            undoLabel: 'Undo',
+            commitLabel: t('Send now'),
+            undoLabel: t('Undo'),
             apply: () => {
                 closeComposeTarget(target)
                 onAfterClose?.()
@@ -4400,7 +4411,7 @@ function MailSection({
             },
         })
         return true
-    }, [accountEmail, accountId, closeComposeTarget, enqueueUndoableAction, restoreComposeTarget, sendComposedMail])
+    }, [accountEmail, accountId, closeComposeTarget, enqueueUndoableAction, restoreComposeTarget, sendComposedMail, t])
 
     const requestComposeExit = useCallback(({ target, draft, intent = 'discard', pendingMail = null, baselineDraft = null }) => {
         const hasMeaningfulChanges = baselineDraft
@@ -4557,12 +4568,12 @@ function MailSection({
         const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
         const candidates = canUseRemoteMail
             ? [
-                `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
-                `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
+                `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
+                `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
             ]
             : [
-                `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
-                `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(mailbox)}`,
+                `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
+                `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?${mailQuery(mailbox, mail.uid_validity)}`,
             ]
 
         for (const endpoint of candidates) {
@@ -5284,14 +5295,14 @@ function MailSection({
 
         let content = null
         try {
-            content = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+            content = await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail)
         } catch (error) {
             console.error('Failed to load tab message:', error)
         }
         if (!pendingTabLoadsRef.current.delete(tabId)) return
         setTabContents((prev) => ({ ...prev, [tabId]: content }))
         if (!content) return
-        void prefetchInlineAssets(mail.id, mailbox).then((html) => {
+        void prefetchInlineAssets(mail.id, mailbox, mail.uid_validity).then((html) => {
             if (!html) return
             setTabContents((prev) => prev[tabId] === content
                 ? { ...prev, [tabId]: { ...content, html_body: html } }
@@ -6119,6 +6130,7 @@ function MailSection({
                     || ''
                 return {
                     uid: mail.id,
+                    uidValidity: mail.uid_validity,
                     mailbox,
                     subject: content?.subject || mail.subject || '',
                     address: replyTo,
@@ -6179,7 +6191,7 @@ function MailSection({
             format: 'plain',
             htmlBody: '',
             extraHeaders: headers,
-            replyContext: { uid: mail.id, mailbox: mail?.mailbox || selectedFolder || 'INBOX' },
+            replyContext: { uid: mail.id, uidValidity: mail.uid_validity, mailbox: mail?.mailbox || selectedFolder || 'INBOX' },
         }, 'reply')
     }
 
@@ -6197,6 +6209,7 @@ function MailSection({
             : `${mail?.address || ''}`.trim()
         const forwardTargets = [{
             uid,
+            uidValidity: mail.uid_validity,
             mailbox,
             from,
             subject: mail?.subject || '',
@@ -6503,24 +6516,28 @@ function MailSection({
 
         const sessionId = inlineComposeSession.id
         let lastSavedDraft = inlineComposeSession.baselineDraft || null
+        let saving = false
 
         const timer = window.setInterval(async () => {
             const session = inlineComposeSessionRef.current
-            if (!session || session.id !== sessionId) return
+            if (!session || session.id !== sessionId || saving) return
             const draft = session.draft
             const changedFromBaseline = session.baselineDraft
                 ? isComposeDraftModified(draft, session.baselineDraft)
                 : isComposeDraftDirty(draft)
             if (!changedFromBaseline) return
             if (lastSavedDraft && !isComposeDraftModified(draft, lastSavedDraft)) return
+            saving = true
             try {
-                const draftId = await saveComposeDraft(draft)
+                const savedIdentity = await saveComposeDraft(draft)
                 lastSavedDraft = draft
-                if (draftId && !draft.draftId) {
-                    updateInlineComposeDraft((prev) => ({ ...prev, draftId }))
+                if (savedIdentity && inlineComposeSessionRef.current?.id === sessionId) {
+                    updateInlineComposeDraft((prev) => ({ ...prev, ...savedIdentity }))
                 }
             } catch (error) {
                 console.error('Auto-save draft failed:', error)
+            } finally {
+                saving = false
             }
         }, seconds * 1000)
 
@@ -7136,7 +7153,7 @@ function MailSection({
                                                 ) : (
                                                     <a
                                                         className="db-attachments__link"
-                                                        href={attachmentUrl(accountId, activeTabContent.id, at.id, activeTab.mailbox, canUseRemoteMail)}
+                                                        href={attachmentUrl(accountId, activeTabContent.id, at.id, activeTab.mailbox, canUseRemoteMail, activeTab.mail?.uid_validity)}
                                                         download={at.filename}
                                                     >Download</a>
                                                 )}
@@ -8348,7 +8365,7 @@ function MailSection({
                                                                         </div>
                                                                         <a
                                                                             className="db-attachments__link"
-                                                                            href={attachmentUrl(accountId, mailContent.id, at.id, selectedMail?.mailbox || selectedFolder || 'INBOX', canUseRemoteMail)}
+                                                                            href={attachmentUrl(accountId, mailContent.id, at.id, selectedMail?.mailbox || selectedFolder || 'INBOX', canUseRemoteMail, selectedMail?.uid_validity)}
                                                                             download={at.filename}
                                                                         >
                                                                             Download

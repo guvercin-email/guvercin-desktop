@@ -93,7 +93,7 @@ export async function queueComposeSend({
       payload.headers = headers
       payload.post_send = { mark_answered: { uid: target.uid, mailbox: target.mailbox } }
 
-      await queueAction('send', null, payload, null)
+      await queueAction('send', null, payload, null, target.uidValidity ?? 0)
     }
 
     return true
@@ -125,7 +125,7 @@ export async function queueComposeSend({
     }
 
     const target = normalized.forwardTargets[0]
-    await queueAction('forward', target.uid, forwardPayload, target.mailbox)
+    await queueAction('forward', target.uid, forwardPayload, target.mailbox, target.uidValidity ?? 0)
     return true
   }
 
@@ -141,6 +141,6 @@ export async function queueComposeSend({
     payload.post_send = { mark_answered: { uid: normalized.replyContext.uid, mailbox: normalized.replyContext.mailbox } }
   }
 
-  await queueAction('send', null, payload, null)
+  await queueAction('send', null, payload, null, normalized.replyContext?.uidValidity)
   return true
 }

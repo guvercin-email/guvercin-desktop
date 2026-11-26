@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { apiUrl } from '../utils/api'
+import { mailQuery } from '../utils/mailIdentity.js'
+import { getUIPreferences } from '../utils/uiPreferences.js'
 import { normalizeMailboxResponse } from '../utils/mailboxes'
 import ExternalLinkPrompt from '../components/ExternalLinkPrompt.jsx'
 import MailHeadersPanel from '../components/MailHeadersPanel.jsx'
@@ -255,19 +257,29 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     })
   }, [])
 
-  const queueAction = useCallback(async (actionType, payload = {}) => {
-    if (!accountId || !mail?.id) return
-    await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action_type: actionType,
-        target_uid: mail.id,
-        target_folder: mailbox || 'INBOX',
-        payload,
-      }),
-    })
-  }, [accountId, mail?.id, mailbox])
+  const readHandledRef = useRef(false)
+  const { markAsReadDelaySeconds } = getUIPreferences(accountId)
+  const queueAction = useCallback(async (actionType, payload = {}, showError = true) => {
+    if (!accountId || !mail?.id) return false
+    try {
+      const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action_type: actionType,
+          target_uid: mail.id,
+          target_folder: mailbox || 'INBOX',
+          uid_validity: mail.uid_validity ?? 0,
+          payload,
+        }),
+      })
+      if (response.ok) return true
+    } catch {
+      // Keep the current message visible if the action could not be queued.
+    }
+    if (showError) window.alert(t('Could not queue {{count}} message actions.', { count: 1 }))
+    return false
+  }, [accountId, mail?.id, mail?.uid_validity, mailbox, t])
 
   useEffect(() => {
     document.body.style.padding = '0'
@@ -327,7 +339,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     }, 20000)
     setLoading(true)
     setError('')
-    const mailboxParam = mailbox ? `?mailbox=${encodeURIComponent(mailbox)}` : ''
+    const mailboxParam = `?${mailQuery(mailbox, mail.uid_validity)}`
     const fetchContent = async () => {
       const primaryPath = preferOffline
         ? `/api/offline/${accountId}/local-content/${mail.id}${mailboxParam}`
@@ -408,9 +420,14 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
   }, [accountId])
 
   useEffect(() => {
-    if (!mail?.id || mail.seen === true || loading) return
-    queueAction('mark_read').then(() => patchMail({ seen: true })).catch(() => {})
-  }, [loading, mail?.id, mail?.seen, patchMail, queueAction])
+    if (isImported || !mailContent || mail?.seen === true || loading || readHandledRef.current) return
+    const timer = window.setTimeout(async () => {
+      if (readHandledRef.current) return
+      readHandledRef.current = true
+      if (await queueAction('mark_read', {}, false)) patchMail({ seen: true })
+    }, markAsReadDelaySeconds * 1000)
+    return () => window.clearTimeout(timer)
+  }, [isImported, loading, mail?.seen, mailContent, markAsReadDelaySeconds, patchMail, queueAction])
 
   useEffect(() => {
     if (!isMoveMenuOpen) {
@@ -491,12 +508,12 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     const safeMailbox = mailbox || 'INBOX'
     const candidates = preferOffline
       ? [
-        `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(safeMailbox)}`,
-        `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(safeMailbox)}`,
+        `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?${mailQuery(safeMailbox, mail?.uid_validity)}`,
+        `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?${mailQuery(safeMailbox, mail?.uid_validity)}`,
       ]
       : [
-        `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(safeMailbox)}`,
-        `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?mailbox=${encodeURIComponent(safeMailbox)}`,
+        `/api/mail/${accountId}/raw/${encodeURIComponent(mail.id)}?${mailQuery(safeMailbox, mail?.uid_validity)}`,
+        `/api/offline/${accountId}/local-raw/${encodeURIComponent(mail.id)}?${mailQuery(safeMailbox, mail?.uid_validity)}`,
       ]
 
     for (const endpoint of candidates) {
@@ -509,7 +526,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
       }
     }
     return null
-  }, [accountId, isImported, mail?.id, mailbox, preferOffline])
+  }, [accountId, isImported, mail?.id, mail?.uid_validity, mailbox, preferOffline])
 
   const openHeadersPanel = useCallback(async () => {
     if (!mail) return
@@ -585,8 +602,8 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     const path = preferOffline
       ? `/api/offline/${accountId}/local-content/${encodeURIComponent(uid)}/attachments/${attachmentId}`
       : `/api/mail/${accountId}/content/${encodeURIComponent(uid)}/attachments/${attachmentId}`
-    return apiUrl(`${path}?mailbox=${encodeURIComponent(safeMailbox)}`)
-  }, [accountId, mailbox, preferOffline])
+    return apiUrl(`${path}?${mailQuery(safeMailbox, mail?.uid_validity)}`)
+  }, [accountId, mail?.uid_validity, mailbox, preferOffline])
 
   const buildQuotedBody = () => {
     const body = mailContent?.plain_body || '(No content)'
@@ -602,14 +619,12 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
 
   const handleDelete = async () => {
     if (isImported) return
-    await queueAction('delete')
-    closeWindow()
+    if (await queueAction('delete')) closeWindow()
   }
 
   const handleMove = async (destination) => {
     if (isImported) return
-    await queueAction('move', { destination })
-    closeWindow()
+    if (await queueAction('move', { destination })) closeWindow()
   }
 
   const handleReply = () => {
@@ -635,21 +650,19 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     const current = Array.isArray(mail?.labels) ? mail.labels : []
     const input = window.prompt('Labels (comma separated)', current.join(', '))
     if (!input) return
-    const labels = input.split(',').map((s) => s.trim()).filter(Boolean)
-    if (labels.length === 0) return
-    try {
-      await queueAction('label', { labels })
-      patchMail({ labels: Array.from(new Set([...(current || []), ...labels])) })
-    } catch {
-      // ignore
+    const labels = [...current]
+    for (const label of input.split(',').map((value) => value.trim()).filter(Boolean)) {
+      if (labels.some((value) => value.toLowerCase() === label.toLowerCase())) continue
+      if (await queueAction('label_add', { label })) labels.push(label)
     }
+    patchMail({ labels })
   }
 
   const handleReadToggle = async () => {
     if (isImported) return
     const nextSeen = mail?.seen !== true
-    await queueAction(nextSeen ? 'mark_read' : 'mark_unread')
-    patchMail({ seen: nextSeen })
+    readHandledRef.current = true
+    if (await queueAction(nextSeen ? 'mark_read' : 'mark_unread')) patchMail({ seen: nextSeen })
   }
 
   const handleCreateFolderAndMove = async () => {

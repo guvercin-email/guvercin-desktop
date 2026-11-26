@@ -76,8 +76,9 @@ pub fn reconcile_matched(local: LocalState, remote_ms: i64) -> MatchAction {
 /// windowed calendar pull, false rows are left untouched).
 pub fn reconcile_orphan(local: LocalState, in_scope: bool) -> OrphanAction {
     if local.deleted {
-        // Tombstone with the remote already gone (or never pushed): just drop it.
-        return OrphanAction::DropLocal;
+        // An out-of-scope remote item may still exist. Keep its tombstone
+        // until the sync can verify the deletion.
+        return if local.has_remote_id && !in_scope { OrphanAction::Noop } else { OrphanAction::DropLocal };
     }
     if !local.has_remote_id {
         // Locally created — push it regardless of window.
@@ -147,6 +148,12 @@ mod tests {
     fn orphan_tombstone_drops() {
         assert_eq!(reconcile_orphan(st(false, true, true, 100, 100), true), OrphanAction::DropLocal);
         assert_eq!(reconcile_orphan(st(false, true, false, 0, 100), true), OrphanAction::DropLocal);
+    }
+
+    #[test]
+    fn orphan_out_of_scope_preserves_a_remote_tombstone() {
+        assert_eq!(reconcile_orphan(st(true, true, true, 100, 200), false), OrphanAction::Noop);
+        assert_eq!(reconcile_orphan(st(true, true, false, 0, 200), false), OrphanAction::DropLocal);
     }
 
     #[test]

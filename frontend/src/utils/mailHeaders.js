@@ -1,3 +1,5 @@
+import { mailKey } from './mailIdentity.js'
+
 export function extractRfc822Headers(rawText) {
   const text = `${rawText || ''}`.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   if (!text.trim()) return ''
@@ -46,8 +48,7 @@ export function buildHeaderFallback(mail, content, formatDate = (value) => value
 }
 
 export function mailHeadersKey(mail, mailbox) {
-  if (!mail?.id) return ''
-  return `${mailbox || mail?.mailbox || 'INBOX'}:${mail.id}`
+  return mailKey(mail && { ...mail, mailbox: mailbox || mail.mailbox })
 }
 
 function sanitizeFilePart(value) {

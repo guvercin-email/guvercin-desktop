@@ -293,6 +293,8 @@ pub struct OfflineActionResponse {
     pub status: &'static str,
     pub queued_id: i64,
     pub draft_id: Option<String>,
+    pub draft_mailbox: Option<String>,
+    pub draft_uid_validity: Option<u32>,
 }
 
 #[derive(Serialize)]

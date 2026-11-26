@@ -63,6 +63,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     const [exitPromptOpen, setExitPromptOpen] = useState(false)
     const [actionBusy, setActionBusy] = useState(false)
     const sendTimeoutRef = useRef(null)
+    const sendInFlightRef = useRef(false)
 
     const allowCloseRef = useRef(false)
     const dataRef = useRef(data)
@@ -257,7 +258,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         window.close()
     }, [windowLabel])
 
-    const queueOfflineAction = useCallback(async (actionType, payload, targetUid = null, targetFolder = null) => {
+    const queueOfflineAction = useCallback(async (actionType, payload, targetUid = null, targetFolder = null, uidValidity) => {
         if (!accountId) return null
         const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
             method: 'POST',
@@ -266,6 +267,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 action_type: actionType,
                 target_uid: targetUid,
                 target_folder: targetFolder,
+                uid_validity: uidValidity,
                 payload,
             }),
         })
@@ -279,14 +281,18 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }, [accountId])
 
     const handleSendNow = useCallback(async (composed) => {
-        if (!accountId) return
+        if (!accountId || sendInFlightRef.current || sentRef.current) return false
+        sendInFlightRef.current = true
+        window.clearTimeout(sendTimeoutRef.current)
+        sendTimeoutRef.current = null
+        setPendingSend(null)
+        setSending(true)
         try {
-            setSending(true)
             const ok = await queueComposeSend({
                 draft: composed,
                 accountEmail,
-                queueAction: (actionType, targetUid, payload, targetFolder) => (
-                    queueOfflineAction(actionType, payload, targetUid, targetFolder)
+                queueAction: (actionType, targetUid, payload, targetFolder, uidValidity) => (
+                    queueOfflineAction(actionType, payload, targetUid, targetFolder, uidValidity)
                 ),
                 confirm: async (normalized, context = {}) => {
                     if (context?.type === 'forward_many') {
@@ -301,7 +307,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
             })
             if (!ok) return false
 
-            setPendingSend(null)
+            sentRef.current = true
             setSent(true)
             try { localStorage.removeItem(recoveryKey) } catch { /* ignore */ }
             setTimeout(() => closeWindow(), 1500)
@@ -311,13 +317,14 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
             window.alert('Failed to send email: ' + (error?.message || 'Unknown error'))
             return false
         } finally {
+            sendInFlightRef.current = false
             setSending(false)
         }
     }, [accountId, accountEmail, closeWindow, queueOfflineAction, recoveryKey])
 
     const handleSaveDraft = useCallback(async (composed) => {
         const payload = buildDraftSavePayload(composed, accountEmail)
-        const response = await queueOfflineAction('save_draft', payload, payload.draft_id, 'Drafts')
+        const response = await queueOfflineAction('save_draft', payload, payload.draft_id, composed.draftMailbox || 'Drafts', composed.draftUidValidity)
         return response?.draft_id || payload.draft_id || null
     }, [accountEmail, queueOfflineAction])
 
@@ -330,6 +337,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }, [])
 
     const startDelayedSend = useCallback((composed) => {
+        if (sendTimeoutRef.current || sendInFlightRef.current || sentRef.current) return false
         try {
             const normalized = normalizeComposeDraft(composed)
             const hasBulkReplyTargets = Array.isArray(normalized?.bulkReplyTargets) && normalized.bulkReplyTargets.length > 0
@@ -399,10 +407,6 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 return
             }
 
-            if (action === 'send') {
-                await handleSendNow(draft)
-                return
-            }
             if (action === 'discard') {
                 try { localStorage.removeItem(recoveryKey) } catch { /* ignore */ }
                 await closeWindow()
@@ -420,7 +424,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         } finally {
             setActionBusy(false)
         }
-    }, [closeWindow, draft, handleSaveDraft, handleSendNow, recoveryKey, startDelayedSend])
+    }, [closeWindow, draft, handleSaveDraft, recoveryKey, startDelayedSend])
 
     if (sent) {
         return (
@@ -448,6 +452,12 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
         )
     }
 
+    const countdown = pendingSend
+        ? t('Mail will be sent in {{count}} seconds.', {
+            count: Math.max(0, Math.ceil((pendingSend.expiresAt - noticeNow) / 1000)),
+        })
+        : ''
+
     return (
         <ComposeEditorProvider>
         <div className="dashboard-page" style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
@@ -463,7 +473,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                     <div className="db-section-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <div className="db-empty-state">
                             <div className="db-empty-icon">✉️</div>
-                        <div className="db-empty-text">{t('Mail will be sent in {{count}} seconds.', { count: Math.max(0, Math.ceil((pendingSend.expiresAt - noticeNow) / 1000)) })}</div>
+                            <div className="db-empty-text">{countdown}</div>
                         </div>
                     </div>
                 ) : (
@@ -483,13 +493,13 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 <div className="db-action-notices" aria-live="polite">
                     <div className="db-action-notice db-action-notice--warning">
                         <div className="db-action-notice__body">
-                            <span className="db-action-notice__text">Mail will be sent in 10 seconds</span>
+                            <span className="db-action-notice__text">{countdown}</span>
                             <div className="db-action-notice__actions">
                                 <button type="button" className="db-action-notice__commit" onClick={() => handleSendNow(pendingSend.draft)}>
-                                    Send now
+                                    {t('Send now')}
                                 </button>
                                 <button type="button" className="db-action-notice__undo" onClick={clearPendingSend}>
-                                    Undo
+                                    {t('Undo')}
                                 </button>
                             </div>
                         </div>

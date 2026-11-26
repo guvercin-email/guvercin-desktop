@@ -425,9 +425,19 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
-        for (final_reply, expected_uncertainty) in [
-            (Some("451 try again later\r\n"), false),
-            (None, true),
+        #[derive(Clone, Copy)]
+        enum SmtpOutcome {
+            RejectAuthentication,
+            DropBeforeData,
+            AfterData(Option<&'static str>),
+        }
+
+        for (outcome, expected_uncertainty, expected_messages) in [
+            (SmtpOutcome::RejectAuthentication, false, 0),
+            (SmtpOutcome::DropBeforeData, true, 0),
+            (SmtpOutcome::AfterData(Some("451 try again later\r\n")), false, 1),
+            (SmtpOutcome::AfterData(Some("550 message rejected\r\n")), false, 1),
+            (SmtpOutcome::AfterData(None), true, 1),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -440,8 +450,15 @@ mod tests {
                     let response = if line.starts_with("EHLO ") {
                         "250-localhost\r\n250 AUTH PLAIN\r\n"
                     } else if line.starts_with("AUTH PLAIN ") {
+                        if matches!(outcome, SmtpOutcome::RejectAuthentication) {
+                            writer.write_all(b"535 invalid credentials\r\n").await.unwrap();
+                            return 0;
+                        }
                         "235 authenticated\r\n"
                     } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                        if matches!(outcome, SmtpOutcome::DropBeforeData) {
+                            return 0;
+                        }
                         "250 OK\r\n"
                     } else if line == "DATA" {
                         writer.write_all(b"354 send data\r\n").await.unwrap();
@@ -451,10 +468,10 @@ mod tests {
                                 break;
                             }
                         }
-                        if let Some(reply) = final_reply {
+                        if let SmtpOutcome::AfterData(Some(reply)) = outcome {
                             writer.write_all(reply.as_bytes()).await.unwrap();
                         }
-                        return;
+                        return 1;
                     } else {
                         panic!("Unexpected SMTP command");
                     };
@@ -482,7 +499,7 @@ mod tests {
                 result.expect_err("delivery error").delivery_uncertain,
                 expected_uncertainty,
             );
-            server.await.unwrap();
+            assert_eq!(server.await.unwrap(), expected_messages);
         }
     }
 

@@ -114,10 +114,15 @@ export function normalizeComposeDraft(draft = {}) {
     return ''
   }
 
+  const normalizedValidity = (value) => Number.isInteger(value) && value > 0
+    ? { uidValidity: value }
+    : {}
+
   const rawForwardTargets = Array.isArray(draft?.forwardTargets)
     ? draft.forwardTargets
       .map((target) => ({
         uid: normalizeUid(target?.uid),
+        ...normalizedValidity(target?.uidValidity),
         mailbox: typeof target?.mailbox === 'string' ? target.mailbox.trim() : '',
         from: typeof target?.from === 'string' ? target.from : '',
         subject: typeof target?.subject === 'string' ? target.subject : '',
@@ -151,6 +156,7 @@ export function normalizeComposeDraft(draft = {}) {
   const replyContext = draft?.replyContext && typeof draft.replyContext === 'object'
     ? {
       uid: normalizeUid(draft.replyContext.uid),
+      ...normalizedValidity(draft.replyContext.uidValidity),
       mailbox: typeof draft.replyContext.mailbox === 'string' ? draft.replyContext.mailbox.trim() : '',
     }
     : null
@@ -159,6 +165,7 @@ export function normalizeComposeDraft(draft = {}) {
     ? draft.bulkReplyTargets
       .map((target) => ({
         uid: normalizeUid(target?.uid),
+        ...normalizedValidity(target?.uidValidity),
         mailbox: typeof target?.mailbox === 'string' ? target.mailbox.trim() : '',
         subject: typeof target?.subject === 'string' ? target.subject : '',
         address: typeof target?.address === 'string' ? target.address : '',
@@ -196,6 +203,8 @@ export function normalizeComposeDraft(draft = {}) {
     htmlSeededFromPlain: Boolean(draft?.htmlSeededFromPlain),
     showCc: Boolean(draft?.showCc || ccRecipients.length > 0),
     showBcc: Boolean(draft?.showBcc || bccRecipients.length > 0),
+    draftMailbox: typeof draft?.draftMailbox === 'string' ? draft.draftMailbox : undefined,
+    draftUidValidity: normalizedValidity(draft?.draftUidValidity).uidValidity,
     draftId: typeof draft?.draftId === 'string' && draft.draftId.trim() ? draft.draftId.trim() : undefined,
     source: typeof draft?.source === 'string' && draft.source.trim() ? draft.source.trim() : 'new',
     composeSurface: draft?.composeSurface === 'window' || draft?.composeSurface === 'tab' ? draft.composeSurface : 'inline',

@@ -45,6 +45,7 @@ pub struct LocalMailListQuery {
     pub page: usize,
     #[serde(default = "default_per_page")]
     pub per_page: usize,
+    pub uid_validity: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -440,6 +441,7 @@ async fn cache_remote_draft_to_local_cache(
     pool: &SqlitePool,
     mailbox: &str,
     uid: &str,
+    generation: u32,
     payload: &serde_json::Value,
     default_from: &str,
     raw_rfc822: &[u8],
@@ -483,12 +485,13 @@ async fn cache_remote_draft_to_local_cache(
     sqlx::query(
         r#"
         INSERT INTO local_mail_cache (
-            uid, folder, sender_name, sender_address, recipient_to, subject, seen, flagged,
+            uid, folder, uid_validity, sender_name, sender_address, recipient_to, subject, seen, flagged,
             date_value, date_ms, size_bytes, importance_value, content_type, category, labels_json,
             cc_value, bcc_value, plain_body, html_body, raw_rfc822, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, '', '[]', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, 0, ?, '', '[]', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(uid, folder) DO UPDATE SET
+            uid_validity = excluded.uid_validity,
             sender_name = excluded.sender_name,
             sender_address = excluded.sender_address,
             recipient_to = excluded.recipient_to,
@@ -509,6 +512,7 @@ async fn cache_remote_draft_to_local_cache(
     )
     .bind(uid)
     .bind(mailbox)
+    .bind(generation)
     .bind("")
     .bind(&from_addr)
     .bind(to_addrs.join(", "))
@@ -1067,12 +1071,14 @@ pub async fn sync_mailbox(
     Path(account_id): Path<i64>,
     Query(q): Query<SyncMailboxQuery>,
 ) -> Result<Json<SyncNowResponse>, AppError> {
-    let mailbox = q.mailbox;
-    let mailbox = if mailbox.is_empty() {
-        "INBOX".to_string()
+    let mailbox = if q.mailbox.is_empty() {
+        "INBOX"
     } else {
-        mailbox
-    };
+        crate::mail_models::mailbox_identity(&q.mailbox)
+    }.to_string();
+
+    let sync_lock = state.account_sync_lock(account_id).await;
+    let _guard = sync_lock.lock().await;
 
     // Ensure IMAP connected
     let _ = ensure_imap_connected(&state._db, &state.imap, account_id).await;
@@ -1089,13 +1095,15 @@ pub async fn sync_mailbox(
     let mut failed = 0usize;
 
     // Fetch page 1 first to discover the total message count for this mailbox.
-    let (total, first_previews) = tokio::task::spawn_blocking({
+    let imap_session::MailboxPage { generation, total, previews: first_previews } = tokio::task::spawn_blocking({
         let imap_state = state.imap.clone();
-        let mailbox_c = mailbox.clone();
-        move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox_c, 1, per_page)
+        let mailbox = mailbox.clone();
+        move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, 1, per_page, None)
     })
     .await
-    .unwrap_or_default();
+    .map_err(|error| AppError::BadRequest(error.to_string()))?
+    .map_err(AppError::BadRequest)?;
+    record_mailbox_generation(&pool, &mailbox, generation).await?;
 
     if total == 0 {
         let _ = touch_last_sync_time(&state._db, account_id).await;
@@ -1154,15 +1162,14 @@ pub async fn sync_mailbox(
 
     // Fetch and process remaining pages (2..=total_pages).
     for page_i in 2..=total_pages {
-        let (pg_total, previews) = tokio::task::spawn_blocking({
+        let imap_session::MailboxPage { total: pg_total, previews, .. } = tokio::task::spawn_blocking({
             let imap_state = state.imap.clone();
-            let mailbox_c = mailbox.clone();
-            move || {
-                imap_session::fetch_mail_list(&imap_state, account_id, &mailbox_c, page_i, per_page)
-            }
+            let mailbox = mailbox.clone();
+            move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, page_i, per_page, Some(generation))
         })
         .await
-        .unwrap_or_default();
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .map_err(AppError::BadRequest)?;
 
         let (p, f) = insert_previews(&pool, &mailbox, previews, force_all).await;
         processed += p;
@@ -1199,12 +1206,6 @@ pub async fn search_advanced(
         ));
     }
 
-    let mut count_qb = QueryBuilder::<Sqlite>::new(format!(
-        "SELECT COUNT(1) FROM local_mail_cache WHERE {VISIBLE_CACHED_MAIL}"
-    ));
-    apply_advanced_search_filters(&mut count_qb, &body, &normalized_mailboxes);
-    let (total,): (i64,) = count_qb.build_query_as::<(i64,)>().fetch_one(&pool).await?;
-
     let mut qb = QueryBuilder::<Sqlite>::new(format!(
         r#"
         SELECT uid, uid_validity, message_id, in_reply_to, references_value,
@@ -1215,10 +1216,10 @@ pub async fn search_advanced(
         "#,
     ));
     apply_advanced_search_filters(&mut qb, &body, &normalized_mailboxes);
-    qb.push(" ORDER BY date_ms DESC, uid DESC");
+    qb.push(" ORDER BY date_ms DESC, CAST(uid AS INTEGER) DESC, uid DESC, folder ASC");
 
     let rows = qb.build().fetch_all(&pool).await?;
-    let mails = rows
+    let mails: Vec<_> = rows
         .into_iter()
         .map(|r| {
             let mailbox = r
@@ -1323,7 +1324,7 @@ pub async fn search_advanced(
         .collect();
 
     Ok(Json(AdvancedSearchResponse {
-        total_count: total.max(0) as usize,
+        total_count: mails.len(),
         mails,
     }))
 }
@@ -1342,11 +1343,12 @@ pub async fn get_local_mail_content(
         r#"
         SELECT uid, subject, sender_name, sender_address, date_value, cc_value, bcc_value, plain_body, html_body, raw_rfc822
         FROM local_mail_cache
-        WHERE uid = ? AND folder = ?
+        WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)
         "#,
     )
     .bind(&uid)
     .bind(&q.mailbox)
+    .bind(q.uid_validity)
     .fetch_optional(&pool)
     .await;
 
@@ -1449,6 +1451,7 @@ fn build_inline_cid_attachment_map(
     account_id: i64,
     uid: &str,
     mailbox: &str,
+    generation: Option<u32>,
     attachments: &[crate::mail_models::AttachmentInfo],
 ) -> std::collections::HashMap<String, String> {
     let encoded_mailbox = percent_encode_filename(mailbox);
@@ -1463,11 +1466,12 @@ fn build_inline_cid_attachment_map(
             Some((
                 format!("cid:{}", content_id),
                 format!(
-                    "http://127.0.0.1:5000/api/offline/{}/local-content/{}/attachments/{}?mailbox={}",
+                    "http://127.0.0.1:5000/api/offline/{}/local-content/{}/attachments/{}?mailbox={}&uid_validity={}",
                     account_id,
                     uid,
                     attachment.id,
                     encoded_mailbox,
+                    generation.unwrap_or(0),
                 ),
             ))
         })
@@ -1485,10 +1489,11 @@ pub async fn prefetch_local_inline_assets(
     };
 
     let row = sqlx::query(
-        "SELECT html_body, raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ?",
+        "SELECT html_body, raw_rfc822, uid_validity FROM local_mail_cache WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)",
     )
     .bind(&uid)
     .bind(&q.mailbox)
+    .bind(q.uid_validity)
     .fetch_optional(&pool)
     .await;
 
@@ -1517,22 +1522,25 @@ pub async fn prefetch_local_inline_assets(
         .into_response();
     }
 
+    let generation = row.get::<Option<u32>, _>("uid_validity");
     let cid_to_attachment = raw
         .as_deref()
         .map(|raw_bytes| {
             let content = imap_session::parse_mail_content(uid.clone(), raw_bytes);
-            build_inline_cid_attachment_map(account_id, &uid, &q.mailbox, &content.attachments)
+            build_inline_cid_attachment_map(account_id, &uid, &q.mailbox, generation, &content.attachments)
         })
         .unwrap_or_default();
     let rewritten = rewrite_html_inline_image_srcs(&html, &cid_to_attachment);
 
     if rewritten != html {
         let _ = sqlx::query(
-            "UPDATE local_mail_cache SET html_body = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
+            "UPDATE local_mail_cache SET html_body = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ? AND uid_validity IS ? AND html_body IS ?",
         )
         .bind(&rewritten)
         .bind(&uid)
         .bind(&q.mailbox)
+        .bind(generation)
+        .bind(&html)
         .execute(&pool)
         .await;
     }
@@ -1555,9 +1563,10 @@ pub async fn download_local_attachment(
     };
 
     let row =
-        match sqlx::query("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ?")
+        match sqlx::query("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)")
             .bind(&uid)
             .bind(&q.mailbox)
+            .bind(q.uid_validity)
             .fetch_optional(&pool)
             .await
         {
@@ -1629,9 +1638,10 @@ pub async fn get_local_mail_raw(
     };
 
     let row =
-        match sqlx::query("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ?")
+        match sqlx::query("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)")
             .bind(&uid)
             .bind(&q.mailbox)
+            .bind(q.uid_validity)
             .fetch_optional(&pool)
             .await
         {
@@ -1739,9 +1749,10 @@ pub async fn get_local_reply_seed(
     };
 
     let cached_raw: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ?")
+        sqlx::query_scalar("SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)")
             .bind(&uid)
             .bind(&q.mailbox)
+            .bind(q.uid_validity)
             .fetch_optional(&pool)
             .await
             .ok()
@@ -1751,7 +1762,7 @@ pub async fn get_local_reply_seed(
     let mut raw = cached_raw;
     if raw.is_none() {
         let _ = ensure_imap_connected(&state._db, &state.imap, account_id).await;
-        raw = imap_session::fetch_mail_raw_in_mailbox(&state.imap, account_id, &q.mailbox, &uid);
+        raw = imap_session::fetch_mail_raw_in_mailbox(&state.imap, account_id, &q.mailbox, &uid, q.uid_validity);
 
     }
 
@@ -2041,6 +2052,8 @@ pub async fn post_offline_action(
     let payload_value = payload.payload.clone().unwrap_or_else(|| json!({}));
 
     if payload.action_type == "save_draft" {
+        let sync_lock = state.account_sync_lock(account_id).await;
+        let _guard = sync_lock.lock().await;
         let general_pool = state._db.require_general_pool().await?;
         let account_email = sqlx::query_scalar::<_, Option<String>>(
             "SELECT email_address FROM accounts WHERE account_id = ?",
@@ -2115,7 +2128,7 @@ pub async fn post_offline_action(
             raw_headers: &[("X-Guvercin-Draft-Key".to_string(), tracking_key.clone())],
         })
         .map_err(AppError::BadRequest)?;
-        let draft_uid = imap_session::append_draft(
+        let (draft_uid, generation) = imap_session::append_draft(
             &state.imap,
             account_id,
             &drafts_mailbox,
@@ -2124,38 +2137,40 @@ pub async fn post_offline_action(
         )
         .map_err(AppError::BadRequest)?;
 
-        if let Some(previous_draft_id) = existing_draft_id {
-            if previous_draft_id.starts_with("draft-") {
-                let _ = delete_cached_local_draft(&pool, &previous_draft_id).await;
-            } else if previous_draft_id != draft_uid {
-                let _ = imap_session::delete_mail(
-                    &state.imap,
-                    account_id,
-                    &drafts_mailbox,
-                    &previous_draft_id,
-                );
-                let _ = sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
-                    .bind(&previous_draft_id)
-                    .bind(&drafts_mailbox)
-                    .execute(&pool)
-                    .await;
-            }
-        }
-
+        record_mailbox_generation(&pool, &drafts_mailbox, generation).await?;
         cache_remote_draft_to_local_cache(
             &pool,
             &drafts_mailbox,
             &draft_uid,
+            generation,
             &payload_value,
             &account_email,
             &raw_rfc822,
         )
         .await?;
 
+        if let Some(previous_draft_id) = existing_draft_id {
+            if previous_draft_id.starts_with("draft-") {
+                let _ = delete_cached_local_draft(&pool, &previous_draft_id).await;
+            } else if previous_draft_id != draft_uid
+                && payload.uid_validity == Some(generation)
+                && payload.target_folder.as_deref() == Some(drafts_mailbox.as_str())
+                && imap_session::apply_queued_mail_action(
+                    &state.imap, account_id, &drafts_mailbox, &previous_draft_id,
+                    Some(generation), imap_session::QueuedMailAction::Delete,
+                ).is_ok()
+            {
+                let mut connection = pool.acquire().await?;
+                remove_cached_source(&mut connection, &previous_draft_id, &drafts_mailbox, Some(generation)).await?;
+            }
+        }
+
         return Ok(Json(OfflineActionResponse {
             status: "saved",
             queued_id: draft_uid.parse::<i64>().unwrap_or(0),
             draft_id: Some(draft_uid),
+            draft_mailbox: Some(drafts_mailbox),
+            draft_uid_validity: Some(generation),
         }));
     }
 
@@ -2250,20 +2265,7 @@ pub async fn post_offline_action(
     } else {
         (payload.target_uid.as_deref(), payload.target_folder.as_deref())
     };
-    let uid_validity = match (uid, folder, payload.uid_validity) {
-        (_, _, Some(value)) => Some(value),
-        (Some(uid), Some(folder), None) => {
-            sqlx::query_scalar::<_, Option<u32>>(
-                "SELECT uid_validity FROM local_mail_cache WHERE uid = ? AND folder = ?",
-            )
-            .bind(uid)
-            .bind(folder)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten()
-        }
-        _ => None,
-    };
+    let uid_validity = payload.uid_validity;
     if requires_queued_uid(&payload.action_type) && uid_validity.filter(|value| *value > 0).is_none() {
         return Err(AppError::BadRequest(
             "Message UIDVALIDITY is unavailable. Refresh the folder and repeat the action.".into(),
@@ -2308,6 +2310,8 @@ pub async fn post_offline_action(
         status: "queued",
         queued_id: res.last_insert_rowid(),
         draft_id: None,
+        draft_mailbox: None,
+        draft_uid_validity: None,
     }))
 }
 
@@ -2315,10 +2319,7 @@ pub async fn sync_now(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<SyncNowResponse>, AppError> {
-    let sync_lock = {
-        let mut locks = state.sync_locks.lock().await;
-        locks.entry(account_id).or_default().clone()
-    };
+    let sync_lock = state.account_sync_lock(account_id).await;
     let Ok(_guard) = sync_lock.try_lock() else {
         return Ok(Json(SyncNowResponse {
             status: "busy",
@@ -2349,7 +2350,9 @@ async fn sync_now_impl(
         .await
         .is_ok()
     {
-        sync_cached_mailboxes(&state._db, &state.imap, account_id).await?;
+        let result = sync_cached_mailboxes(&state._db, &state.imap, account_id).await;
+        set_transfer_receiving(&state._db, account_id, None).await;
+        result?;
         touch_last_sync_time(&state._db, account_id).await?;
     }
     Ok((processed, failed))
@@ -3484,7 +3487,6 @@ async fn sync_cached_mailboxes(
                     n,
                 )
                 .await?;
-                set_transfer_receiving(app_state, account_id, None).await;
                 return Ok(());
             }
         }
@@ -3497,7 +3499,6 @@ async fn sync_cached_mailboxes(
         .await?;
     }
 
-    set_transfer_receiving(app_state, account_id, None).await;
     Ok(())
 }
 
@@ -3506,6 +3507,7 @@ struct MailCandidate {
     mailbox: String,
     uid: u32,
     date_ms: i64,
+    generation: u32,
 }
 
 async fn initial_sync_global_by_count(
@@ -3520,17 +3522,17 @@ async fn initial_sync_global_by_count(
     let candidate_per_page = limit_total.clamp(50, 200);
     let max_pages = 5usize;
 
-    let mut totals_by_mailbox = std::collections::HashMap::<String, usize>::new();
+    let mut totals_by_mailbox = std::collections::HashMap::<String, (usize, u32)>::new();
     let mut candidates: Vec<MailCandidate> = Vec::new();
 
     for page in 1..=max_pages {
         for mailbox in mailboxes {
-            let total = *totals_by_mailbox.get(mailbox).unwrap_or(&usize::MAX);
-            if total != usize::MAX && (page - 1) * candidate_per_page >= total {
+            let previous = totals_by_mailbox.get(mailbox).copied();
+            if previous.is_some_and(|(total, _)| (page - 1) * candidate_per_page >= total) {
                 continue;
             }
 
-            let (total_count, previews) = tokio::task::spawn_blocking({
+            let imap_session::MailboxPage { generation, total, previews } = tokio::task::spawn_blocking({
                 let imap_state = imap_state.clone();
                 let mailbox = mailbox.clone();
                 move || {
@@ -3540,13 +3542,18 @@ async fn initial_sync_global_by_count(
                         &mailbox,
                         page,
                         candidate_per_page,
+                        previous.map(|(_, generation)| generation),
                     )
                 }
             })
             .await
-            .unwrap_or_default();
+            .map_err(|error| AppError::BadRequest(error.to_string()))?
+            .map_err(AppError::BadRequest)?;
 
-            totals_by_mailbox.insert(mailbox.clone(), total_count);
+            if previous.is_none() {
+                record_mailbox_generation(pool, mailbox, generation).await?;
+            }
+            totals_by_mailbox.insert(mailbox.clone(), (total, generation));
 
             for p in previews {
                 let Ok(uid) = p.id.parse::<u32>() else {
@@ -3559,6 +3566,7 @@ async fn initial_sync_global_by_count(
                     mailbox: mailbox.clone(),
                     uid,
                     date_ms,
+                    generation,
                 });
             }
         }
@@ -3571,13 +3579,13 @@ async fn initial_sync_global_by_count(
     candidates.sort_by(|a, b| b.date_ms.cmp(&a.date_ms).then_with(|| b.uid.cmp(&a.uid)));
     candidates.truncate(limit_total);
 
-    let mut uids_by_mailbox: std::collections::HashMap<String, Vec<u32>> =
+    let mut uids_by_mailbox: std::collections::HashMap<(String, u32), Vec<u32>> =
         std::collections::HashMap::new();
     for c in candidates {
-        uids_by_mailbox.entry(c.mailbox).or_default().push(c.uid);
+        uids_by_mailbox.entry((c.mailbox, c.generation)).or_default().push(c.uid);
     }
 
-    for (mailbox, mut uids) in uids_by_mailbox {
+    for ((mailbox, generation), mut uids) in uids_by_mailbox {
         uids.sort_unstable();
         uids.dedup();
         sync_specific_uids(
@@ -3586,7 +3594,7 @@ async fn initial_sync_global_by_count(
             imap_state,
             account_id,
             &mailbox,
-            &uids,
+            (generation, &uids),
             policy.cache_raw_rfc822,
         )
         .await?;
@@ -3601,9 +3609,10 @@ async fn sync_specific_uids(
     imap_state: &Arc<ImapState>,
     account_id: i64,
     mailbox: &str,
-    uids: &[u32],
+    selection: (u32, &[u32]),
     cache_raw_rfc822: bool,
 ) -> Result<(), AppError> {
+    let (generation, uids) = selection;
     if uids.is_empty() {
         return Ok(());
     }
@@ -3633,7 +3642,6 @@ async fn sync_specific_uids(
     .unwrap_or_default();
 
     let mut done = 0i64;
-    let mut max_uid_synced = 0u32;
 
     for chunk in uids.chunks(50) {
         let chunk_uids: Vec<u32> = chunk.to_vec();
@@ -3647,6 +3655,7 @@ async fn sync_specific_uids(
                     account_id,
                     &mailbox,
                     &chunk_uids_for_fetch,
+                    generation,
                 )
             }
         })
@@ -3654,6 +3663,11 @@ async fn sync_specific_uids(
         .unwrap_or_default();
 
         let aligned = align_previews_to_uids(&chunk_uids, &mails);
+        if aligned.len() != chunk_uids.len()
+            || aligned.iter().any(|(_, mail)| mail.uid_validity != Some(generation))
+        {
+            return Err(AppError::BadRequest("Incomplete IMAP headers during initial sync".into()));
+        }
         for (uid, mut mail) in aligned {
             let mut is_blocked = false;
             for rule in &blocked_rules {
@@ -3687,12 +3701,10 @@ async fn sync_specific_uids(
             }
 
             if is_blocked {
-                max_uid_synced = bump_max_uid_synced(max_uid_synced, uid);
                 done += 1;
                 continue;
             }
 
-            max_uid_synced = bump_max_uid_synced(max_uid_synced, uid);
             let uid_str = uid.to_string();
             mail.id = uid_str.clone();
 
@@ -3726,20 +3738,8 @@ async fn sync_specific_uids(
         }
     }
 
-    if max_uid_synced > 0 {
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO sync_checkpoints (folder_path, last_synced_uid, last_uid_validity, updated_at)
-            VALUES (?, ?, 0, CURRENT_TIMESTAMP)
-            ON CONFLICT(folder_path) DO UPDATE SET
-                last_synced_uid = excluded.last_synced_uid,
-                updated_at = CURRENT_TIMESTAMP
-            "#,
-        )
-        .bind(mailbox)
-        .bind(max_uid_synced as i64)
-        .execute(pool)
-        .await;
+    if let Some(last_uid) = uids.last() {
+        advance_mailbox_checkpoint(pool, mailbox, generation, *last_uid).await?;
     }
 
     Ok(())
@@ -3814,8 +3814,8 @@ async fn load_sync_rules_and_policy(
 fn mailbox_is_selected(mailbox: &str, includes: &[String], excludes: &[String]) -> bool {
     let included = includes
         .iter()
-        .any(|path| path == "*" || mailbox == path || mailbox.starts_with(&format!("{path}/")));
-    let excluded = excludes.iter().any(|path| mailbox == path);
+        .any(|path| path == "*" || mailbox == crate::mail_models::mailbox_identity(path) || mailbox.starts_with(&format!("{path}/")));
+    let excluded = excludes.iter().any(|path| mailbox == crate::mail_models::mailbox_identity(path));
     included && !excluded
 }
 
@@ -3942,6 +3942,64 @@ async fn upsert_folder_metadata(pool: &SqlitePool, mailbox: &str) -> Result<(), 
     Ok(())
 }
 
+pub(crate) async fn record_mailbox_generation(
+    pool: &SqlitePool,
+    mailbox: &str,
+    generation: u32,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        r#"
+        INSERT INTO sync_checkpoints (folder_path, last_synced_uid, last_uid_validity, updated_at)
+        VALUES (?, 0, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(folder_path) DO UPDATE SET
+            last_synced_uid = 0,
+            last_uid_validity = excluded.last_uid_validity,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE last_uid_validity IS NOT excluded.last_uid_validity
+        "#,
+    )
+    .bind(mailbox)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() > 0 {
+        // Unknown-generation rows may include saved drafts. Preserve them until
+        // a server preview for the same UID replaces their cached contents.
+        sqlx::query(
+            "DELETE FROM local_mail_cache
+             WHERE (folder = ? OR (? = 'INBOX' AND folder = 'INBOX' COLLATE NOCASE))
+               AND uid_validity > 0 AND uid_validity != ?",
+        )
+            .bind(mailbox)
+            .bind(mailbox)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn advance_mailbox_checkpoint(
+    pool: &SqlitePool,
+    mailbox: &str,
+    generation: u32,
+    uid: u32,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE sync_checkpoints SET last_synced_uid = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE folder_path = ? AND last_uid_validity = ? AND last_synced_uid < ?",
+    )
+    .bind(uid)
+    .bind(mailbox)
+    .bind(generation)
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn sync_single_mailbox(
     app_state: &Arc<AppState>,
     pool: &SqlitePool,
@@ -3956,30 +4014,25 @@ async fn sync_single_mailbox(
         .filter(|_| policy.mode == "by_count")
         .map(|value| value.max(0) as usize);
 
-    let last_synced_uid: u32 =
-        sqlx::query_scalar("SELECT last_synced_uid FROM sync_checkpoints WHERE folder_path = ?")
-            .bind(mailbox)
-            .fetch_optional(pool)
-            .await?
-            .map(|v: i64| v.max(0) as u32)
-            .unwrap_or(0);
+    let checkpoint = sqlx::query_as::<_, (u32, u32)>(
+        "SELECT last_synced_uid, last_uid_validity FROM sync_checkpoints WHERE folder_path = ?",
+    )
+    .bind(mailbox)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or_default();
 
-    // Apply the by_days cutoff only during initial sync (when checkpoint UID == 0).
-    let cutoff = if last_synced_uid == 0 {
-        policy_cutoff(policy)
-    } else {
-        None
-    };
-
-    let (_total, new_uids) = tokio::task::spawn_blocking({
+    let (generation, last_synced_uid, new_uids) = tokio::task::spawn_blocking({
         let imap_state = imap_state.clone();
         let mailbox = mailbox.to_string();
-        move || {
-            imap_session::fetch_new_uids_since(&imap_state, account_id, &mailbox, last_synced_uid)
-        }
+        move || imap_session::fetch_new_uids_since(&imap_state, account_id, &mailbox, checkpoint)
     })
     .await
-    .unwrap_or((0, vec![]));
+    .map_err(|error| AppError::BadRequest(error.to_string()))?
+    .map_err(AppError::BadRequest)?;
+    record_mailbox_generation(pool, mailbox, generation).await?;
+
+    let cutoff = if last_synced_uid == 0 { policy_cutoff(policy) } else { None };
 
     let mut uids_to_sync = new_uids;
     if last_synced_uid == 0 {
@@ -4043,6 +4096,7 @@ async fn sync_single_mailbox(
                     account_id,
                     &mailbox,
                     &chunk_uids_for_fetch,
+                    generation,
                 )
             }
         })
@@ -4050,7 +4104,19 @@ async fn sync_single_mailbox(
         .unwrap_or_default();
 
         let aligned = align_previews_to_uids(&chunk_uids, &mails);
-        for (uid, mail) in aligned {
+        let mut aligned = aligned.into_iter().peekable();
+        for requested_uid in chunk_uids {
+            if !aligned.peek().is_some_and(|(uid, mail)| {
+                *uid == requested_uid && mail.uid_validity == Some(generation)
+            }) {
+                // The response may be incomplete, or the mailbox may have been
+                // replaced between SEARCH and FETCH. Retry from the last safe UID.
+                if last_synced_uid == 0 {
+                    max_uid_synced = 0;
+                }
+                break 'outer;
+            }
+            let (uid, mail) = aligned.next().expect("matching preview");
             if cutoff
                 .as_ref()
                 .is_some_and(|threshold| mail_date_before_threshold(&mail.date, threshold))
@@ -4132,20 +4198,7 @@ async fn sync_single_mailbox(
     }
 
     if max_uid_synced > last_synced_uid {
-        sqlx::query(
-            r#"
-            INSERT INTO sync_checkpoints (folder_path, last_synced_uid, last_uid_validity, updated_at)
-            VALUES (?, ?, 0, CURRENT_TIMESTAMP)
-            ON CONFLICT(folder_path) DO UPDATE SET
-                last_synced_uid = excluded.last_synced_uid,
-                updated_at = CURRENT_TIMESTAMP
-            "#,
-        )
-        .bind(mailbox)
-        .bind(max_uid_synced as i64)
-        .execute(pool)
-        .await?;
-        tracing::info!("Checkpoint saved: {mailbox} last_uid={max_uid_synced}");
+        advance_mailbox_checkpoint(pool, mailbox, generation, max_uid_synced).await?;
     }
 
     Ok(())
@@ -4521,7 +4574,7 @@ async fn cache_mail_body(
     };
     let content = imap_session::parse_mail_content(uid.to_string(), &raw);
     let cid_to_attachment =
-        build_inline_cid_attachment_map(account_id, uid, mailbox, &content.attachments);
+        build_inline_cid_attachment_map(account_id, uid, mailbox, uid_validity, &content.attachments);
     let rewritten_html = rewrite_html_inline_image_srcs(&content.html_body, &cid_to_attachment);
     let date_ms: i64 = DateTime::parse_from_rfc2822(&content.date)
         .map(|dt| dt.timestamp_millis())

@@ -9,7 +9,7 @@ test('mail identity distinguishes equal UIDs in different mailboxes', () => {
 })
 
 test('batch actions preserve mailbox names and report only failed targets', async () => {
-  const inbox = mailKey({ id: '42', mailbox: 'INBOX' })
+  const inbox = mailKey({ id: '42', mailbox: 'INBOX', uid_validity: 6 })
   const archive = mailKey({ id: '42', mailbox: 'Projects, 2026' })
   const calls = []
   const payload = { destination: 'Trash' }
@@ -19,8 +19,8 @@ test('batch actions preserve mailbox names and report only failed targets', asyn
   }, 'move', payload)
 
   assert.deepEqual(calls, [
-    ['move', '42', payload, 'INBOX'],
-    ['move', '42', payload, 'Projects, 2026'],
+    ['move', '42', payload, 'INBOX', 6],
+    ['move', '42', payload, 'Projects, 2026', 0],
   ])
   assert.deepEqual(failed, [archive])
 })
@@ -30,4 +30,10 @@ test('mailbox scope distinguishes case and preserves mailbox punctuation and spa
     dedupeMailboxes(['INBOX', 'inbox', 'Work, Foo/Çalışma', 'work, Foo/Çalışma', ' Archive ']),
     ['INBOX', 'Work, Foo/Çalışma', 'work, Foo/Çalışma', ' Archive '],
   )
+})
+
+test('a replacement UID is a different selection while INBOX aliases remain equivalent', () => {
+  const oldMail = { id: '42', mailbox: 'inbox', uid_validity: 6 }
+  assert.equal(sameMail(oldMail, { ...oldMail, mailbox: 'INBOX' }), true)
+  assert.equal(sameMail(oldMail, { ...oldMail, uid_validity: 7 }), false)
 })
