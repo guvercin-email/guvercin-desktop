@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next'
 import { apiUrl, getApiBaseUrl } from '../utils/api'
 import {
     normalizeMailboxResponse,
-    dedupeStringsCaseInsensitive,
     indexInOrderIgnoreCase,
     defaultMailboxSidebarPriority,
 } from '../utils/mailboxes'
@@ -37,6 +36,7 @@ import {
     autoCcRecipients,
 } from '../utils/composeSettings.js'
 import { buildThreads } from '../utils/threading.js'
+import { getUIPreferences } from '../utils/uiPreferences.js'
 import ExternalLinkPrompt from '../components/ExternalLinkPrompt.jsx'
 import {
     copyTextToClipboard,
@@ -60,7 +60,7 @@ import { subscribeMailto, requestNewCompose } from '../utils/mailtoInbox.js'
 import { subscribeNavigate, requestNewEvent, requestNewTask } from '../utils/crossLinks.js'
 import { subscribeEml } from '../utils/emlInbox.js'
 import { notifyNewMail, setUnreadBadge, subscribeNotificationOpen, dismissNotificationForMail } from '../utils/notifications.js'
-import { mailKey, sameMail, queueMailActions } from '../utils/mailIdentity.js'
+import { dedupeMailboxes, mailboxIdentity, mailKey, sameMail, queueMailActions } from '../utils/mailIdentity.js'
 import { getNotificationSettings, shouldNotifyForMail } from '../utils/notificationSettings.js'
 import {
     isDefaultMailClient,
@@ -581,7 +581,7 @@ function createDefaultAdvancedSearchDraft() {
 
 function buildAdvancedSearchPayload(draft) {
     const readStatus = ['all', 'read', 'unread'].includes(draft?.readStatus) ? draft.readStatus : 'all'
-    const mailboxes = dedupeStringsCaseInsensitive(draft?.mailboxes)
+    const mailboxes = dedupeMailboxes(draft?.mailboxes)
     const scope = draft?.scope === 'mailboxes' && mailboxes.length > 0 ? 'mailboxes' : 'all'
 
     const normalizeField = (value) => {
@@ -1318,6 +1318,7 @@ const DashboardPage = () => {
     const [notifications, setNotifications] = useState([])
     const [notifOpen, setNotifOpen] = useState(false)
     const [settingsPageOpen, setSettingsPageOpen] = useState(false)
+    const { threadViewEnabled, markAsReadDelaySeconds } = getUIPreferences(accountId)
     const [toolbarStyle, setToolbarStyle] = useState(() => normalizeToolbarStyle(localStorage.getItem('toolbar_style')))
     const [isMailFullscreen, setIsMailFullscreen] = useState(false)
     const [appMenuVisible, setAppMenuVisible] = useState(true)
@@ -1437,7 +1438,7 @@ const DashboardPage = () => {
     const perPageNum = Math.max(1, Number.parseInt(perPage, 10) || 50)
     const maxPage = Math.max(1, Math.ceil(totalCount / perPageNum))
     const searchMailboxOptions = useMemo(
-        () => dedupeStringsCaseInsensitive(folders).filter((mailbox) => !isMailboxSectionRoot(mailbox)),
+        () => dedupeMailboxes(folders).filter((mailbox) => !isMailboxSectionRoot(mailbox)),
         [folders],
     )
 
@@ -1814,7 +1815,7 @@ const DashboardPage = () => {
     const loadMailsFromCache = useCallback(async (folder) => {
         if (listModeRef.current === 'search') return 0
         if (!accountId) return 0
-        const mailbox = (folder || '').toString().trim()
+        const mailbox = (folder || '').toString()
         if (!mailbox) return 0
         try {
             const pageSize = 250
@@ -1838,13 +1839,13 @@ const DashboardPage = () => {
             }
             
             const currentAccountId = accountIdRef.current
-            const currentSelectedFolder = (selectedFolderRef.current || '').toString().trim()
+            const currentSelectedFolder = selectedFolderRef.current
 
             if (
                 currentAccountId === accountId
                 && listModeRef.current !== 'search'
                 && currentSelectedFolder
-                && currentSelectedFolder.toLowerCase() === mailbox.toLowerCase()
+                && mailboxIdentity(currentSelectedFolder) === mailboxIdentity(mailbox)
             ) {
                 setMails(allMails)
             }
@@ -1878,12 +1879,12 @@ const DashboardPage = () => {
         if (listModeRef.current === 'search') return
 
         const currentMails = Array.isArray(mailsRef.current) ? mailsRef.current : []
-        const currentMailbox = (currentMails?.[0]?.mailbox || '').toString().trim()
-        const selectedMailbox = (selectedFolder || '').toString().trim()
+        const currentMailbox = currentMails?.[0]?.mailbox
+        const selectedMailbox = selectedFolder
         const mailboxMismatch = (
             currentMailbox
             && selectedMailbox
-            && currentMailbox.toLowerCase() !== selectedMailbox.toLowerCase()
+            && mailboxIdentity(currentMailbox) !== mailboxIdentity(selectedMailbox)
         )
         const shouldShowLoading = !background && (currentMails.length === 0 || mailboxMismatch)
         const requestId = shouldShowLoading ? (mailLoadRequestIdRef.current + 1) : mailLoadRequestIdRef.current
@@ -2165,7 +2166,7 @@ const DashboardPage = () => {
     }, [exitSearchMode, selectedFolder])
 
     const handleSelectFolder = useCallback((folder) => {
-        const nextFolder = (folder || '').toString().trim()
+        const nextFolder = (folder || '').toString()
         if (!nextFolder) return
         if (listModeRef.current === 'search') {
             exitSearchMode()
@@ -2381,7 +2382,6 @@ const DashboardPage = () => {
             const data = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail, signal)
             if (!data || signal.aborted) return
             setMailContent(data)
-            if (mail.seen !== true) void setMailsSeenState([mailKey(message)], true)
 
             void prefetchInlineAssets(mail.id, mailbox).then((html) => {
                 if (html && !signal.aborted) {
@@ -2396,15 +2396,19 @@ const DashboardPage = () => {
     }
     openMailRef.current = openMail
 
-    const queueAction = useCallback(async (actionType, targetUid, payload = {}, targetFolderOverride = null) => {
+    const queueAction = useCallback(async (actionType, targetUid, payload = {}, targetFolderOverride = null, uidValidity) => {
         if (!accountId || !backendReachable) throw new Error('Mail service is unavailable.')
+        const mailbox = targetFolderOverride || selectedFolder || 'INBOX'
+        const targetKey = mailKey({ id: targetUid, mailbox })
+        const target = targetKey && mailsRef.current.find((mail) => mailKey(mail, selectedFolder) === targetKey)
         const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 action_type: actionType,
                 target_uid: targetUid || null,
-                target_folder: targetFolderOverride || selectedFolder || 'INBOX',
+                target_folder: mailbox,
+                uid_validity: uidValidity ?? (target ? target.uid_validity ?? 0 : undefined),
                 payload,
             }),
         })
@@ -2479,6 +2483,12 @@ const DashboardPage = () => {
             (sourceMode !== 'search' || activeSearchRef.current === sourceSearch)
         )
         const affectedMails = mails.filter((mail) => affected.has(mailKey(mail, sourceFolder)))
+        const activeMail = tabs.find((tab) => tab.id === activeTabId)?.mail || selectedMail
+        const validityByKey = new Map(affectedMails.map((mail) => [mailKey(mail, sourceFolder), mail.uid_validity ?? 0]))
+        if (activeMail) validityByKey.set(mailKey(activeMail, sourceFolder), activeMail.uid_validity ?? 0)
+        const queueFromSnapshot = (action, uid, payload, mailbox) => queueAction(
+            action, uid, payload, mailbox, validityByKey.get(mailKey({ id: uid, mailbox })),
+        )
         const restoreRows = (restoreKeys) => {
             if (!inSourceView()) return
             const restoring = new Set(restoreKeys)
@@ -2504,7 +2514,7 @@ const DashboardPage = () => {
             },
             undo: () => restoreRows(affected),
             commit: async () => {
-                const failed = await queueMailActions([...affected], queueAction, destination ? 'move' : 'delete', destination ? { destination } : {})
+                const failed = await queueMailActions([...affected], queueFromSnapshot, destination ? 'move' : 'delete', destination ? { destination } : {})
                 if (failed.length > 0) {
                     restoreRows(failed)
                     window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
@@ -2518,8 +2528,9 @@ const DashboardPage = () => {
         if (destination) removeMailsOptimistic(keys, destination)
     }
 
-    const setMailsSeenState = async (keys, seen) => {
-        const failed = await queueMailActions(keys, queueAction, seen ? 'mark_read' : 'mark_unread')
+    const setMailsSeenState = useCallback(async (keys, seen, uidValidity) => {
+        const action = (type, uid, payload, mailbox) => queueAction(type, uid, payload, mailbox, uidValidity)
+        const failed = await queueMailActions(keys, action, seen ? 'mark_read' : 'mark_unread')
         if (accountIdRef.current !== accountId) return
         const successful = new Set(keys.filter((key) => !failed.includes(key)))
         const update = (mail) => successful.has(mailKey(mail, selectedFolder)) ? { ...mail, seen } : mail
@@ -2534,7 +2545,38 @@ const DashboardPage = () => {
             }
         }
         if (failed.length > 0) window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
-    }
+    }, [accountId, queueAction, selectedFolder, setSelectedMail, t])
+
+    const readingTab = activeTabId ? tabs.find((tab) => tab.id === activeTabId) : null
+    const readingMail = activeTabId ? readingTab?.mail : selectedMail
+    const readingKey = mailKey(readingMail, selectedFolder)
+    const readingContent = activeTabId ? tabContents[activeTabId] : mailContent
+    const readingIdentity = readingKey && readingContent
+        ? JSON.stringify([accountId, activeTabId, readingKey])
+        : ''
+    const readingSeen = readingMail?.seen === true
+    const readingValidity = readingMail?.uid_validity ?? 0
+    const readingVisible = activeSection === 'mail' && !settingsPageOpen
+        && (Boolean(activeTabId) || !inlineComposeSession)
+    const readingVisit = useRef(null)
+
+    useEffect(() => {
+        if (!readingIdentity) {
+            readingVisit.current = null
+            return
+        }
+        if (readingVisit.current?.identity !== readingIdentity) {
+            readingVisit.current = { identity: readingIdentity, handled: false }
+        }
+        const visit = readingVisit.current
+        if (readingSeen) visit.handled = true
+        if (visit.handled || !readingVisible) return
+        const timer = window.setTimeout(() => {
+            visit.handled = true
+            void setMailsSeenState([readingKey], true, readingValidity)
+        }, markAsReadDelaySeconds * 1000)
+        return () => window.clearTimeout(timer)
+    }, [markAsReadDelaySeconds, readingIdentity, readingKey, readingSeen, readingValidity, readingVisible, setMailsSeenState])
 
     const createMailbox = async (name) => {
         const mailboxName = name.trim()
@@ -3146,6 +3188,7 @@ const DashboardPage = () => {
                                 backendReachable={backendReachable}
                                 networkOnline={networkOnline}
                                 listMode={listMode}
+                                threadViewEnabled={threadViewEnabled}
                                 activeSearch={activeSearch}
                                 onClearSearch={clearAdvancedSearch}
                                 onSearchBySender={searchBySender}
@@ -3348,7 +3391,7 @@ const DashboardPage = () => {
                                                         : {
                                                             ...prev,
                                                             scope: 'mailboxes',
-                                                            mailboxes: dedupeStringsCaseInsensitive([selectedFolder || 'INBOX']),
+                                                            mailboxes: dedupeMailboxes([selectedFolder || 'INBOX']),
                                                         }
                                                 ))
                                             }}
@@ -3361,7 +3404,7 @@ const DashboardPage = () => {
                                         ) : (
                                             searchMailboxOptions.map((mailbox) => {
                                                 const checked = advancedSearchDraft.mailboxes
-                                                    .some((entry) => entry.toLowerCase() === mailbox.toLowerCase())
+                                                    .some((entry) => mailboxIdentity(entry) === mailboxIdentity(mailbox))
                                                 const label = folderInfo(mailbox).label
                                                 return (
                                                     <label key={mailbox} className="db-advanced-search-mailbox-item">
@@ -3371,12 +3414,12 @@ const DashboardPage = () => {
                                                             onChange={(e) => {
                                                                 const nextChecked = e.target.checked
                                                                 setAdvancedSearchDraft((prev) => {
-                                                                    const current = dedupeStringsCaseInsensitive(prev.mailboxes)
-                                                                    const exists = current.some((entry) => entry.toLowerCase() === mailbox.toLowerCase())
+                                                                    const current = dedupeMailboxes(prev.mailboxes)
+                                                                    const exists = current.some((entry) => mailboxIdentity(entry) === mailboxIdentity(mailbox))
                                                                     const next = nextChecked
                                                                         ? (exists ? current : [...current, mailbox])
-                                                                        : current.filter((entry) => entry.toLowerCase() !== mailbox.toLowerCase())
-                                                                    const nextMailboxes = dedupeStringsCaseInsensitive(next)
+                                                                        : current.filter((entry) => mailboxIdentity(entry) !== mailboxIdentity(mailbox))
+                                                                    const nextMailboxes = dedupeMailboxes(next)
                                                                     const nextScope = nextMailboxes.length > 0 ? 'mailboxes' : 'all'
                                                                     return { ...prev, scope: nextScope, mailboxes: nextMailboxes }
                                                                 })
@@ -3518,6 +3561,7 @@ function MailSection({
     networkOnline,
     listMode,
     activeSearch,
+    threadViewEnabled,
     onClearSearch,
     onSearchBySender,
     onSelectFolder,
@@ -3734,7 +3778,7 @@ function MailSection({
         return filtered
     }, [accountEmail, activeFilter, mails, sortBy, sortDirection])
 
-    const threadedEnabled = listMode !== 'search'
+    const threadedEnabled = threadViewEnabled && listMode !== 'search'
     useEffect(() => {
         if (threadedEnabled) return
         setActiveThreadReaderId(null)
@@ -5247,7 +5291,6 @@ function MailSection({
         if (!pendingTabLoadsRef.current.delete(tabId)) return
         setTabContents((prev) => ({ ...prev, [tabId]: content }))
         if (!content) return
-        if (mail.seen !== true) void setMailsSeenState([mailKey(mail, mailbox)], true)
         void prefetchInlineAssets(mail.id, mailbox).then((html) => {
             if (!html) return
             setTabContents((prev) => prev[tabId] === content
@@ -6255,7 +6298,7 @@ function MailSection({
 
     const handleMailItemMenuReadToggle = async () => {
         if (!mailItemMenu?.mail) return
-        await setMailsSeenState([mailKey(mailItemMenu.mail, selectedFolder)], mailItemMenu.mail.seen !== true)
+        await setMailsSeenState([mailKey(mailItemMenu.mail, selectedFolder)], mailItemMenu.mail.seen !== true, mailItemMenu.mail.uid_validity ?? 0)
         closeMailItemMenu()
     }
 
@@ -6355,7 +6398,7 @@ function MailSection({
     const handleActiveTabReadToggleAction = async () => {
         if (!activeTabMail) return
         const nextSeen = activeTabMail.seen !== true
-        await setMailsSeenState([mailKey(activeTabMail, selectedFolder)], nextSeen)
+        await setMailsSeenState([mailKey(activeTabMail, selectedFolder)], nextSeen, activeTabMail.uid_validity ?? 0)
     }
 
     const handleActiveTabLabelToggleAction = async (labelKey, shouldAdd) => {

@@ -256,10 +256,30 @@ pub fn build_rfc822_message(msg: OutgoingMessage<'_>) -> Result<Vec<u8>, String>
     Ok(build_message(msg)?.formatted())
 }
 
+pub struct SmtpSendError {
+    pub message: String,
+    pub delivery_uncertain: bool,
+}
+
+impl From<String> for SmtpSendError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            delivery_uncertain: false,
+        }
+    }
+}
+
+impl From<&str> for SmtpSendError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 /// Sends `msg` through `server`. When `server.xoauth2` is set the SMTP
 /// `XOAUTH2` mechanism is used and `server.password` is an access token
 /// (Gmail); otherwise plain credentials are used.
-pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Result<(), String> {
+pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Result<(), SmtpSendError> {
     let SmtpServer {
         host: smtp_host,
         port: smtp_port,
@@ -289,7 +309,8 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
         return Err(format!(
             "SMTP mode {} requires a hostname, not an IP address ({}). Use a real hostname like smtp.example.com. Loopback hosts are supported separately.",
             ssl_mode, smtp_host
-        ));
+        )
+        .into());
     }
 
     let email_message = build_message(msg)?;
@@ -369,10 +390,25 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
                 "Could not send email via {}:{} ({}): {}",
                 smtp_host, smtp_port, ssl_mode, e
             );
-            Err(format!(
-                "Could not send email via {}:{} ({}): {}",
-                smtp_host, smtp_port, ssl_mode, e
-            ))
+            let mut cause = std::error::Error::source(&e);
+            let mut connection_refused = false;
+            while let Some(error) = cause {
+                if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                    connection_refused = io.kind() == std::io::ErrorKind::ConnectionRefused;
+                    break;
+                }
+                cause = error.source();
+            }
+            let delivery_uncertain = e.status().is_none() && !connection_refused && !e.is_tls();
+            let message = if delivery_uncertain {
+                format!("SMTP delivery could not be confirmed: {e}")
+            } else {
+                format!("SMTP send failed: {e}")
+            };
+            Err(SmtpSendError {
+                message,
+                delivery_uncertain,
+            })
         }
     }
 }
@@ -383,6 +419,72 @@ mod tests {
         build_message, OutgoingAttachment, OutgoingAttachmentDisposition, OutgoingMailFormat,
         OutgoingMessage,
     };
+
+    #[tokio::test]
+    async fn smtp_distinguishes_rejection_from_lost_delivery_confirmation() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (final_reply, expected_uncertainty) in [
+            (Some("451 try again later\r\n"), false),
+            (None, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                writer.write_all(b"220 localhost SMTP\r\n").await.unwrap();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let response = if line.starts_with("EHLO ") {
+                        "250-localhost\r\n250 AUTH PLAIN\r\n"
+                    } else if line.starts_with("AUTH PLAIN ") {
+                        "235 authenticated\r\n"
+                    } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                        "250 OK\r\n"
+                    } else if line == "DATA" {
+                        writer.write_all(b"354 send data\r\n").await.unwrap();
+                        loop {
+                            let line = lines.next_line().await.unwrap().expect("SMTP message ended early");
+                            if line == "." {
+                                break;
+                            }
+                        }
+                        if let Some(reply) = final_reply {
+                            writer.write_all(reply.as_bytes()).await.unwrap();
+                        }
+                        return;
+                    } else {
+                        panic!("Unexpected SMTP command");
+                    };
+                    writer.write_all(response.as_bytes()).await.unwrap();
+                }
+                panic!("Client closed before sending the message");
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::send_mail(
+                    super::SmtpServer {
+                        host: "127.0.0.1", port, ssl_mode: "NONE",
+                        email: "sender@example.test", password: "fixture", xoauth2: false,
+                    },
+                    OutgoingMessage {
+                        from: "sender@example.test", to: vec!["recipient@example.test".into()],
+                        cc: vec![], bcc: vec![], subject: "Fixture", format: OutgoingMailFormat::Plain,
+                        html_body: "", plain_body: "Fixture body", attachments: &[], raw_headers: &[],
+                    },
+                ),
+            )
+            .await
+            .expect("SMTP test timeout");
+            assert_eq!(
+                result.expect_err("delivery error").delivery_uncertain,
+                expected_uncertainty,
+            );
+            server.await.unwrap();
+        }
+    }
 
     fn sample_attachment(disposition: OutgoingAttachmentDisposition) -> OutgoingAttachment {
         OutgoingAttachment {

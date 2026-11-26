@@ -1,3 +1,17 @@
+export function mailboxIdentity(mailbox) {
+  return /^inbox$/i.test(mailbox) ? 'INBOX' : mailbox
+}
+
+export function dedupeMailboxes(mailboxes) {
+  const unique = new Map()
+  for (const mailbox of mailboxes || []) {
+    if (typeof mailbox !== 'string' || !mailbox) continue
+    const key = mailboxIdentity(mailbox)
+    if (!unique.has(key)) unique.set(key, mailbox)
+  }
+  return [...unique.values()]
+}
+
 export function mailKey(mail, fallbackMailbox = 'INBOX') {
   if (mail?.id == null || mail.id === '') return ''
   return JSON.stringify([mail.mailbox || fallbackMailbox || 'INBOX', String(mail.id)])

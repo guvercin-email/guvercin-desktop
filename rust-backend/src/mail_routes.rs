@@ -508,59 +508,7 @@ pub async fn get_mail_list(
 
     if let Ok(pool) = crate::db::get_user_db_pool(&state._db, account_id).await {
         for mail in &mails {
-            let date_ms: i64 = DateTime::parse_from_rfc2822(&mail.date)
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or(0);
-            let labels_json =
-                serde_json::to_string(&mail.labels).unwrap_or_else(|_| "[]".to_string());
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO local_mail_cache (
-                    uid, folder, message_id, in_reply_to, references_value,
-                    sender_name, sender_address, recipient_to, subject, date_value, date_ms,
-                    seen, flagged, size_bytes, importance_value, content_type, category, labels_json, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(uid, folder) DO UPDATE SET
-                    message_id = excluded.message_id,
-                    in_reply_to = excluded.in_reply_to,
-                    references_value = excluded.references_value,
-                    sender_name = excluded.sender_name,
-                    sender_address = excluded.sender_address,
-                    recipient_to = excluded.recipient_to,
-                    subject = excluded.subject,
-                    date_value = excluded.date_value,
-                    date_ms = excluded.date_ms,
-                    seen = excluded.seen,
-                    flagged = excluded.flagged,
-                    size_bytes = excluded.size_bytes,
-                    importance_value = excluded.importance_value,
-                    content_type = excluded.content_type,
-                    category = excluded.category,
-                    labels_json = excluded.labels_json,
-                    updated_at = CURRENT_TIMESTAMP
-                "#,
-            )
-            .bind(&mail.id)
-            .bind(&q.mailbox)
-            .bind(&mail.message_id)
-            .bind(&mail.in_reply_to)
-            .bind(&mail.references)
-            .bind(&mail.name)
-            .bind(&mail.address)
-            .bind(&mail.recipient_to)
-            .bind(&mail.subject)
-            .bind(&mail.date)
-            .bind(date_ms)
-            .bind(mail.seen as i64)
-            .bind(mail.flagged as i64)
-            .bind(mail.size as i64)
-            .bind(mail.importance as i64)
-            .bind(&mail.content_type)
-            .bind(&mail.category)
-            .bind(&labels_json)
-            .execute(&pool)
-            .await;
+            let _ = crate::offline_routes::cache_mail_preview(&pool, &q.mailbox, mail).await;
         }
     }
 
@@ -639,13 +587,13 @@ pub async fn get_mail_content(
         let imap_state = state.imap.clone();
         let uid = uid.clone();
         let mailbox = q.mailbox.clone();
-        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_mail_raw_with_validity(&imap_state, account_id, &mailbox, &uid)
     })
     .await
     .ok()
     .flatten();
 
-    if let Some(raw_bytes) = raw {
+    if let Some((raw_bytes, uid_validity)) = raw {
         let is_drafts_mailbox = {
             let lower = q.mailbox.trim().to_ascii_lowercase();
             lower == "drafts"
@@ -666,7 +614,7 @@ pub async fn get_mail_content(
                 r#"
                 UPDATE local_mail_cache
                 SET plain_body = ?, html_body = ?, date_value = ?, date_ms = ?, cc_value = ?, bcc_value = ?, raw_rfc822 = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE uid = ? AND folder = ?
+                WHERE uid = ? AND folder = ? AND uid_validity = ?
                 "#,
             )
             .bind(&content.plain_body)
@@ -678,6 +626,7 @@ pub async fn get_mail_content(
             .bind(raw_bytes)
             .bind(&content.id)
             .bind(&q.mailbox)
+            .bind(uid_validity)
             .execute(&pool)
             .await;
         }

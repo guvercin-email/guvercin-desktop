@@ -587,25 +587,20 @@ async fn load_draft_attachments(
 }
 
 fn normalize_mailbox_list(values: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if normalized
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
-        {
-            continue;
-        }
-        normalized.push(trimmed.to_string());
-    }
-    normalized
+    let mut seen = std::collections::HashSet::new();
+    values.iter()
+        .filter(|value| !value.is_empty() && seen.insert(crate::mail_models::mailbox_identity(value)))
+        .cloned()
+        .collect()
 }
 
 fn parse_ymd(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
+}
+
+fn literal_search_pattern(value: &str) -> String {
+    let escaped = value.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+    format!("%{escaped}%")
 }
 
 fn apply_advanced_search_filters(
@@ -623,8 +618,7 @@ fn apply_advanced_search_filters(
     }
 
     if let Some(value) = req.from.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        let literal = value.replace('!', "!!").replace('%', "!%").replace('_', "!_");
-        let pattern = format!("%{literal}%");
+        let pattern = literal_search_pattern(value);
         qb.push(" AND (LOWER(COALESCE(sender_address, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
             .push(") ESCAPE '!' OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
@@ -633,17 +627,17 @@ fn apply_advanced_search_filters(
     }
 
     if let Some(value) = req.to.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        let pattern = format!("%{}%", value);
+        let pattern = literal_search_pattern(value);
         qb.push(" AND LOWER(COALESCE(recipient_to, '')) LIKE LOWER(")
             .push_bind(pattern)
-            .push(")");
+            .push(") ESCAPE '!'");
     }
 
     if let Some(value) = req.cc.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        let pattern = format!("%{}%", value);
+        let pattern = literal_search_pattern(value);
         qb.push(" AND LOWER(COALESCE(cc_value, '')) LIKE LOWER(")
             .push_bind(pattern)
-            .push(")");
+            .push(") ESCAPE '!'");
     }
 
     if let Some(value) = req
@@ -652,10 +646,10 @@ fn apply_advanced_search_filters(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        let pattern = format!("%{}%", value);
+        let pattern = literal_search_pattern(value);
         qb.push(" AND LOWER(COALESCE(subject, '')) LIKE LOWER(")
             .push_bind(pattern)
-            .push(")");
+            .push(") ESCAPE '!'");
     }
 
     if let Some(value) = req
@@ -664,22 +658,22 @@ fn apply_advanced_search_filters(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        let pattern = format!("%{}%", value);
+        let pattern = literal_search_pattern(value);
         qb.push(" AND (LOWER(COALESCE(plain_body, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(html_body, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(html_body, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(subject, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(subject, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(sender_address, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(sender_address, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(recipient_to, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(recipient_to, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(cc_value, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(cc_value, '')) LIKE LOWER(")
             .push_bind(pattern)
-            .push("))");
+            .push(") ESCAPE '!')");
     }
 
     if let Some(date) = req
@@ -877,7 +871,7 @@ pub async fn get_local_mailboxes(
         for mailbox in cached_mailboxes {
             if !mailboxes
                 .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&mailbox))
+                .any(|existing| crate::mail_models::mailbox_identity(existing) == crate::mail_models::mailbox_identity(&mailbox))
             {
                 mailboxes.push(mailbox);
             }
@@ -922,12 +916,14 @@ pub async fn get_mailbox_counts_cached(
 
 // Keep the source copy available for retries. Only the server can assign the
 // destination UID, so a pending move never creates a destination cache row.
+// A pending deletion also retains the source until the server confirms it.
 const VISIBLE_CACHED_MAIL: &str = r#"
     NOT EXISTS (
         SELECT 1 FROM offline_sync_queue AS pending
         WHERE pending.target_folder = local_mail_cache.folder
           AND pending.target_uid = local_mail_cache.uid
-          AND pending.action_type = 'move'
+          AND pending.uid_validity IS local_mail_cache.uid_validity
+          AND pending.action_type IN ('move', 'delete')
           AND pending.status IN ('pending', 'processing')
     )
 "#;
@@ -950,7 +946,7 @@ pub async fn get_local_mail_list(
 
     let rows = sqlx::query(&format!(
         r#"
-        SELECT uid, message_id, in_reply_to, references_value,
+        SELECT uid, uid_validity, message_id, in_reply_to, references_value,
                sender_name, sender_address, recipient_to, subject, date_value,
                seen, flagged, size_bytes, importance_value, content_type, category, labels_json
         FROM local_mail_cache
@@ -969,6 +965,7 @@ pub async fn get_local_mail_list(
         .into_iter()
         .map(|r| {
             let mut preview = MailPreview {
+                uid_validity: r.try_get::<Option<u32>, _>("uid_validity").ok().flatten(),
                 id: r.try_get::<String, _>("uid").unwrap_or_default(),
                 message_id: r
                     .try_get::<Option<String>, _>("message_id")
@@ -1070,7 +1067,7 @@ pub async fn sync_mailbox(
     Path(account_id): Path<i64>,
     Query(q): Query<SyncMailboxQuery>,
 ) -> Result<Json<SyncNowResponse>, AppError> {
-    let mailbox = q.mailbox.trim().to_string();
+    let mailbox = q.mailbox;
     let mailbox = if mailbox.is_empty() {
         "INBOX".to_string()
     } else {
@@ -1124,10 +1121,11 @@ pub async fn sync_mailbox(
         for preview in previews {
             let uid = preview.id.clone();
             let exists: bool = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? LIMIT 1",
+                "SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity IS ? LIMIT 1",
             )
             .bind(&uid)
             .bind(mailbox)
+            .bind(preview.uid_validity)
             .fetch_optional(pool)
             .await
             .ok()
@@ -1209,7 +1207,7 @@ pub async fn search_advanced(
 
     let mut qb = QueryBuilder::<Sqlite>::new(format!(
         r#"
-        SELECT uid, message_id, in_reply_to, references_value,
+        SELECT uid, uid_validity, message_id, in_reply_to, references_value,
                sender_name, sender_address, recipient_to, subject, date_value, seen, flagged,
                size_bytes, importance_value, content_type, category, labels_json, folder
         FROM local_mail_cache
@@ -1229,6 +1227,7 @@ pub async fn search_advanced(
                 .flatten()
                 .unwrap_or_default();
             let mut preview = MailPreview {
+                uid_validity: r.try_get::<Option<u32>, _>("uid_validity").ok().flatten(),
                 id: r.try_get::<String, _>("uid").unwrap_or_default(),
                 message_id: r
                     .try_get::<Option<String>, _>("message_id")
@@ -1518,7 +1517,6 @@ pub async fn prefetch_local_inline_assets(
         .into_response();
     }
 
-    let url_to_asset = cache_inline_assets_for_html(&pool, account_id, &html).await;
     let cid_to_attachment = raw
         .as_deref()
         .map(|raw_bytes| {
@@ -1526,8 +1524,7 @@ pub async fn prefetch_local_inline_assets(
             build_inline_cid_attachment_map(account_id, &uid, &q.mailbox, &content.attachments)
         })
         .unwrap_or_default();
-    let rewritten =
-        rewrite_html_inline_image_srcs(&html, account_id, &url_to_asset, &cid_to_attachment);
+    let rewritten = rewrite_html_inline_image_srcs(&html, &cid_to_attachment);
 
     if rewritten != html {
         let _ = sqlx::query(
@@ -1542,7 +1539,7 @@ pub async fn prefetch_local_inline_assets(
 
     Json(InlinePrefetchResponse {
         html_body: rewritten,
-        cached_count: url_to_asset.len() + cid_to_attachment.len(),
+        cached_count: cid_to_attachment.len(),
     })
     .into_response()
 }
@@ -1755,16 +1752,7 @@ pub async fn get_local_reply_seed(
     if raw.is_none() {
         let _ = ensure_imap_connected(&state._db, &state.imap, account_id).await;
         raw = imap_session::fetch_mail_raw_in_mailbox(&state.imap, account_id, &q.mailbox, &uid);
-        if let Some(ref raw_bytes) = raw {
-            let _ = sqlx::query(
-                "UPDATE local_mail_cache SET raw_rfc822 = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
-            )
-            .bind(raw_bytes)
-            .bind(&uid)
-            .bind(&q.mailbox)
-            .execute(&pool)
-            .await;
-        }
+
     }
 
     let Some(raw_bytes) = raw else {
@@ -2255,27 +2243,65 @@ pub async fn post_offline_action(
         .await?;
     }
 
+    let answered = parse_post_send_mark_answered(&payload_value);
+    let (uid, folder) = if payload.action_type == "send" {
+        answered.as_ref().map(|(uid, folder)| (Some(uid.as_str()), Some(folder.as_str())))
+            .unwrap_or((None, None))
+    } else {
+        (payload.target_uid.as_deref(), payload.target_folder.as_deref())
+    };
+    let uid_validity = match (uid, folder, payload.uid_validity) {
+        (_, _, Some(value)) => Some(value),
+        (Some(uid), Some(folder), None) => {
+            sqlx::query_scalar::<_, Option<u32>>(
+                "SELECT uid_validity FROM local_mail_cache WHERE uid = ? AND folder = ?",
+            )
+            .bind(uid)
+            .bind(folder)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten()
+        }
+        _ => None,
+    };
+    if requires_queued_uid(&payload.action_type) && uid_validity.filter(|value| *value > 0).is_none() {
+        return Err(AppError::BadRequest(
+            "Message UIDVALIDITY is unavailable. Refresh the folder and repeat the action.".into(),
+        ));
+    }
+
     let res = sqlx::query(
         r#"
-        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         "#,
     )
     .bind(&payload.action_type)
     .bind(&payload.target_uid)
     .bind(&payload.target_folder)
     .bind(payload_json)
+    .bind(uid_validity)
     .execute(&mut *tx)
     .await?;
 
-    apply_local_action_side_effects(
-        &mut tx,
-        &payload.action_type,
-        payload.target_uid.as_deref(),
-        payload.target_folder.as_deref(),
-        &payload_value,
+    let cached_target = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity = ?)",
     )
+    .bind(uid)
+    .bind(folder)
+    .bind(uid_validity)
+    .fetch_one(&mut *tx)
     .await?;
+    if cached_target {
+        apply_local_action_side_effects(
+            &mut tx,
+            &payload.action_type,
+            payload.target_uid.as_deref(),
+            payload.target_folder.as_deref(),
+            &payload_value,
+        )
+        .await?;
+    }
     tx.commit().await?;
 
     Ok(Json(OfflineActionResponse {
@@ -2316,7 +2342,9 @@ async fn sync_now_impl(
     state: &Arc<MailAppState>,
     account_id: i64,
 ) -> Result<(usize, usize), AppError> {
-    let (processed, failed) = process_queue_once(state, account_id, 200).await?;
+    let result = process_queue_once(state, account_id, 200).await;
+    set_transfer_sending(&state._db, account_id, None).await;
+    let (processed, failed) = result?;
     if ensure_imap_connected(&state._db, &state.imap, account_id)
         .await
         .is_ok()
@@ -2327,15 +2355,65 @@ async fn sync_now_impl(
     Ok((processed, failed))
 }
 
-pub async fn process_queue_once(
+// Called while holding the account's sync lock. A previous processor may have
+// stopped after the server applied an action but before SQLite recorded it.
+async fn recover_interrupted_queue(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE offline_sync_queue
+        SET status = CASE
+                WHEN action_type IN ('mark_read', 'mark_unread', 'label_remove') THEN 'pending'
+                ELSE 'dead'
+            END,
+            last_error = 'Synchronization interrupted; remote outcome not confirmed.',
+            next_retry_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'processing'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn discard_superseded_read_actions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE offline_sync_queue AS older
+        SET status = 'done', last_error = NULL, next_retry_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE older.status IN ('pending', 'failed')
+          AND older.action_type IN ('mark_read', 'mark_unread')
+          AND EXISTS (
+              SELECT 1 FROM offline_sync_queue AS newer
+              WHERE newer.id > older.id
+                AND newer.target_uid = older.target_uid
+                AND newer.target_folder = older.target_folder
+                AND newer.uid_validity IS older.uid_validity
+                AND newer.action_type IN ('mark_read', 'mark_unread')
+          )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn requires_queued_uid(action: &str) -> bool {
+    matches!(action, "mark_read" | "mark_unread" | "delete" | "move" | "label_add" | "label_remove" | "forward")
+}
+
+async fn process_queue_once(
     state: &Arc<MailAppState>,
     account_id: i64,
     limit: usize,
 ) -> Result<(usize, usize), AppError> {
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    recover_interrupted_queue(&pool).await?;
+    discard_superseded_read_actions(&pool).await?;
     let rows = sqlx::query(
         r#"
-        SELECT id, action_type, target_uid, target_folder, payload_json, attempt_count
+        SELECT id, action_type, target_uid, target_folder, payload_json, attempt_count, uid_validity
         FROM offline_sync_queue
         WHERE status = 'pending'
            OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP))
@@ -2405,71 +2483,40 @@ pub async fn process_queue_once(
         let parsed: serde_json::Value =
             serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
 
-        let result = if is_removed_flag_action(action_type.as_str()) {
+        use imap_session::QueuedMailAction;
+        let uid_validity = row.try_get::<Option<u32>, _>("uid_validity")?;
+        let mut remote_outcome_uncertain = false;
+        let mut apply = |action| {
+            imap_session::apply_queued_mail_action(
+                &state.imap, account_id, &target_folder, &target_uid, uid_validity, action,
+            )
+            .map_err(|error| {
+                remote_outcome_uncertain = !error.retryable;
+                error.message
+            })
+        };
+        let result = if requires_queued_uid(&action_type) && uid_validity.filter(|value| *value > 0).is_none() {
+            remote_outcome_uncertain = true;
+            Err("Queued message has no UIDVALIDITY. Refresh the folder and repeat the action.".into())
+        } else if is_removed_flag_action(action_type.as_str()) {
             Ok(())
         } else {
             match action_type.as_str() {
-                "mark_read" => imap_session::mark_seen(
-                    &state.imap,
-                    account_id,
-                    &target_folder,
-                    &target_uid,
-                    true,
-                ),
-                "mark_unread" => imap_session::mark_seen(
-                    &state.imap,
-                    account_id,
-                    &target_folder,
-                    &target_uid,
-                    false,
-                ),
-                "delete" => {
-                    imap_session::delete_mail(&state.imap, account_id, &target_folder, &target_uid)
-                }
+                "mark_read" => apply(QueuedMailAction::Seen(true)),
+                "mark_unread" => apply(QueuedMailAction::Seen(false)),
+                "delete" => apply(QueuedMailAction::Delete),
                 "move" => {
-                    let destination = parsed
-                        .get("destination")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(target_folder.as_str());
-                    if destination == target_folder {
+                    let destination = parsed.get("destination").and_then(|value| value.as_str())
+                        .unwrap_or(&target_folder);
+                    if crate::mail_models::mailbox_identity(destination) == crate::mail_models::mailbox_identity(&target_folder) {
                         Ok(())
                     } else {
-                        imap_session::move_mail(
-                            &state.imap,
-                            account_id,
-                            &target_folder,
-                            &target_uid,
-                            destination,
-                        )
+                        apply(QueuedMailAction::Move(destination))
                     }
                 }
-                "label_add" => {
-                    let label = parsed
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    imap_session::set_label(
-                        &state.imap,
-                        account_id,
-                        &target_folder,
-                        &target_uid,
-                        label,
-                        true,
-                    )
-                }
-                "label_remove" => {
-                    let label = parsed
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    imap_session::set_label(
-                        &state.imap,
-                        account_id,
-                        &target_folder,
-                        &target_uid,
-                        label,
-                        false,
-                    )
+                "label_add" | "label_remove" => {
+                    let label = parsed.get("label").and_then(|value| value.as_str()).unwrap_or_default();
+                    apply(QueuedMailAction::Label(label, action_type == "label_add"))
                 }
                 "send" => {
                     let account_row = sqlx::query(
@@ -2607,17 +2654,17 @@ pub async fn process_queue_once(
                                                     account_id,
                                                 )
                                                 .await;
-                                                let _ = imap_session::mark_answered(
-                                                    &state.imap,
-                                                    account_id,
-                                                    &mailbox,
-                                                    &uid,
-                                                    true,
+                                                let _ = imap_session::apply_queued_mail_action(
+                                                    &state.imap, account_id, &mailbox, &uid,
+                                                    uid_validity, QueuedMailAction::Answered,
                                                 );
                                             }
                                             Ok(())
                                         }
-                                        Err(err) => Err(err),
+                                        Err(err) => {
+                                            remote_outcome_uncertain = err.delivery_uncertain;
+                                            Err(err.message)
+                                        }
                                     }
                                 }
                             }
@@ -2691,44 +2738,23 @@ pub async fn process_queue_once(
                                         .to_string();
                                     let extra_attachments = parse_send_attachments(&parsed);
 
-                                    let cached_raw: Option<Vec<u8>> = sqlx::query_scalar(
-                                        "SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ?",
+                                    let _ = ensure_imap_connected(&state._db, &state.imap, account_id).await;
+                                    let cached_raw = sqlx::query_scalar::<_, Option<Vec<u8>>>(
+                                        "SELECT raw_rfc822 FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity = ?",
                                     )
                                     .bind(&target_uid)
                                     .bind(&target_folder)
+                                    .bind(uid_validity)
                                     .fetch_optional(&pool)
                                     .await?
                                     .flatten();
-                                    let raw_was_cached = cached_raw.is_some();
-
-                                    let mut raw = cached_raw;
-                                    if raw.is_none() {
-                                        let _ = ensure_imap_connected(
-                                            &state._db,
-                                            &state.imap,
-                                            account_id,
-                                        )
-                                        .await;
-                                        raw = imap_session::fetch_mail_raw_in_mailbox(
-                                            &state.imap,
-                                            account_id,
-                                            &target_folder,
-                                            &target_uid,
-                                        );
+                                    let raw = imap_session::fetch_queued_mail_raw(
+                                        &state.imap, account_id, &target_folder, &target_uid, uid_validity, cached_raw,
+                                    );
+                                    if let Err(error) = &raw {
+                                        remote_outcome_uncertain = !error.retryable;
                                     }
-
-                                    if let Some(raw_bytes) = raw {
-                                        if !raw_was_cached {
-                                            let _ = sqlx::query(
-	                                                "UPDATE local_mail_cache SET raw_rfc822 = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
-	                                            )
-                                            .bind(&raw_bytes)
-                                            .bind(&target_uid)
-                                            .bind(&target_folder)
-                                            .execute(&pool)
-                                            .await;
-                                        }
-
+                                    if let Ok(Some(raw_bytes)) = raw {
                                         let (subject, format, html_body, plain_body, attachments) =
                                             if forward_style == "eml" {
                                                 let content = imap_session::parse_mail_content(
@@ -2878,6 +2904,10 @@ pub async fn process_queue_once(
                                                     },
                                                 )
                                                 .await
+                                                .map_err(|err| {
+                                                    remote_outcome_uncertain = err.delivery_uncertain;
+                                                    err.message
+                                                })
                                             }
                                         };
 
@@ -2888,18 +2918,16 @@ pub async fn process_queue_once(
                                                 account_id,
                                             )
                                             .await;
-                                            let _ = imap_session::mark_forwarded(
-                                                &state.imap,
-                                                account_id,
-                                                &target_folder,
-                                                &target_uid,
-                                                true,
+                                            let _ = imap_session::apply_queued_mail_action(
+                                                &state.imap, account_id, &target_folder, &target_uid,
+                                                uid_validity, QueuedMailAction::Forwarded,
                                             );
                                         }
 
                                         result
                                     } else {
-                                        Err("Raw mail not available for forward (not cached offline and IMAP unavailable)".to_string())
+                                        Err(raw.err().map(|error| error.message)
+                                            .unwrap_or_else(|| "Original message is unavailable for forwarding.".into()))
                                     }
                                 }
                             }
@@ -3183,11 +3211,14 @@ pub async fn process_queue_once(
         match result {
             Ok(_) => {
                 let mut tx = pool.begin().await?;
-                if action_type == "move"
-                    && parsed.get("destination").and_then(|value| value.as_str())
-                        .is_some_and(|destination| destination != target_folder)
+                if action_type == "delete"
+                    || (action_type == "move"
+                        && parsed.get("destination").and_then(|value| value.as_str())
+                            .is_some_and(|destination|
+                                crate::mail_models::mailbox_identity(destination)
+                                    != crate::mail_models::mailbox_identity(&target_folder)))
                 {
-                    remove_moved_source(&mut tx, &target_uid, &target_folder).await?;
+                    remove_cached_source(&mut tx, &target_uid, &target_folder, uid_validity).await?;
                 }
                 sqlx::query(
                     r#"
@@ -3205,9 +3236,13 @@ pub async fn process_queue_once(
             Err(err_msg) => {
                 failed += 1;
                 let attempts = attempt_count + 1;
-                let new_status = if attempts >= 8 { "dead" } else { "failed" };
+                let new_status = if remote_outcome_uncertain || attempts >= 8 {
+                    "dead"
+                } else {
+                    "failed"
+                };
                 let backoff_secs = i64::pow(2, attempts.min(6) as u32);
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"
                     UPDATE offline_sync_queue
                     SET status = ?,
@@ -3224,7 +3259,7 @@ pub async fn process_queue_once(
                 .bind(backoff_secs)
                 .bind(id)
                 .execute(&pool)
-                .await;
+                .await?;
             }
         }
 
@@ -3246,7 +3281,6 @@ pub async fn process_queue_once(
         .await;
     }
 
-    set_transfer_sending(&state._db, account_id, None).await;
     Ok((processed, failed))
 }
 
@@ -3638,14 +3672,15 @@ async fn sync_specific_uids(
                 };
                 sqlx::query(
                     r#"
-                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity)
+                    VALUES (?, ?, ?, ?, ?)
                     "#,
                 )
                 .bind(&action)
                 .bind(uid.to_string())
                 .bind(mailbox)
                 .bind(action_payload.to_string())
+                .bind(mail.uid_validity)
                 .execute(pool)
                 .await?;
                 break;
@@ -3784,14 +3819,16 @@ fn mailbox_is_selected(mailbox: &str, includes: &[String], excludes: &[String]) 
     included && !excluded
 }
 
-async fn remove_moved_source(
+async fn remove_cached_source(
     db: &mut sqlx::SqliteConnection,
     uid: &str,
     folder: &str,
+    uid_validity: Option<u32>,
 ) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
+    sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity IS ?")
         .bind(uid)
         .bind(folder)
+        .bind(uid_validity)
         .execute(db)
         .await?;
     Ok(())
@@ -3827,13 +3864,6 @@ async fn apply_local_action_side_effects(
             .bind(folder)
             .execute(&mut *db)
             .await?;
-        }
-        "delete" => {
-            sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
-                .bind(uid)
-                .bind(folder)
-                .execute(&mut *db)
-                .await?;
         }
         "label_add" | "label_remove" => {
             let Some(label) = payload
@@ -3951,16 +3981,16 @@ async fn sync_single_mailbox(
     .await
     .unwrap_or((0, vec![]));
 
-    let uids_to_sync: Vec<u32> = if last_synced_uid == 0 {
-        let mut filtered = new_uids;
+    let mut uids_to_sync = new_uids;
+    if last_synced_uid == 0 {
         if let Some(max_count) = limit {
-            let skip = filtered.len().saturating_sub(max_count);
-            filtered = filtered[skip..].to_vec();
+            uids_to_sync.truncate(max_count);
         }
-        filtered
     } else {
-        new_uids
-    };
+        // Consume incremental UIDs oldest-first so each stored checkpoint
+        // describes the portion of the mailbox already visited.
+        uids_to_sync.reverse();
+    }
 
     if uids_to_sync.is_empty() {
         tracing::debug!("No new messages for mailbox {mailbox} (checkpoint UID={last_synced_uid})");
@@ -4021,9 +4051,6 @@ async fn sync_single_mailbox(
 
         let aligned = align_previews_to_uids(&chunk_uids, &mails);
         for (uid, mail) in aligned {
-            if limit.is_some_and(|max_count| synced_count >= max_count) {
-                break 'outer;
-            }
             if cutoff
                 .as_ref()
                 .is_some_and(|threshold| mail_date_before_threshold(&mail.date, threshold))
@@ -4048,14 +4075,15 @@ async fn sync_single_mailbox(
                 };
                 sqlx::query(
                     r#"
-                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity)
+                    VALUES (?, ?, ?, ?, ?)
                     "#,
                 )
                 .bind(&action)
                 .bind(uid.to_string())
                 .bind(mailbox)
                 .bind(action_payload.to_string())
+                .bind(mail.uid_validity)
                 .execute(pool)
                 .await?;
                 break;
@@ -4144,22 +4172,6 @@ fn align_previews_to_uids(chunk_uids: &[u32], previews: &[MailPreview]) -> Vec<(
         }
     }
 
-    let matched = idx_by_uid.len();
-    let fallback_positional =
-        previews.len() == chunk_uids.len() && (matched == 0 || matched < (previews.len() / 2));
-
-    if fallback_positional {
-        return chunk_uids
-            .iter()
-            .copied()
-            .zip(previews.iter().cloned())
-            .map(|(uid, mut preview)| {
-                preview.id = uid.to_string();
-                (uid, preview)
-            })
-            .collect();
-    }
-
     chunk_uids
         .iter()
         .copied()
@@ -4242,7 +4254,7 @@ pub async fn add_blocked_sender(
 
     if payload.apply_to_existing {
         let rows = sqlx::query(
-            "SELECT uid, folder FROM local_mail_cache WHERE TRIM(sender_address) = ? COLLATE NOCASE"
+            "SELECT uid, folder, uid_validity FROM local_mail_cache WHERE TRIM(sender_address) = ? COLLATE NOCASE"
         )
         .bind(sender)
         .fetch_all(&mut *tx)
@@ -4275,14 +4287,15 @@ pub async fn add_blocked_sender(
 
             sqlx::query(
                 r#"
-                INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity)
+                VALUES (?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&action)
             .bind(&uid)
             .bind(&folder)
             .bind(action_payload.to_string())
+            .bind(row.try_get::<Option<u32>, _>("uid_validity")?)
             .execute(&mut *tx)
             .await?;
         }
@@ -4339,7 +4352,7 @@ pub async fn update_blocked_sender(
     Ok(Json(record))
 }
 
-async fn cache_mail_preview(
+pub(crate) async fn cache_mail_preview(
     pool: &SqlitePool,
     mailbox: &str,
     mail: &MailPreview,
@@ -4354,12 +4367,18 @@ async fn cache_mail_preview(
     sqlx::query(
         r#"
         INSERT INTO local_mail_cache (
-            uid, folder, message_id, in_reply_to, references_value,
+            uid, folder, uid_validity, message_id, in_reply_to, references_value,
             sender_name, sender_address, recipient_to, subject, seen, flagged,
             date_value, date_ms, size_bytes, importance_value, content_type, category, labels_json, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(uid, folder) DO UPDATE SET
+            plain_body = CASE WHEN uid_validity IS excluded.uid_validity THEN plain_body END,
+            html_body = CASE WHEN uid_validity IS excluded.uid_validity THEN html_body END,
+            raw_rfc822 = CASE WHEN uid_validity IS excluded.uid_validity THEN raw_rfc822 END,
+            cc_value = CASE WHEN uid_validity IS excluded.uid_validity THEN cc_value END,
+            bcc_value = CASE WHEN uid_validity IS excluded.uid_validity THEN bcc_value END,
+            uid_validity = excluded.uid_validity,
             message_id = excluded.message_id,
             in_reply_to = excluded.in_reply_to,
             references_value = excluded.references_value,
@@ -4381,6 +4400,7 @@ async fn cache_mail_preview(
     )
     .bind(&mail.id)
     .bind(mailbox)
+    .bind(mail.uid_validity)
     .bind(&mail.message_id)
     .bind(&mail.in_reply_to)
     .bind(&mail.references)
@@ -4476,11 +4496,21 @@ async fn cache_mail_body(
     uid: &str,
     cache_raw_rfc822: bool,
 ) -> Result<(), AppError> {
+    let uid_validity = sqlx::query_scalar::<_, Option<u32>>(
+        "SELECT uid_validity FROM local_mail_cache WHERE uid = ? AND folder = ?",
+    )
+    .bind(uid)
+    .bind(mailbox)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
     let raw = tokio::task::spawn_blocking({
         let imap_state = imap_state.clone();
         let mailbox = mailbox.to_string();
         let uid = uid.to_string();
-        move || imap_session::fetch_mail_raw_in_mailbox(&imap_state, account_id, &mailbox, &uid)
+        move || imap_session::fetch_queued_mail_raw(
+            &imap_state, account_id, &mailbox, &uid, uid_validity, None,
+        ).ok().flatten()
     })
     .await
     .ok()
@@ -4490,15 +4520,9 @@ async fn cache_mail_body(
         return Ok(());
     };
     let content = imap_session::parse_mail_content(uid.to_string(), &raw);
-    let url_to_asset = cache_inline_assets_for_html(pool, account_id, &content.html_body).await;
     let cid_to_attachment =
         build_inline_cid_attachment_map(account_id, uid, mailbox, &content.attachments);
-    let rewritten_html = rewrite_html_inline_image_srcs(
-        &content.html_body,
-        account_id,
-        &url_to_asset,
-        &cid_to_attachment,
-    );
+    let rewritten_html = rewrite_html_inline_image_srcs(&content.html_body, &cid_to_attachment);
     let date_ms: i64 = DateTime::parse_from_rfc2822(&content.date)
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0);
@@ -4507,7 +4531,7 @@ async fn cache_mail_body(
         r#"
         UPDATE local_mail_cache
         SET plain_body = ?, html_body = ?, date_value = ?, date_ms = ?, cc_value = ?, bcc_value = ?, raw_rfc822 = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE uid = ? AND folder = ?
+        WHERE uid = ? AND folder = ? AND uid_validity = ?
         "#,
     )
     .bind(&content.plain_body)
@@ -4519,6 +4543,7 @@ async fn cache_mail_body(
     .bind(if cache_raw_rfc822 { Some(raw) } else { None })
     .bind(uid)
     .bind(mailbox)
+    .bind(uid_validity)
     .execute(pool)
     .await?;
 
@@ -4547,107 +4572,15 @@ async fn cache_mail_body(
     Ok(())
 }
 
-fn inline_asset_id(url: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in url.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-async fn cache_inline_assets_for_html(
-    pool: &SqlitePool,
-    _account_id: i64,
-    html: &str,
-) -> std::collections::HashMap<String, String> {
-    use std::{collections::HashMap, time::Duration};
-
-    const MAX_INLINE_IMAGES_PER_MAIL: usize = 20;
-    const MAX_INLINE_ASSET_BYTES: usize = 2 * 1024 * 1024;
-
-    if html.is_empty() {
-        return HashMap::new();
-    }
-
-    let mut urls = extract_inline_img_urls(html);
-    urls.sort();
-    urls.dedup();
-    urls.truncate(MAX_INLINE_IMAGES_PER_MAIL);
-
-    let mut out: HashMap<String, String> = HashMap::new();
-    for url in urls {
-        let asset_id = inline_asset_id(&url);
-
-        if let Ok(Some(_)) = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM inline_asset_cache WHERE asset_id = ? LIMIT 1",
-        )
-        .bind(&asset_id)
-        .fetch_optional(pool)
-        .await
-        {
-            out.insert(url, asset_id);
-            continue;
-        }
-
-        let url_clone = url.clone();
-        let fetched = tokio::task::spawn_blocking(move || {
-            fetch_inline_asset_http(&url_clone, MAX_INLINE_ASSET_BYTES, Duration::from_secs(8))
-        })
-        .await
-        .ok()
-        .flatten();
-
-        let Some((content_type, body)) = fetched else {
-            continue;
-        };
-
-        if !content_type.to_ascii_lowercase().starts_with("image/") || body.is_empty() {
-            continue;
-        }
-
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO inline_asset_cache (asset_id, url, content_type, body, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(asset_id) DO UPDATE SET
-                url = excluded.url,
-                content_type = excluded.content_type,
-                body = excluded.body,
-                updated_at = CURRENT_TIMESTAMP
-            "#,
-        )
-        .bind(&asset_id)
-        .bind(&url)
-        .bind(&content_type)
-        .bind(&body)
-        .execute(pool)
-        .await;
-
-        out.insert(url, asset_id);
-    }
-
-    out
-}
-
 fn rewrite_html_inline_image_srcs(
     html: &str,
-    account_id: i64,
-    url_to_asset: &std::collections::HashMap<String, String>,
     cid_to_attachment: &std::collections::HashMap<String, String>,
 ) -> String {
-    if html.is_empty() || (url_to_asset.is_empty() && cid_to_attachment.is_empty()) {
+    if html.is_empty() || cid_to_attachment.is_empty() {
         return html.to_string();
     }
 
     let mut out = html.to_string();
-    for (url, asset_id) in url_to_asset {
-        let local = format!(
-            "http://127.0.0.1:5000/api/offline/{}/inline-assets/{}",
-            account_id, asset_id
-        );
-        out = out.replace(url, &local);
-    }
     for (cid_src, local_url) in cid_to_attachment {
         out = out.replace(cid_src, local_url);
         let lower = cid_src.to_ascii_lowercase();
@@ -4656,240 +4589,6 @@ fn rewrite_html_inline_image_srcs(
         }
     }
     out
-}
-
-fn extract_inline_img_urls(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut urls = Vec::new();
-    let mut pos = 0usize;
-    while let Some(img_idx) = lower[pos..].find("<img") {
-        let start = pos + img_idx;
-        let tag_end = lower[start..]
-            .find('>')
-            .map(|i| start + i)
-            .unwrap_or(lower.len());
-        let tag_lower = &lower[start..tag_end];
-        if let Some(src_idx) = tag_lower.find("src=") {
-            let mut i = start + src_idx + 4;
-
-            while i < tag_end && lower.as_bytes()[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= tag_end {
-                pos = tag_end;
-                continue;
-            }
-            let quote = lower.as_bytes()[i];
-            let (url_start, url_end) = if quote == b'"' || quote == b'\'' {
-                i += 1;
-                let j = lower[i..tag_end]
-                    .find(quote as char)
-                    .map(|k| i + k)
-                    .unwrap_or(tag_end);
-                (i, j)
-            } else {
-                let j = lower[i..tag_end]
-                    .find(|c: char| c.is_whitespace() || c == '>')
-                    .map(|k| i + k)
-                    .unwrap_or(tag_end);
-                (i, j)
-            };
-            if url_end > url_start && url_end <= html.len() {
-                let url = html[url_start..url_end].trim().to_string();
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    urls.push(url);
-                }
-            }
-        }
-        pos = tag_end;
-    }
-    urls
-}
-
-fn fetch_inline_asset_http(
-    url: &str,
-    max_bytes: usize,
-    timeout: std::time::Duration,
-) -> Option<(String, Vec<u8>)> {
-    fetch_inline_asset_http_inner(url, max_bytes, timeout, 1)
-}
-
-fn fetch_inline_asset_http_inner(
-    url: &str,
-    max_bytes: usize,
-    timeout: std::time::Duration,
-    redirects_left: usize,
-) -> Option<(String, Vec<u8>)> {
-    use native_tls::TlsConnector;
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
-        ("https", r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        ("http", r)
-    } else {
-        return None;
-    };
-
-    let (host_port, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if !h.contains(']') && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse::<u16>().ok()?)
-        }
-        _ => (host_port, if scheme == "https" { 443 } else { 80 }),
-    };
-
-    let mut stream = TcpStream::connect((host, port)).ok()?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: guvercin\r\nAccept: image/*\r\nConnection: close\r\n\r\n",
-        path, host
-    )
-    .into_bytes();
-
-    if scheme == "https" {
-        let connector = TlsConnector::new().ok()?;
-        let mut tls = connector.connect(host, stream).ok()?;
-        tls.write_all(&request).ok()?;
-        tls.flush().ok()?;
-        let mut buf = Vec::new();
-        tls.read_to_end(&mut buf).ok()?;
-        match parse_http_response(&buf, max_bytes) {
-            HttpFetchResult::Image(ct, body) => Some((ct, body)),
-            HttpFetchResult::Redirect(location) => {
-                if redirects_left == 0 {
-                    None
-                } else if location.starts_with("http://") || location.starts_with("https://") {
-                    fetch_inline_asset_http_inner(&location, max_bytes, timeout, redirects_left - 1)
-                } else {
-                    None
-                }
-            }
-            HttpFetchResult::Other => None,
-        }
-    } else {
-        stream.write_all(&request).ok()?;
-        stream.flush().ok()?;
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).ok()?;
-        match parse_http_response(&buf, max_bytes) {
-            HttpFetchResult::Image(ct, body) => Some((ct, body)),
-            HttpFetchResult::Redirect(location) => {
-                if redirects_left == 0 {
-                    None
-                } else if location.starts_with("http://") || location.starts_with("https://") {
-                    fetch_inline_asset_http_inner(&location, max_bytes, timeout, redirects_left - 1)
-                } else {
-                    None
-                }
-            }
-            HttpFetchResult::Other => None,
-        }
-    }
-}
-
-enum HttpFetchResult {
-    Image(String, Vec<u8>),
-    Redirect(String),
-    Other,
-}
-
-fn parse_http_response(buf: &[u8], max_bytes: usize) -> HttpFetchResult {
-    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return HttpFetchResult::Other;
-    };
-    let headers = &buf[..header_end];
-    let mut body = buf[header_end + 4..].to_vec();
-
-    let header_str = String::from_utf8_lossy(headers);
-    let mut lines = header_str.lines();
-    let Some(status_line) = lines.next().map(|v| v.trim()) else {
-        return HttpFetchResult::Other;
-    };
-    let Some(status) = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse::<u16>().ok())
-    else {
-        return HttpFetchResult::Other;
-    };
-    let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308);
-
-    let mut content_type = "application/octet-stream".to_string();
-    let mut transfer_chunked = false;
-    let mut location: Option<String> = None;
-    for line in lines {
-        let line = line.trim();
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim().to_ascii_lowercase();
-            let value = v.trim();
-            if key == "content-type" {
-                content_type = value.split(';').next().unwrap_or(value).trim().to_string();
-            } else if key == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
-                transfer_chunked = true;
-            } else if key == "location" {
-                location = Some(value.to_string());
-            } else if key == "content-encoding" {
-                return HttpFetchResult::Other;
-            }
-        }
-    }
-
-    if is_redirect {
-        if let Some(loc) = location {
-            return HttpFetchResult::Redirect(loc);
-        }
-        return HttpFetchResult::Other;
-    }
-
-    if !(200..300).contains(&status) {
-        return HttpFetchResult::Other;
-    }
-
-    if transfer_chunked {
-        body = match decode_chunked_body(&body) {
-            Some(v) => v,
-            None => return HttpFetchResult::Other,
-        };
-    }
-
-    if body.len() > max_bytes {
-        return HttpFetchResult::Other;
-    }
-
-    HttpFetchResult::Image(content_type, body)
-}
-
-fn decode_chunked_body(input: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < input.len() {
-        let line_end = input[i..].windows(2).position(|w| w == b"\r\n")?;
-        let line = &input[i..i + line_end];
-        let size_str = String::from_utf8_lossy(line);
-        let size = usize::from_str_radix(size_str.trim(), 16).ok()?;
-        i += line_end + 2;
-        if size == 0 {
-            return Some(out);
-        }
-        if i + size > input.len() {
-            return None;
-        }
-        out.extend_from_slice(&input[i..i + size]);
-        i += size;
-
-        if i + 2 <= input.len() && &input[i..i + 2] == b"\r\n" {
-            i += 2;
-        }
-    }
-    Some(out)
 }
 
 async fn set_account_sync_status(
@@ -4966,8 +4665,38 @@ mod tests {
         assert_eq!(matching, ["a_b@example.com"]);
     }
 
+    #[tokio::test]
+    async fn advanced_subject_search_treats_percent_underscore_and_escape_as_text() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE mail (subject TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO mail VALUES ('Report !_100%'), ('Report !x100 days')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT subject FROM mail WHERE 1 = 1");
+        apply_advanced_search_filters(
+            &mut query,
+            &AdvancedSearchRequest {
+                subject: Some("!_100%".to_string()),
+                ..Default::default()
+            },
+            &[],
+        );
+        let matching = query.build_query_scalar::<String>().fetch_all(&pool).await.unwrap();
+        assert_eq!(matching, ["Report !_100%"]);
+    }
+
     fn preview(id: &str) -> MailPreview {
         MailPreview {
+            uid_validity: None,
             id: id.to_string(),
             message_id: String::new(),
             in_reply_to: String::new(),
@@ -5000,15 +4729,10 @@ mod tests {
     }
 
     #[test]
-    fn align_previews_falls_back_to_positional_when_ids_not_uids() {
+    fn align_previews_rejects_unrequested_uids_even_when_response_length_matches() {
         let chunk = vec![5001, 5002];
         let previews = vec![preview("1"), preview("2")];
-        let aligned = align_previews_to_uids(&chunk, &previews);
-        assert_eq!(aligned.len(), 2);
-        assert_eq!(aligned[0].0, 5001);
-        assert_eq!(aligned[0].1.id, "5001");
-        assert_eq!(aligned[1].0, 5002);
-        assert_eq!(aligned[1].1.id, "5002");
+        assert!(align_previews_to_uids(&chunk, &previews).is_empty());
     }
 
     #[test]
@@ -5149,75 +4873,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_move_preserves_the_source_for_retry_and_never_reuses_its_uid() {
+    async fn interrupted_queue_only_retries_repeatable_actions() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE local_mail_cache (uid TEXT, folder TEXT, UNIQUE(uid, folder))")
-            .execute(&pool)
-            .await
-            .unwrap();
         sqlx::query(
             "CREATE TABLE offline_sync_queue (
-                target_uid TEXT, target_folder TEXT, action_type TEXT, status TEXT
+                action_type TEXT, status TEXT, last_error TEXT, next_retry_at TEXT, updated_at TEXT
             )",
         )
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO local_mail_cache VALUES ('123', 'INBOX'), ('123', 'Trash')")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        sqlx::query("INSERT INTO offline_sync_queue VALUES ('123', 'INBOX', 'move', 'pending')")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        apply_local_action_side_effects(
-            &mut tx,
-            "move",
-            Some("123"),
-            Some("INBOX"),
-            &json!({ "destination": "Archive" }),
+        sqlx::query(
+            "INSERT INTO offline_sync_queue (action_type, status) VALUES
+                ('mark_unread', 'processing'), ('send', 'processing'),
+                ('move', 'processing'), ('forward', 'pending')",
         )
+        .execute(&pool)
         .await
         .unwrap();
-        tx.commit().await.unwrap();
 
-        let visible_query =
-            format!("SELECT folder FROM local_mail_cache WHERE {VISIBLE_CACHED_MAIL} ORDER BY folder");
-        let pending: Vec<String> = sqlx::query_scalar(&visible_query)
+        recover_interrupted_queue(&pool).await.unwrap();
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT action_type, status, last_error IS NOT NULL FROM offline_sync_queue ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [
+            ("mark_unread".into(), "pending".into(), true),
+            ("send".into(), "dead".into(), true),
+            ("move".into(), "dead".into(), true),
+            ("forward".into(), "pending".into(), false),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_read_retry_cannot_overwrite_a_newer_unread_action() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE offline_sync_queue (
+                id INTEGER PRIMARY KEY, action_type TEXT, target_uid TEXT, target_folder TEXT,
+                status TEXT, last_error TEXT, next_retry_at TEXT, updated_at TEXT, uid_validity INTEGER
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, status) VALUES
+                ('mark_read', '42', 'INBOX', 'failed'),
+                ('mark_read', '42', 'Archive', 'failed'),
+                ('mark_unread', '42', 'INBOX', 'done')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        discard_superseded_read_actions(&pool).await.unwrap();
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM offline_sync_queue ORDER BY id")
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(pending, ["Trash"]);
+        assert_eq!(statuses, ["done", "failed", "done"]);
+    }
 
-        sqlx::query("UPDATE offline_sync_queue SET status = 'failed'")
+    #[test]
+    fn caching_inline_attachments_preserves_remote_links_for_the_renderer() {
+        let html = r#"<img src="cid:logo"><img src="https://example.test/pixel.png">"#;
+        let attachments = std::collections::HashMap::from([
+            ("cid:logo".to_string(), "/api/offline/1/attachment".to_string()),
+        ]);
+        assert_eq!(
+            rewrite_html_inline_image_srcs(html, &attachments),
+            r#"<img src="/api/offline/1/attachment"><img src="https://example.test/pixel.png">"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_removal_preserves_the_source_for_retry_and_never_reuses_its_uid() {
+        for action in ["move", "delete"] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE local_mail_cache (uid TEXT, folder TEXT, uid_validity INTEGER, UNIQUE(uid, folder))")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE offline_sync_queue (
+                    target_uid TEXT, target_folder TEXT, action_type TEXT, status TEXT, uid_validity INTEGER
+                )",
+            )
             .execute(&pool)
             .await
             .unwrap();
-        let failed: Vec<String> = sqlx::query_scalar(&visible_query)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(failed, ["INBOX", "Trash"]);
+            sqlx::query("INSERT INTO local_mail_cache VALUES ('123', 'INBOX', 5), ('123', 'Trash', 5)")
+                .execute(&pool)
+                .await
+                .unwrap();
 
-        let mut tx = pool.begin().await.unwrap();
-        remove_moved_source(&mut tx, "123", "INBOX").await.unwrap();
-        sqlx::query("UPDATE offline_sync_queue SET status = 'done'")
-            .execute(&mut *tx)
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("INSERT INTO offline_sync_queue VALUES ('123', 'INBOX', ?, 'pending', 5)")
+                .bind(action)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            apply_local_action_side_effects(
+                &mut tx,
+                action,
+                Some("123"),
+                Some("INBOX"),
+                &json!({ "destination": "Archive" }),
+            )
             .await
             .unwrap();
-        tx.commit().await.unwrap();
-        let remaining: Vec<String> = sqlx::query_scalar("SELECT folder FROM local_mail_cache")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(remaining, ["Trash"]);
+            tx.commit().await.unwrap();
+
+            let visible_query =
+                format!("SELECT folder FROM local_mail_cache WHERE {VISIBLE_CACHED_MAIL} ORDER BY folder");
+            let pending: Vec<String> = sqlx::query_scalar(&visible_query)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(pending, ["Trash"]);
+
+            sqlx::query("UPDATE offline_sync_queue SET status = 'failed'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let failed: Vec<String> = sqlx::query_scalar(&visible_query)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(failed, ["INBOX", "Trash"]);
+
+            let mut tx = pool.begin().await.unwrap();
+            remove_cached_source(&mut tx, "123", "INBOX", Some(5)).await.unwrap();
+            sqlx::query("UPDATE offline_sync_queue SET status = 'done'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let remaining: Vec<String> = sqlx::query_scalar("SELECT folder FROM local_mail_cache")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(remaining, ["Trash"]);
+        }
     }
 
     #[test]

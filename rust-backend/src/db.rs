@@ -844,6 +844,10 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    let _ = sqlx::query("ALTER TABLE offline_sync_queue ADD COLUMN uid_validity INTEGER")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_offline_sync_queue_status_retry
@@ -855,9 +859,19 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_offline_sync_queue_move_target
+        CREATE INDEX IF NOT EXISTS idx_offline_sync_queue_read_target
+        ON offline_sync_queue(target_folder, target_uid, id)
+        WHERE action_type IN ('mark_read', 'mark_unread')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_offline_sync_queue_removal_target
         ON offline_sync_queue(target_folder, target_uid)
-        WHERE action_type = 'move' AND status IN ('pending', 'processing')
+        WHERE action_type IN ('move', 'delete') AND status IN ('pending', 'processing')
         "#,
     )
     .execute(pool)
@@ -970,6 +984,10 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    let _ = sqlx::query("ALTER TABLE local_mail_cache ADD COLUMN uid_validity INTEGER")
+        .execute(pool)
+        .await;
 
     let _ = sqlx::query("ALTER TABLE local_mail_cache ADD COLUMN raw_rfc822 BLOB")
         .execute(pool)

@@ -1,3 +1,5 @@
+import { mailboxIdentity } from './mailIdentity.js'
+
 export function parseMessageIdList(value) {
   if (typeof value !== 'string') return []
   const matches = value.match(/<[^>]+>/g)
@@ -49,7 +51,7 @@ export function computeThreadKey(mail, { mailbox = '' } = {}) {
   const root = replyRoot(mail)
   if (root) return root
 
-  const mb = String(mailbox || mail?.mailbox || '').trim().toLowerCase()
+  const mb = mailboxIdentity(String(mailbox || mail?.mailbox || ''))
   const fromRaw = String(mail?.address || '').trim().toLowerCase()
   const fromEmail = extractEmailLike(fromRaw) || extractEmailLike(String(mail?.name || ''))
   const fromDomain = fromEmail.includes('@') ? fromEmail.split('@').pop() : ''
@@ -104,16 +106,44 @@ function pickLatest(mails) {
 export function buildThreads(mails, { threadOrder = 'asc', mailbox = '' } = {}) {
   const order = threadOrder === 'desc' ? 'desc' : 'asc'
   const threadsById = new Map()
-  const scopedMailbox = String(mailbox || '').trim()
-
-  const items = Array.isArray(mails) ? mails : []
-  const referencedIds = new Set(items.map(replyRoot).filter(Boolean))
+  const items = (Array.isArray(mails) ? mails : []).filter((mail) => mail && typeof mail === 'object')
+  const parents = new Map()
+  const referencedIds = new Set()
   for (const mail of items) {
-    if (!mail || typeof mail !== 'object') continue
-    const mailboxForKey = scopedMailbox || String(mail.mailbox || '').trim()
+    const parent = replyRoot(mail)
     const ownId = ownMessageId(mail)
-    const id = replyRoot(mail)
-      || (referencedIds.has(ownId) ? ownId : computeThreadKey(mail, { mailbox: mailboxForKey }))
+    if (!parent) continue
+    referencedIds.add(parent)
+    if (ownId && ownId !== parent && !parents.has(ownId)) parents.set(ownId, parent)
+  }
+
+  const resolvedRoots = new Map()
+  const resolveRoot = (id) => {
+    const path = new Set()
+    let current = id
+    while (parents.has(current) && !resolvedRoots.has(current) && !path.has(current)) {
+      path.add(current)
+      current = parents.get(current)
+    }
+    let root = resolvedRoots.get(current) || current
+    if (path.has(current)) {
+      let member = parents.get(current)
+      while (member !== current) {
+        if (member < root) root = member
+        member = parents.get(member)
+      }
+    }
+    for (const member of path) resolvedRoots.set(member, root)
+    return root
+  }
+
+  for (const mail of items) {
+    const mailboxForKey = mail.mailbox || mailbox
+    const ownId = ownMessageId(mail)
+    const replyId = replyRoot(mail)
+    const id = replyId || referencedIds.has(ownId)
+      ? resolveRoot(replyId || ownId)
+      : computeThreadKey(mail, { mailbox: mailboxForKey })
     const existing = threadsById.get(id)
     if (existing) {
       existing.mails.push(mail)

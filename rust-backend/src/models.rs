@@ -284,6 +284,7 @@ pub struct OfflineActionRequest {
     pub action_type: String,
     pub target_uid: Option<String>,
     pub target_folder: Option<String>,
+    pub uid_validity: Option<u32>,
     pub payload: Option<serde_json::Value>,
 }
 

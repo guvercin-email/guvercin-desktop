@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mailKey, queueMailActions, sameMail } from './mailIdentity.js'
+import { dedupeMailboxes, mailKey, queueMailActions, sameMail } from './mailIdentity.js'
 
 test('mail identity distinguishes equal UIDs in different mailboxes', () => {
   assert.equal(sameMail({ id: 42 }, { id: '42', mailbox: 'INBOX' }), true)
@@ -23,4 +23,11 @@ test('batch actions preserve mailbox names and report only failed targets', asyn
     ['move', '42', payload, 'Projects, 2026'],
   ])
   assert.deepEqual(failed, [archive])
+})
+
+test('mailbox scope distinguishes case and preserves mailbox punctuation and spaces', () => {
+  assert.deepEqual(
+    dedupeMailboxes(['INBOX', 'inbox', 'Work, Foo/Çalışma', 'work, Foo/Çalışma', ' Archive ']),
+    ['INBOX', 'Work, Foo/Çalışma', 'work, Foo/Çalışma', ' Archive '],
+  )
 })

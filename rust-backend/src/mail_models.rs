@@ -2,6 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn mailbox_identity(mailbox: &str) -> &str {
+    if mailbox.eq_ignore_ascii_case("INBOX") {
+        "INBOX"
+    } else {
+        mailbox
+    }
+}
+
 /// A mailbox as reported by the IMAP `LIST` command, enriched with its
 /// SPECIAL-USE role (RFC 6154) and whether it can actually be selected.
 ///
@@ -18,6 +26,7 @@ pub struct MailboxEntry {
 
 #[derive(Serialize, Clone)]
 pub struct MailPreview {
+    pub uid_validity: Option<u32>,
     pub id: String,
     pub message_id: String,
     pub in_reply_to: String,
@@ -318,6 +327,7 @@ mod tests {
     #[test]
     fn merge_mailbox_label_adds_missing_label_to_preview() {
         let mut preview = MailPreview {
+            uid_validity: None,
             id: "1".to_string(),
             message_id: String::new(),
             in_reply_to: String::new(),
