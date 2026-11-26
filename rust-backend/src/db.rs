@@ -855,6 +855,16 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
+        CREATE INDEX IF NOT EXISTS idx_offline_sync_queue_move_target
+        ON offline_sync_queue(target_folder, target_uid)
+        WHERE action_type = 'move' AND status IN ('pending', 'processing')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS outbox_mails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             draft_rfc822 TEXT,

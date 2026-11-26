@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::{Read, Write},
     net::TcpStream,
     sync::{Arc, Mutex},
 };
@@ -52,6 +53,29 @@ impl ImapState {
 pub enum ImapSession {
     Plain(imap::Session<TcpStream>),
     Tls(imap::Session<native_tls::TlsStream<TcpStream>>),
+}
+
+fn move_uid<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    uid: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let capabilities = session.capabilities().map_err(|error| error.to_string())?;
+    if capabilities.has_str("MOVE") || capabilities.has_str("IMAP4rev2") {
+        return session.uid_mv(uid, destination).map_err(|error| error.to_string());
+    }
+    if !capabilities.has_str("UIDPLUS") {
+        return Err("Server does not support UID MOVE or UIDPLUS for a targeted move".to_string());
+    }
+
+    session
+        .uid_copy(uid, quote_imap_string(destination))
+        .map_err(|error| error.to_string())?;
+    session
+        .uid_store(uid, "+FLAGS.SILENT (\\Deleted)")
+        .map_err(|error| error.to_string())?;
+    session.uid_expunge(uid).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 impl ImapSession {
@@ -295,17 +319,10 @@ impl ImapSession {
 
     fn uid_move_to(&mut self, uid: &str, folder: &str) -> Result<(), String> {
         let folder = crate::imap_utf7::encode(folder);
-        let copied = match self {
-            ImapSession::Plain(s) => s.uid_copy(uid, &folder),
-            ImapSession::Tls(s) => s.uid_copy(uid, &folder),
-        };
-        copied.map_err(|e| format!("{e}"))?;
-        self.uid_store_flag(uid, "\\Deleted", true)?;
-        let expunge = match self {
-            ImapSession::Plain(s) => s.expunge(),
-            ImapSession::Tls(s) => s.expunge(),
-        };
-        expunge.map(|_| ()).map_err(|e| format!("{e}"))
+        match self {
+            ImapSession::Plain(session) => move_uid(session, uid, &folder),
+            ImapSession::Tls(session) => move_uid(session, uid, &folder),
+        }
     }
 
     fn uid_delete(&mut self, uid: &str) -> Result<(), String> {
@@ -1532,6 +1549,66 @@ fn split_from(from: &str) -> (String, String) {
 mod tests {
     use super::{build_imap_advanced_query, parse_labels};
     use crate::mail_models::{AdvancedSearchRequest, ReadStatus};
+
+    #[test]
+    fn imap_move_only_expunges_the_target_uid() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        for (capability, expected_commands, succeeds) in [
+            ("MOVE", vec!["UID MOVE 42 \"Project Archive\""], true),
+            (
+                "UIDPLUS",
+                vec![
+                    "UID COPY 42 \"Project Archive\"",
+                    "UID STORE 42 +FLAGS.SILENT (\\Deleted)",
+                    "UID EXPUNGE 42",
+                ],
+                true,
+            ),
+            ("", vec![], false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                write!(stream, "* OK test server\r\n").unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut commands = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                    match command {
+                        "CAPABILITY" => {
+                            let capabilities = format!("IMAP4rev1 {capability}");
+                            write!(stream, "* CAPABILITY {}\r\n", capabilities.trim_end()).unwrap()
+                        }
+                        "LOGOUT" => {
+                            write!(stream, "* BYE goodbye\r\n{tag} OK logout\r\n").unwrap();
+                            break;
+                        }
+                        cmd if cmd.starts_with("LOGIN ") => {}
+                        cmd => commands.push(cmd.to_string()),
+                    }
+                    write!(stream, "{tag} OK success\r\n").unwrap();
+                }
+                commands
+            });
+            let stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut client = imap::Client::new(stream);
+            client.read_greeting().unwrap();
+            let mut session = client.login("test", "test").unwrap();
+            assert_eq!(super::move_uid(&mut session, "42", "Project Archive").is_ok(), succeeds);
+            session.logout().unwrap();
+            assert_eq!(server.join().unwrap(), expected_commands);
+        }
+    }
 
     #[test]
     fn parse_labels_splits_and_dedupes_keywords() {

@@ -60,6 +60,7 @@ import { subscribeMailto, requestNewCompose } from '../utils/mailtoInbox.js'
 import { subscribeNavigate, requestNewEvent, requestNewTask } from '../utils/crossLinks.js'
 import { subscribeEml } from '../utils/emlInbox.js'
 import { notifyNewMail, setUnreadBadge, subscribeNotificationOpen, dismissNotificationForMail } from '../utils/notifications.js'
+import { mailKey, sameMail, queueMailActions } from '../utils/mailIdentity.js'
 import { getNotificationSettings, shouldNotifyForMail } from '../utils/notificationSettings.js'
 import {
     isDefaultMailClient,
@@ -489,47 +490,25 @@ function isMoveTargetMailbox(value) {
     return !isLabelMailbox(mailbox)
 }
 
+async function fetchMessageContent(accountId, mailId, mailbox, canUseRemoteMail, signal) {
+    const query = `${encodeURIComponent(mailId)}?mailbox=${encodeURIComponent(mailbox)}`
+    const options = { cache: 'no-store', signal }
+    let response = await fetch(apiUrl(`/api/offline/${accountId}/local-content/${query}`), options)
+    if (!response.ok && canUseRemoteMail) {
+        response = await fetch(apiUrl(`/api/mail/${accountId}/content/${query}`), options)
+    }
+    return response.ok ? response.json() : null
+}
+
 const MAIL_IDS_DRAG_MIME = 'application/x-guvercin-mail-ids'
 
 function parseDraggedMailIds(dataTransfer) {
-    if (!dataTransfer) return []
-
-    const normalizeIds = (ids) => Array.from(new Set(
-        (ids || [])
-            .map((id) => (id == null ? '' : String(id)).trim())
-            .filter(Boolean),
-    ))
-
-    const parseJsonPayload = (value) => {
-        try {
-            const parsed = JSON.parse(value)
-            if (!Array.isArray(parsed?.ids)) return []
-            return normalizeIds(parsed.ids)
-        } catch {
-            return []
-        }
+    try {
+        const { ids } = JSON.parse(dataTransfer.getData(MAIL_IDS_DRAG_MIME))
+        return Array.isArray(ids) ? [...new Set(ids.filter((id) => typeof id === 'string'))] : []
+    } catch {
+        return []
     }
-
-    const mimeValue = (() => {
-        try {
-            return dataTransfer.getData(MAIL_IDS_DRAG_MIME)
-        } catch {
-            return ''
-        }
-    })()
-    const fromMime = mimeValue ? parseJsonPayload(mimeValue) : []
-    if (fromMime.length > 0) return fromMime
-
-    const plainValue = (() => {
-        try {
-            return (dataTransfer.getData('text/plain') || '').trim()
-        } catch {
-            return ''
-        }
-    })()
-    if (!plainValue) return []
-
-    return normalizeIds(plainValue.split(',').map((part) => part.trim()))
 }
 
 const LABEL_NAMESPACE_ROOTS = ['Labels', '[Labels]']
@@ -1323,7 +1302,7 @@ const DashboardPage = () => {
     const [isAdvancedSearchOpen, setIsAdvancedSearchOpen] = useState(false)
     const [advancedSearchDraft, setAdvancedSearchDraft] = useState(() => createDefaultAdvancedSearchDraft())
     const [mails, setMails] = useState([])
-    const [selectedMail, setSelectedMail] = useState(null)
+    const [selectedMail, updateSelectedMail] = useState(null)
     const [mailContent, setMailContent] = useState(null)
     const [loadingMails, setLoadingMails] = useState(false)
     const [loadingContent, setLoadingContent] = useState(false)
@@ -1333,7 +1312,6 @@ const DashboardPage = () => {
     const [tabs, setTabs] = useState([])
     const [activeTabId, setActiveTabId] = useState(null)
     const [tabContents, setTabContents] = useState({})
-    const [loadingTab, setLoadingTab] = useState(false)
 
     const [accountMenuOpen, setAccountMenuOpen] = useState(false)
     // Notification center: recent new-mail arrivals surfaced by the poller.
@@ -1346,6 +1324,17 @@ const DashboardPage = () => {
     const [isSyncing, setIsSyncing] = useState(false)
     const [actionNotices, setActionNotices] = useState([])
 
+    const previewRequestRef = useRef(null)
+    const setSelectedMail = useCallback((mail) => {
+        if (typeof mail !== 'function') {
+            previewRequestRef.current?.abort()
+            setLoadingContent(false)
+        }
+        updateSelectedMail(mail)
+    }, [])
+
+    useEffect(() => () => previewRequestRef.current?.abort(), [accountId])
+
     const accountIdRef = useRef(accountId)
     const selectedFolderRef = useRef(selectedFolder)
     const listModeRef = useRef(listMode)
@@ -1354,6 +1343,11 @@ const DashboardPage = () => {
     const mailsRef = useRef(mails)
     const mailLoadRequestIdRef = useRef(0)
     const searchRequestRef = useRef(null)
+    const activeSearchRef = useRef(activeSearch)
+
+    useEffect(() => {
+        activeSearchRef.current = activeSearch
+    }, [activeSearch])
 
     useEffect(() => {
         accountIdRef.current = accountId
@@ -2144,6 +2138,46 @@ const DashboardPage = () => {
         setUnreadBadge(count)
     }, [mailboxCounts, accountId])
 
+    const exitSearchMode = useCallback(() => {
+        searchRequestRef.current?.abort()
+        searchRequestRef.current = null
+        listModeRef.current = 'mailbox'
+        setLoadingMails(false)
+        setListMode('mailbox')
+        setActiveSearch(null)
+        setSearchText('')
+        setMails([])
+        setSelectedMail(null)
+        setMailContent(null)
+        setCurrentPage(1)
+        lastMailboxBeforeSearchRef.current = null
+    }, [setSelectedMail])
+
+    useEffect(() => {
+        exitSearchMode()
+        return () => searchRequestRef.current?.abort()
+    }, [accountId, exitSearchMode])
+
+    const clearAdvancedSearch = useCallback(() => {
+        const backFolder = lastMailboxBeforeSearchRef.current || selectedFolder || 'INBOX'
+        exitSearchMode()
+        setSelectedFolder(backFolder)
+    }, [exitSearchMode, selectedFolder])
+
+    const handleSelectFolder = useCallback((folder) => {
+        const nextFolder = (folder || '').toString().trim()
+        if (!nextFolder) return
+        if (listModeRef.current === 'search') {
+            exitSearchMode()
+        }
+        if (nextFolder !== selectedFolderRef.current) {
+            selectedFolderRef.current = nextFolder
+            setSelectedMail(null)
+            setMailContent(null)
+        }
+        setSelectedFolder(nextFolder)
+    }, [exitSearchMode, setSelectedMail])
+
     // Tray menu actions (New Mail / Settings) and mail-notification clicks.
     // Handled here in DashboardPage so they work from any section: "New Mail"
     // routes through the compose queue (drained by the mail UI whenever it
@@ -2183,7 +2217,7 @@ const DashboardPage = () => {
             const mail = event.kind ? event.payload : event
             if (!mail) return
             setActiveSection('mail')
-            setSelectedFolder('INBOX')
+            handleSelectFolder(mail.mailbox || 'INBOX')
             openMailRef.current?.({ ...mail, mailbox: mail.mailbox || 'INBOX' })
         })
 
@@ -2193,49 +2227,14 @@ const DashboardPage = () => {
             unlistenSettings()
             unsubscribeOpen()
         }
-    }, [navigate])
+    }, [handleSelectFolder, navigate])
 
-
-    const exitSearchMode = useCallback(() => {
-        searchRequestRef.current?.abort()
-        searchRequestRef.current = null
-        listModeRef.current = 'mailbox'
-        setLoadingMails(false)
-        setListMode('mailbox')
-        setActiveSearch(null)
-        setSearchText('')
-        setMails([])
-        setSelectedMail(null)
-        setMailContent(null)
-        setCurrentPage(1)
-        lastMailboxBeforeSearchRef.current = null
-    }, [])
-
-    useEffect(() => {
-        exitSearchMode()
-        return () => searchRequestRef.current?.abort()
-    }, [accountId, exitSearchMode])
-
-    const clearAdvancedSearch = useCallback(() => {
-        const backFolder = lastMailboxBeforeSearchRef.current || selectedFolder || 'INBOX'
-        exitSearchMode()
-        setSelectedFolder(backFolder)
-    }, [exitSearchMode, selectedFolder])
-
-    const handleSelectFolder = useCallback((folder) => {
-        const nextFolder = (folder || '').toString().trim()
-        if (!nextFolder) return
-        if (listMode === 'search') {
-            exitSearchMode()
-        }
-        setSelectedFolder(nextFolder)
-    }, [exitSearchMode, listMode])
 
     const executeAdvancedSearch = useCallback(async (options = {}) => {
-        const { draftOverride } = options
+        const { draftOverride, draft = advancedSearchDraft } = options
         if (!accountId || !backendReachable) return
 
-        const criteria = { ...advancedSearchDraft, ...(draftOverride || {}) }
+        const criteria = { ...draft, ...draftOverride }
         const payload = buildAdvancedSearchPayload(criteria)
 
         if (listModeRef.current !== 'search') {
@@ -2252,7 +2251,7 @@ const DashboardPage = () => {
         setActiveSection('mail')
         setCurrentPage(1)
         setListMode('search')
-        setActiveSearch(null)
+        setActiveSearch({ criteria, totalCount: null })
         setIsAdvancedSearchOpen(false)
         setSelectedMail(null)
         setMailContent(null)
@@ -2323,9 +2322,20 @@ const DashboardPage = () => {
         ensureImapConnected,
         networkOnline,
         selectedFolder,
+        setSelectedMail,
     ])
 
 
+
+    const searchBySender = (address) => {
+        const from = address?.trim()
+        if (!from || !backendReachable) return
+        const draft = { ...createDefaultAdvancedSearchDraft(), from }
+        setAdvancedSearchDraft(draft)
+        setSearchText('')
+        setActiveTabId(null)
+        void executeAdvancedSearch({ draft })
+    }
 
     const prefetchInlineAssets = useCallback(
         async (uid, mailbox) => {
@@ -2358,44 +2368,36 @@ const DashboardPage = () => {
     )
 
     const openMail = async (mail) => {
-        if (mail?.id != null) dismissNotificationForMail(mail.id)
+        const mailbox = mail.mailbox || selectedFolder || 'INBOX'
+        const message = { ...mail, mailbox }
         setIsMailFullscreen(false)
-        setSelectedMail(mail)
+        setSelectedMail(message)
         setMailContent(null)
         setLoadingContent(true)
+        const controller = new AbortController()
+        previewRequestRef.current = controller
+        const { signal } = controller
         try {
-            const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            let endpoint
+            const data = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail, signal)
+            if (!data || signal.aborted) return
+            setMailContent(data)
+            if (mail.seen !== true) void setMailsSeenState([mailKey(message)], true)
 
-            endpoint = `/api/offline/${accountId}/local-content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-            let res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-
-            if (!res.ok && canUseRemoteMail) {
-                endpoint = `/api/mail/${accountId}/content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            }
-
-            if (res.ok) {
-                const data = await res.json()
-                setMailContent(data)
-                if (mail.seen !== true) {
-                    setMailsSeenState([mail.id], true)
+            void prefetchInlineAssets(mail.id, mailbox).then((html) => {
+                if (html && !signal.aborted) {
+                    setMailContent((prev) => (prev ? { ...prev, html_body: html } : prev))
                 }
-
-                prefetchInlineAssets(mail.id, mailbox).then((html) => {
-                    if (!html) return
-                    setMailContent((prev) => (prev && prev.id === mail.id ? { ...prev, html_body: html } : prev))
-                })
-            }
-        } catch {
-
+            })
+        } catch (error) {
+            if (!signal.aborted) console.error('Failed to load message:', error)
+        } finally {
+            if (!signal.aborted) setLoadingContent(false)
         }
-        setLoadingContent(false)
     }
     openMailRef.current = openMail
 
     const queueAction = useCallback(async (actionType, targetUid, payload = {}, targetFolderOverride = null) => {
-        if (!accountId || !backendReachable) return
+        if (!accountId || !backendReachable) throw new Error('Mail service is unavailable.')
         const response = await fetch(apiUrl(`/api/offline/${accountId}/actions`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2464,103 +2466,74 @@ const DashboardPage = () => {
         }
     }, [dismissActionNotice])
 
-    const restoreMailSelection = useCallback((selectionSnapshot) => {
-        if (!selectionSnapshot) return
-        setSelectedMail((prev) => prev || selectionSnapshot.mail)
-        setMailContent((prev) => prev || selectionSnapshot.content)
-    }, [])
-
-    const deleteMailsOptimistic = async (mailIds) => {
-        const ids = Array.from(new Set((mailIds || []).filter(Boolean)))
-        if (ids.length === 0) return
+    const removeMailsOptimistic = (keys, destination) => {
+        const affected = new Set(keys.filter((key) => key && (!destination || JSON.parse(key)[0] !== destination)))
+        if (affected.size === 0) return
         const sourceFolder = selectedFolder || 'INBOX'
-        const affectedMails = mails.filter((mail) => ids.includes(mail.id))
-        const mailboxById = new Map(
-            affectedMails.map((mail) => [mail.id, mail.mailbox || sourceFolder]),
+        const sourceMode = listMode
+        const sourceSearch = activeSearch
+        const inSourceView = () => (
+            accountIdRef.current === accountId &&
+            selectedFolderRef.current === sourceFolder &&
+            listModeRef.current === sourceMode &&
+            (sourceMode !== 'search' || activeSearchRef.current === sourceSearch)
         )
-        const selectionSnapshot = selectedMail && ids.includes(selectedMail.id)
-            ? { mail: selectedMail, content: mailContent }
-            : null
-
+        const affectedMails = mails.filter((mail) => affected.has(mailKey(mail, sourceFolder)))
+        const restoreRows = (restoreKeys) => {
+            if (!inSourceView()) return
+            const restoring = new Set(restoreKeys)
+            setMails((prev) => {
+                const existing = new Set(prev.map((mail) => mailKey(mail, sourceFolder)))
+                return [...prev, ...affectedMails.filter((mail) => {
+                    const key = mailKey(mail, sourceFolder)
+                    return restoring.has(key) && !existing.has(key)
+                })]
+            })
+        }
+        const count = affected.size
         enqueueUndoableAction({
-            label: ids.length === 1 ? 'Mail deleted' : `${ids.length} mails deleted`,
+            label: destination
+                ? t('Moved {{count}} messages to {{folder}}', { count, folder: folderInfo(destination).label })
+                : t('Deleted {{count}} messages', { count }),
             apply: () => {
-                setMails((prev) => prev.filter((mail) => !ids.includes(mail.id)))
-                if (selectionSnapshot) {
+                setMails((prev) => prev.filter((mail) => !affected.has(mailKey(mail, sourceFolder))))
+                if (selectedMail && affected.has(mailKey(selectedMail, sourceFolder))) {
                     setSelectedMail(null)
                     setMailContent(null)
                 }
             },
-            undo: () => {
-                setMails((prev) => {
-                    const existing = new Set(prev.map((mail) => mail.id))
-                    return [...prev, ...affectedMails.filter((mail) => !existing.has(mail.id))]
-                })
-                restoreMailSelection(selectionSnapshot)
-            },
-            commit: () => Promise.all(ids.map((id) => (
-                queueAction('delete', id, {}, mailboxById.get(id) || sourceFolder)
-            ))),
-        })
-    }
-
-    const moveMailsOptimistic = async (mailIds, destination) => {
-        const ids = Array.from(new Set((mailIds || []).filter(Boolean)))
-        if (ids.length === 0 || !destination) return
-        const sourceFolder = selectedFolder || 'INBOX'
-        const destinationLabel = folderInfo(destination).label
-        const affectedMails = mails.filter((mail) => ids.includes(mail.id))
-        const mailboxById = new Map(
-            affectedMails.map((mail) => [mail.id, mail.mailbox || sourceFolder]),
-        )
-        const selectionSnapshot = selectedMail && ids.includes(selectedMail.id)
-            ? { mail: selectedMail, content: mailContent }
-            : null
-
-        enqueueUndoableAction({
-            label: ids.length === 1 ? `Mail moved to ${destinationLabel}` : `${ids.length} mails moved to ${destinationLabel}`,
-            apply: () => {
-                setMails((prev) => prev.filter((mail) => !ids.includes(mail.id)))
-                if (selectionSnapshot) {
-                    setSelectedMail(null)
-                    setMailContent(null)
+            undo: () => restoreRows(affected),
+            commit: async () => {
+                const failed = await queueMailActions([...affected], queueAction, destination ? 'move' : 'delete', destination ? { destination } : {})
+                if (failed.length > 0) {
+                    restoreRows(failed)
+                    window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
                 }
             },
-            undo: () => {
-                setMails((prev) => {
-                    const existing = new Set(prev.map((mail) => mail.id))
-                    return [...prev, ...affectedMails.filter((mail) => !existing.has(mail.id))]
-                })
-                restoreMailSelection(selectionSnapshot)
-            },
-            commit: () => Promise.all(ids.map((id) => (
-                queueAction('move', id, { destination }, mailboxById.get(id) || sourceFolder)
-            ))),
         })
     }
 
-    const setMailsSeenState = async (mailIds, seen) => {
-        const ids = Array.from(new Set((mailIds || []).filter(Boolean)))
-        if (ids.length === 0) return
-        setMails((prev) => prev.map((mail) => (
-            ids.includes(mail.id) ? { ...mail, seen } : mail
-        )))
-        setSelectedMail((prev) => (prev && ids.includes(prev.id) ? { ...prev, seen } : prev))
+    const deleteMailsOptimistic = (keys) => removeMailsOptimistic(keys)
+    const moveMailsOptimistic = (keys, destination) => {
+        if (destination) removeMailsOptimistic(keys, destination)
+    }
+
+    const setMailsSeenState = async (keys, seen) => {
+        const failed = await queueMailActions(keys, queueAction, seen ? 'mark_read' : 'mark_unread')
+        if (accountIdRef.current !== accountId) return
+        const successful = new Set(keys.filter((key) => !failed.includes(key)))
+        const update = (mail) => successful.has(mailKey(mail, selectedFolder)) ? { ...mail, seen } : mail
+        setMails((prev) => prev.map(update))
+        setSelectedMail(update)
+        setTabs((prev) => prev.map((tab) => tab.kind === 'mail' ? { ...tab, mail: update(tab.mail) } : tab))
         if (seen) {
-            // Drop any notification-center entries for mails that were just read.
-            setNotifications((prev) => prev.filter((n) => !ids.includes(n.id)))
+            setNotifications((prev) => prev.filter((mail) => !successful.has(mailKey(mail))))
+            for (const key of successful) {
+                const [mailbox, uid] = JSON.parse(key)
+                if (mailbox === 'INBOX') dismissNotificationForMail(uid)
+            }
         }
-        try {
-            const sourceFolder = selectedFolder || 'INBOX'
-            const mailboxById = new Map(
-                mails.filter((mail) => ids.includes(mail.id)).map((mail) => [mail.id, mail.mailbox || sourceFolder]),
-            )
-            await Promise.all(ids.map((id) => (
-                queueAction(seen ? 'mark_read' : 'mark_unread', id, {}, mailboxById.get(id) || sourceFolder)
-            )))
-        } catch (error) {
-            console.error('Failed to queue seen-state change:', error)
-        }
+        if (failed.length > 0) window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
     }
 
     const createMailbox = async (name) => {
@@ -2665,14 +2638,7 @@ const DashboardPage = () => {
         try {
 
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            let content = null
-            let endpoint = `/api/offline/${accountId}/local-content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-            let res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            if (!res.ok && canUseRemoteMail) {
-                endpoint = `/api/mail/${accountId}/content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            }
-            if (res.ok) content = await res.json()
+            const content = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
 
             nextMailWindowId.current += 1
             const mailWindowLabel = `mail-${nextMailWindowId.current}`
@@ -2689,7 +2655,7 @@ const DashboardPage = () => {
                 mailDataJson: JSON.stringify(mailData),
             })
 
-            if (selectedMail?.id === mail.id) {
+            if (sameMail(selectedMail, mail, selectedFolder)) {
                 setSelectedMail(null)
                 setMailContent(null)
             }
@@ -2902,7 +2868,7 @@ const DashboardPage = () => {
                                     setIsAdvancedSearchOpen(true)
                                     return
                                 }
-                                executeAdvancedSearch({ draftOverride: { keywords: trimmed } })
+                                executeAdvancedSearch({ draft: { ...createDefaultAdvancedSearchDraft(), keywords: trimmed } })
                             }}
                         />
                         <button
@@ -2922,7 +2888,7 @@ const DashboardPage = () => {
                                     setIsAdvancedSearchOpen(true)
                                     return
                                 }
-                                executeAdvancedSearch({ draftOverride: { keywords: trimmed } })
+                                executeAdvancedSearch({ draft: { ...createDefaultAdvancedSearchDraft(), keywords: trimmed } })
                             }}
                             aria-label={t('Search')}
                             title={t('Search')}
@@ -3056,7 +3022,7 @@ const DashboardPage = () => {
                                                         setNotifOpen(false)
                                                         setNotifications((prev) => prev.filter((x) => x.id !== n.id))
                                                         setActiveSection('mail')
-                                                        setSelectedFolder(n.mailbox || 'INBOX')
+                                                        handleSelectFolder(n.mailbox || 'INBOX')
                                                         openMailRef.current?.({ ...n, mailbox: n.mailbox || 'INBOX' })
                                                     }}
                                                     style={{
@@ -3182,6 +3148,7 @@ const DashboardPage = () => {
                                 listMode={listMode}
                                 activeSearch={activeSearch}
                                 onClearSearch={clearAdvancedSearch}
+                                onSearchBySender={searchBySender}
                                 onSelectFolder={handleSelectFolder}
                                 ensureImapConnected={ensureImapConnected}
                                 folders={folders}
@@ -3236,8 +3203,6 @@ const DashboardPage = () => {
                                 setActiveTabId={setActiveTabId}
                                 tabContents={tabContents}
                                 setTabContents={setTabContents}
-                                loadingTab={loadingTab}
-                                setLoadingTab={setLoadingTab}
                                 nextTabId={nextTabId}
                                 accountForm={accountForm}
                                 mailboxCounts={mailboxCounts}
@@ -3554,6 +3519,7 @@ function MailSection({
     listMode,
     activeSearch,
     onClearSearch,
+    onSearchBySender,
     onSelectFolder,
 	    ensureImapConnected,
 	    folders, labels, mailboxRoles = {}, noselectMailboxes = [], selectedFolder, setSelectedFolder, mails, setMails,
@@ -3564,7 +3530,7 @@ function MailSection({
     isMailFullscreen, toggleMailFullscreen,
     deleteMailsOptimistic, moveMailsOptimistic, setMailsSeenState, queueAction, createMailbox,
     canUseRemoteMail, remoteMailAvailable, inlineComposeSession, setInlineComposeSession, sendComposedMail, saveComposeDraft, enqueueUndoableAction,
-    tabs, setTabs, activeTabId, setActiveTabId, tabContents, setTabContents, loadingTab, setLoadingTab,     nextTabId,
+    tabs, setTabs, activeTabId, setActiveTabId, tabContents, setTabContents, nextTabId,
     accountForm,
     mailboxCounts,
     mailboxCountDisplayMode,
@@ -3779,14 +3745,14 @@ function MailSection({
         const threadByMailId = new Map()
         threads.forEach((thread) => {
             ;(thread?.mails || []).forEach((mail) => {
-                if (mail?.id != null) threadByMailId.set(String(mail.id), thread)
+                if (mail?.id != null) threadByMailId.set(mailKey(mail, selectedFolder), thread)
             })
         })
         return { threads, threadByMailId }
     }, [threadedEnabled, visibleMails, selectedFolder])
 
     const visibleThreads = threadData.threads
-    const selectedThread = selectedMail ? threadData.threadByMailId.get(String(selectedMail.id)) : null
+    const selectedThread = selectedMail ? threadData.threadByMailId.get(mailKey(selectedMail, selectedFolder)) : null
     const showThreadReader = !!(threadedEnabled && selectedThread && activeThreadReaderId && String(activeThreadReaderId) === String(selectedThread.id))
 
     useEffect(() => {
@@ -3812,10 +3778,8 @@ function MailSection({
     )
     const selectedGlobalIndex = useMemo(() => {
         if (!selectedMail) return -1
-        const selectedKey = String(selectedMail?.id ?? '')
-        if (!selectedKey) return -1
-        return visibleMails.findIndex((mail) => String(mail?.id ?? '') === selectedKey)
-    }, [selectedMail, visibleMails])
+        return visibleMails.findIndex((mail) => sameMail(mail, selectedMail, selectedFolder))
+    }, [selectedFolder, selectedMail, visibleMails])
 
     const selectedPage = selectedGlobalIndex >= 0 ? Math.floor(selectedGlobalIndex / perPageValue) + 1 : 1
 
@@ -3831,14 +3795,8 @@ function MailSection({
         if (!mail || !accountId || !backendReachable) return null
         try {
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            let endpoint = `/api/offline/${accountId}/local-content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-            let res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            if (!res.ok && canUseRemoteMail) {
-                endpoint = `/api/mail/${accountId}/content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            }
-            if (!res.ok) return null
-            let data = await res.json()
+            let data = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+            if (!data) return null
             const html = await prefetchInlineAssets(mail.id, mailbox)
             if (html) data = { ...data, html_body: html }
             return data
@@ -3848,7 +3806,7 @@ function MailSection({
     }, [accountId, backendReachable, canUseRemoteMail, prefetchInlineAssets, selectedFolder])
 
     const toggleThreadReaderMail = useCallback((mail) => {
-        const id = String(mail?.id ?? '')
+        const id = mailKey(mail, selectedFolder)
         if (!id) return
         const wasOpen = threadReaderOpenIds.has(id)
         setThreadReaderOpenIds((prev) => {
@@ -3877,7 +3835,7 @@ function MailSection({
                 return next
 	            })
 	        })
-	    }, [fetchMailContentForThreadReader, threadReaderContentByIdSafe, threadReaderLoadingIds, threadReaderOpenIds])
+	    }, [fetchMailContentForThreadReader, selectedFolder, threadReaderContentByIdSafe, threadReaderLoadingIds, threadReaderOpenIds])
 
     useEffect(() => {
         if (!showThreadReader || !selectedThread?.id) {
@@ -3891,12 +3849,11 @@ function MailSection({
         setThreadReaderContentById({})
     }, [selectedThread?.id, showThreadReader])
 
+    const selectedMessageKey = mailKey(selectedMail, selectedFolder)
     useEffect(() => {
-        if (!threadedEnabled || !showThreadReader) return
-        const id = String(selectedMail?.id ?? '')
-        if (!id || !mailContent || String(mailContent.id) !== id) return
-        setThreadReaderContentById((prev) => ({ ...(prev || {}), [id]: mailContent }))
-    }, [mailContent, selectedMail?.id, showThreadReader, threadedEnabled])
+        if (!threadedEnabled || !showThreadReader || !selectedMessageKey || !mailContent) return
+        setThreadReaderContentById((prev) => ({ ...(prev || {}), [selectedMessageKey]: mailContent }))
+    }, [mailContent, selectedMessageKey, showThreadReader, threadedEnabled])
 
     const pagedSelectableMails = useMemo(() => {
         if (!threadedEnabled) return pagedVisibleMails
@@ -3908,15 +3865,14 @@ function MailSection({
         })
         return out
     }, [pagedVisibleMails, pagedVisibleThreads, threadedEnabled])
-    const selectedIdSet = selectedMailIds
     const actionableMails = useMemo(() => {
-        if (selectMode && selectedIdSet.size > 0) {
-            return mails.filter((mail) => selectedIdSet.has(mail.id))
+        if (selectMode && selectedMailIds.size > 0) {
+            return mails.filter((mail) => selectedMailIds.has(mailKey(mail, selectedFolder)))
         }
         if (selectedMail) return [selectedMail]
         return []
-    }, [mails, selectMode, selectedIdSet, selectedMail])
-    const actionableMailIds = actionableMails.map((mail) => mail.id)
+    }, [mails, selectMode, selectedFolder, selectedMailIds, selectedMail])
+    const actionableMailIds = actionableMails.map((mail) => mailKey(mail, selectedFolder))
     const hasAnyActionMail = actionableMails.length > 0
     const hasMultipleActionMails = actionableMails.length > 1
     const canForwardActionMail = actionableMails.length === 1
@@ -3988,24 +3944,14 @@ function MailSection({
 
     const loadMailContentForDraft = useCallback(async (mail) => {
         if (!mail) return null
-        if (selectedMail?.id === mail.id && mailContent) return mailContent
+        if (sameMail(selectedMail, mail, selectedFolder) && mailContent) return mailContent
 
         try {
             const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
-            let endpoint = `/api/offline/${accountId}/local-content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-            let res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            if (!res.ok && canUseRemoteMail) {
-                endpoint = `/api/mail/${accountId}/content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-            }
-            if (res.ok) {
-                return await res.json()
-            }
+            return await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
         } catch {
             return null
         }
-
-        return null
     }, [accountId, canUseRemoteMail, mailContent, selectedFolder, selectedMail])
 
     const fetchReplySeed = useCallback(async (mail) => {
@@ -4929,95 +4875,24 @@ function MailSection({
         return created ? labelKey : null
     }, [createMailbox, labelNamespacePrefix])
 
-    const toggleLabelsOptimistic = useCallback(async (mailIds, labelKey, shouldAdd) => {
-        const ids = Array.from(new Set((mailIds || []).filter(Boolean)))
-        const trimmedLabel = (labelKey || '').trim()
-        if (ids.length === 0 || !trimmedLabel) return false
-
-        const idSet = new Set(ids)
-        const shouldPruneCurrentView = !shouldAdd && isCurrentLabelMailbox(selectedFolder, trimmedLabel)
-        const previousMails = mails
-        const previousSelectedMail = selectedMail
-        const previousMailContent = mailContent
-        const previousSelectedMailIds = new Set(selectedMailIds)
-        const previousTabs = tabs
-        const previousMailItemMenu = mailItemMenu
-
-        setMails((prev) => {
-            const next = prev
-                .map((mail) => (idSet.has(mail.id) ? toggleMailLabelState(mail, trimmedLabel, shouldAdd) : mail))
-            return shouldPruneCurrentView ? next.filter((mail) => !idSet.has(mail.id)) : next
-        })
-
-        setSelectedMail((prev) => {
-            if (!prev || !idSet.has(prev.id)) return prev
-            if (shouldPruneCurrentView) return null
-            return toggleMailLabelState(prev, trimmedLabel, shouldAdd)
-        })
-
-        if (shouldPruneCurrentView && selectedMail && idSet.has(selectedMail.id)) {
-            setMailContent(null)
+    const toggleLabelsOptimistic = useCallback(async (keys, labelKey, shouldAdd) => {
+        const label = (labelKey || '').trim()
+        if (keys.length === 0 || !label) return false
+        const failed = await queueMailActions(keys, queueAction, shouldAdd ? 'label_add' : 'label_remove', { label })
+        const successful = new Set(keys.filter((key) => !failed.includes(key)))
+        const matches = (mail) => successful.has(mailKey(mail, selectedFolder))
+        const update = (mail) => matches(mail) ? toggleMailLabelState(mail, label, shouldAdd) : mail
+        const prune = !shouldAdd && listMode !== 'search' && isCurrentLabelMailbox(selectedFolder, label)
+        setMails((prev) => prune ? prev.filter((mail) => !matches(mail)) : prev.map(update))
+        setSelectedMail(update)
+        setTabs((prev) => prev.map((tab) => tab.kind === 'mail' ? { ...tab, mail: update(tab.mail) } : tab))
+        setMailItemMenu((prev) => prev ? { ...prev, mail: update(prev.mail) } : prev)
+        if (prune) {
+            setSelectedMailIds((prev) => new Set([...prev].filter((key) => !successful.has(key))))
         }
-
-        if (shouldPruneCurrentView) {
-            setSelectedMailIds((prev) => new Set([...prev].filter((id) => !idSet.has(id))))
-        }
-
-        setTabs((prev) => prev.map((tab) => (
-            tab.kind === 'mail' && idSet.has(tab.mail.id)
-                ? { ...tab, mail: toggleMailLabelState(tab.mail, trimmedLabel, shouldAdd) }
-                : tab
-        )))
-
-        setMailItemMenu((prev) => {
-            if (!prev || !idSet.has(prev.mail.id)) return prev
-            return {
-                ...prev,
-                mail: toggleMailLabelState(prev.mail, trimmedLabel, shouldAdd),
-            }
-        })
-
-        try {
-            const sourceFolder = selectedFolder || 'INBOX'
-            const mailboxById = new Map(
-                mails
-                    .filter((mail) => idSet.has(mail.id))
-                    .map((mail) => [mail.id, mail.mailbox || sourceFolder]),
-            )
-            await Promise.all(ids.map((id) => (
-                queueAction(
-                    shouldAdd ? 'label_add' : 'label_remove',
-                    id,
-                    { label: trimmedLabel },
-                    mailboxById.get(id) || sourceFolder,
-                )
-            )))
-            return true
-        } catch (error) {
-            setMails(previousMails)
-            setSelectedMail(previousSelectedMail)
-            setMailContent(previousMailContent)
-            setSelectedMailIds(previousSelectedMailIds)
-            setTabs(previousTabs)
-            setMailItemMenu(previousMailItemMenu)
-            window.alert(error?.message || 'The label action failed.')
-            return false
-        }
-    }, [
-        mailContent,
-        mailItemMenu,
-        mails,
-        queueAction,
-        selectedFolder,
-        selectedMail,
-        selectedMailIds,
-        setMailContent,
-        setMailItemMenu,
-        setMails,
-        setSelectedMail,
-        setTabs,
-        tabs,
-    ])
+        if (failed.length > 0) window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
+        return failed.length === 0
+    }, [listMode, queueAction, selectedFolder, setMails, setSelectedMail, setTabs, t])
 
     const createAndApplyLabel = useCallback(async (mailIds) => {
         const labelKey = promptForNewLabelKey()
@@ -5143,7 +5018,7 @@ function MailSection({
 
     const handleMailDragStart = useCallback((event, mail) => {
         if (!event?.dataTransfer || !mail?.id) return
-        const draggedId = mail.id
+        const draggedId = mailKey(mail, selectedFolder)
         const ids = (
             selectedMailIds.size > 0 && selectedMailIds.has(draggedId)
                 ? Array.from(selectedMailIds)
@@ -5180,12 +5055,7 @@ function MailSection({
 
         }
 
-        try {
-            event.dataTransfer.setData('text/plain', ids.join(','))
-        } catch {
-
-        }
-    }, [createMailDragPreview, selectedMailIds])
+    }, [createMailDragPreview, selectedFolder, selectedMailIds])
 
     const handleMailDragEnd = useCallback(() => {
         isDraggingRef.current = false
@@ -5358,10 +5228,35 @@ function MailSection({
 
     const tabIframeRefs = useRef({})
     const pendingTabLoadsRef = useRef(new Set())
-    const loadingTabCountRef = useRef(0)
+
+    const loadMailTabContent = async (tabId, mail, mailbox) => {
+        if (pendingTabLoadsRef.current.has(tabId)) return
+        pendingTabLoadsRef.current.add(tabId)
+        setTabContents((prev) => {
+            const next = { ...prev }
+            delete next[tabId]
+            return next
+        })
+
+        let content = null
+        try {
+            content = await fetchMessageContent(accountId, mail.id, mailbox, canUseRemoteMail)
+        } catch (error) {
+            console.error('Failed to load tab message:', error)
+        }
+        if (!pendingTabLoadsRef.current.delete(tabId)) return
+        setTabContents((prev) => ({ ...prev, [tabId]: content }))
+        if (!content) return
+        if (mail.seen !== true) void setMailsSeenState([mailKey(mail, mailbox)], true)
+        void prefetchInlineAssets(mail.id, mailbox).then((html) => {
+            if (!html) return
+            setTabContents((prev) => prev[tabId] === content
+                ? { ...prev, [tabId]: { ...content, html_body: html } }
+                : prev)
+        })
+    }
 
     const openMailInTab = async (mail, existingContent) => {
-        if (mail?.id != null) dismissNotificationForMail(mail.id)
         const mailbox = mail?.mailbox || selectedFolder || 'INBOX'
         const isDraftMailbox = mailboxRoles[mailbox] === 'drafts' || folderInfo(mailbox).label === 'Drafts'
         if (isDraftMailbox) {
@@ -5375,48 +5270,18 @@ function MailSection({
 
         nextTabId.current += 1
         const tabId = `tab-${nextTabId.current}`
-        pendingTabLoadsRef.current.add(tabId)
 
         // Create + activate the tab immediately so the user doesn't just see the main view ("anasayfa")
-        setTabs((prev) => [...prev, { id: tabId, kind: 'mail', mail, mailbox }])
+        setTabs((prev) => [...prev, { id: tabId, kind: 'mail', mail: { ...mail, mailbox }, mailbox }])
         setActiveTabId(tabId)
         setSelectedMail(null)
         setMailContent(null)
 
-        let content = existingContent
-        if (!content) {
-            loadingTabCountRef.current += 1
-            setLoadingTab(true)
-            try {
-                let endpoint = `/api/offline/${accountId}/local-content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                let res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-                if (!res.ok && canUseRemoteMail) {
-                    endpoint = `/api/mail/${accountId}/content/${mail.id}?mailbox=${encodeURIComponent(mailbox)}`
-                    res = await fetch(apiUrl(endpoint), { cache: 'no-store' })
-                }
-                if (res.ok) {
-                    content = await res.json()
-                    const html = await prefetchInlineAssets(mail.id, mailbox)
-                    if (html && content) {
-                        content = { ...content, html_body: html }
-                    }
-                }
-            } catch {
-
-            } finally {
-                loadingTabCountRef.current = Math.max(0, loadingTabCountRef.current - 1)
-                if (loadingTabCountRef.current === 0) {
-                    setLoadingTab(false)
-                }
-            }
+        if (existingContent) {
+            setTabContents((prev) => ({ ...prev, [tabId]: existingContent }))
+        } else {
+            await loadMailTabContent(tabId, mail, mailbox)
         }
-        if (mail.seen !== true) {
-            setMailsSeenState([mail.id], true)
-        }
-        if (pendingTabLoadsRef.current.has(tabId)) {
-            setTabContents((prev) => ({ ...prev, [tabId]: content }))
-        }
-        pendingTabLoadsRef.current.delete(tabId)
     }
 
     const openImportedMailInTab = useCallback((mail, content) => {
@@ -5424,7 +5289,7 @@ function MailSection({
         nextTabId.current += 1
         const tabId = `tab-${nextTabId.current}`
         const mailbox = mail?.mailbox || 'Imported'
-        setTabs((prev) => [...prev, { id: tabId, kind: 'mail', mail, mailbox }])
+        setTabs((prev) => [...prev, { id: tabId, kind: 'mail', mail: { ...mail, mailbox }, mailbox }])
         setTabContents((prev) => ({ ...prev, [tabId]: content }))
         setActiveTabId(tabId)
         setSelectedMail(null)
@@ -5472,7 +5337,7 @@ function MailSection({
     const handleOpenActionMailInTab = async () => {
         if (!canOpenActionMail) return
         const mail = actionableMails[0]
-        const existingContent = selectedMail?.id === mail?.id ? mailContent : null
+        const existingContent = sameMail(selectedMail, mail, selectedFolder) ? mailContent : null
         await openMailInTab(mail, existingContent)
         closeActionMenus()
     }
@@ -5664,21 +5529,16 @@ function MailSection({
     }, [currentPage, filteredMaxPage, setCurrentPage])
 
     useEffect(() => {
-        if (!selectedMail) return
-        if (threadedEnabled) {
-            if (!selectedThread?.id) return
-            if (selectedThreadGlobalIndex < 0) return
-            if (currentPage !== selectedThreadPage) setCurrentPage(selectedThreadPage)
-            return
+        if (!selectedMessageKey) return
+        if (threadedEnabled && selectedThreadGlobalIndex >= 0) {
+            setCurrentPage(selectedThreadPage)
+        } else if (!threadedEnabled && selectedGlobalIndex >= 0) {
+            setCurrentPage(selectedPage)
         }
-        if (selectedGlobalIndex < 0) return
-        if (currentPage !== selectedPage) setCurrentPage(selectedPage)
     }, [
-        currentPage,
         selectedGlobalIndex,
-        selectedMail,
+        selectedMessageKey,
         selectedPage,
-        selectedThread?.id,
         selectedThreadGlobalIndex,
         selectedThreadPage,
         setCurrentPage,
@@ -5790,13 +5650,13 @@ function MailSection({
         setSelectMode(true)
 
         if (event.shiftKey && lastSelectedMailId && lastSelectedMailId !== mailId) {
-            const currentIndex = pagedSelectableMails.findIndex(mail => mail.id === mailId)
-            const lastIndex = pagedSelectableMails.findIndex(mail => mail.id === lastSelectedMailId)
+            const currentIndex = pagedSelectableMails.findIndex(mail => mailKey(mail, selectedFolder) === mailId)
+            const lastIndex = pagedSelectableMails.findIndex(mail => mailKey(mail, selectedFolder) === lastSelectedMailId)
 
             if (currentIndex !== -1 && lastIndex !== -1) {
                 const startIndex = Math.min(currentIndex, lastIndex)
                 const endIndex = Math.max(currentIndex, lastIndex)
-                const rangeIds = pagedSelectableMails.slice(startIndex, endIndex + 1).map(mail => mail.id)
+                const rangeIds = pagedSelectableMails.slice(startIndex, endIndex + 1).map(mail => mailKey(mail, selectedFolder))
 
                 setSelectedMailIds(prev => {
                     const next = new Set(prev)
@@ -5819,13 +5679,13 @@ function MailSection({
                 if (scope === 'unread') return mail.seen !== true
                 return true
             })
-            .map((mail) => mail.id)
+            .map((mail) => mailKey(mail, selectedFolder))
 
         setSelectedMailIds(new Set(nextSelectedIds))
         setSelectMode(nextSelectedIds.length > 0)
         setLastSelectedMailId(nextSelectedIds.length > 0 ? nextSelectedIds[nextSelectedIds.length - 1] : null)
         setIsSelectionMenuOpen(false)
-    }, [visibleMails])
+    }, [selectedFolder, visibleMails])
 
     const buildTree = useCallback((list, namespaceRoots = []) => {
         const tree = []
@@ -5994,7 +5854,8 @@ function MailSection({
 
                             setDragOverTarget(null)
 
-                            const ids = parseDraggedMailIds(e.dataTransfer)
+                            const validKeys = new Set(mails.map((mail) => mailKey(mail, selectedFolder)))
+                            const ids = parseDraggedMailIds(e.dataTransfer).filter((key) => validKeys.has(key))
                             if (ids.length === 0) return
 
                             const isExactSelectionSet = selectedMailIds.size > 0
@@ -6115,8 +5976,9 @@ function MailSection({
     const handleBlockSenderAction = async (mail, actionType) => {
         if (!mail) return
         const mailsToProcess = Array.isArray(mail) ? mail : [mail]
-        const sender = mailsToProcess[0]?.address
+        const sender = mailsToProcess[0]?.address?.trim()
         if (!sender) return
+        const belongsToSender = (item) => item?.address?.trim().toLowerCase() === sender.toLowerCase()
         
         let targetFolder = null
         if (actionType === 'Spam') targetFolder = resolveFolderDestination('Spam')
@@ -6146,18 +6008,19 @@ function MailSection({
 
             if (!res.ok) throw new Error('Failed to block sender')
 
-            const idsToRemove = blockSenderApplyExisting 
-                ? Array.isArray(mails) ? mails.filter(m => m.address?.toLowerCase() === sender.toLowerCase()).map(m => m.id) : []
-                : mailsToProcess.map(m => m.id)
-
-            if (idsToRemove.length > 0) {
-                if (action === 'delete') {
-                    await deleteMailsOptimistic(idsToRemove)
-                } else {
-                    await moveMailsOptimistic(idsToRemove, targetFolder)
+            if (blockSenderApplyExisting) {
+                setMails((prev) => prev.filter((item) => !belongsToSender(item)))
+                if (belongsToSender(selectedMail)) {
+                    setSelectedMail(null)
+                    setMailContent(null)
                 }
+            } else {
+                const keys = mailsToProcess.filter(belongsToSender).map((item) => mailKey(item, selectedFolder))
+                if (action === 'delete') deleteMailsOptimistic(keys)
+                else moveMailsOptimistic(keys, targetFolder)
             }
-            
+            setBlockSenderApplyExisting(false)
+            setBlockSenderSelectedFolder('')
             setBlockSenderModal(null)
         } catch (error) {
             console.error('Failed to block sender:', error)
@@ -6358,13 +6221,13 @@ function MailSection({
 
     const handleMailItemMenuDelete = async () => {
         if (!mailItemMenu?.mail) return
-        await deleteMailsOptimistic([mailItemMenu.mail.id])
+        await deleteMailsOptimistic([mailKey(mailItemMenu.mail, selectedFolder)])
         closeMailItemMenu()
     }
 
     const handleMailItemMenuMove = async (destination) => {
         if (!mailItemMenu?.mail || !destination) return
-        await moveMailsOptimistic([mailItemMenu.mail.id], destination)
+        await moveMailsOptimistic([mailKey(mailItemMenu.mail, selectedFolder)], destination)
         closeMailItemMenu()
     }
 
@@ -6392,24 +6255,24 @@ function MailSection({
 
     const handleMailItemMenuReadToggle = async () => {
         if (!mailItemMenu?.mail) return
-        await setMailsSeenState([mailItemMenu.mail.id], mailItemMenu.mail.seen !== true)
+        await setMailsSeenState([mailKey(mailItemMenu.mail, selectedFolder)], mailItemMenu.mail.seen !== true)
         closeMailItemMenu()
     }
 
     const handleMailItemMenuLabelToggle = async (labelKey, shouldAdd) => {
         if (!mailItemMenu?.mail) return
-        await toggleLabelsOptimistic([mailItemMenu.mail.id], labelKey, shouldAdd)
+        await toggleLabelsOptimistic([mailKey(mailItemMenu.mail, selectedFolder)], labelKey, shouldAdd)
     }
 
     const handleMailItemMenuCreateLabel = async () => {
         if (!mailItemMenu?.mail) return
-        await createAndApplyLabel([mailItemMenu.mail.id])
+        await createAndApplyLabel([mailKey(mailItemMenu.mail, selectedFolder)])
     }
 
     const activeTab = tabs.find((tab) => tab.id === activeTabId) || null
     const activeTabContent = activeTab?.kind === 'mail' && activeTabId ? tabContents[activeTabId] : null
     const activeTabMail = activeTab?.kind === 'mail'
-        ? (mails.find((mail) => mail.id === activeTab.mail.id) || activeTab.mail)
+        ? (mails.find((mail) => sameMail(mail, activeTab.mail, selectedFolder)) || activeTab.mail)
         : null
     const activeComposeTab = activeTab?.kind === 'compose' ? activeTab : null
     // Rich-text formatting toolbar visibility: shown for compose tabs directly,
@@ -6419,7 +6282,7 @@ function MailSection({
     const activeTabReadLabel = activeTabMail?.seen === true ? 'Unread' : 'Read'
     const fileActionsDisabled = !selectedMail || loadingContent || fileActionLoading !== ''
     const mailItemMenuMail = mailItemMenu?.mail
-        ? (mails.find((mail) => mail.id === mailItemMenu.mail.id) || mailItemMenu.mail)
+        ? (mails.find((mail) => sameMail(mail, mailItemMenu.mail, selectedFolder)) || mailItemMenu.mail)
         : null
     const mailItemReadLabel = mailItemMenuMail?.seen === true ? 'Mark as unread' : 'Mark as read'
 
@@ -6434,9 +6297,10 @@ function MailSection({
     const closeTabsForMailIds = (mailIds) => {
         const ids = new Set(mailIds)
         const affectedTabIds = tabs
-            .filter((tab) => tab.kind === 'mail' && ids.has(tab.mail.id))
+            .filter((tab) => tab.kind === 'mail' && ids.has(mailKey(tab.mail, selectedFolder)))
             .map((tab) => tab.id)
-        setTabs((prev) => prev.filter((tab) => tab.kind !== 'mail' || !ids.has(tab.mail.id)))
+        affectedTabIds.forEach((tabId) => pendingTabLoadsRef.current.delete(tabId))
+        setTabs((prev) => prev.filter((tab) => tab.kind !== 'mail' || !ids.has(mailKey(tab.mail, selectedFolder))))
         setTabContents((prev) => {
             const next = { ...prev }
             affectedTabIds.forEach((tabId) => {
@@ -6446,28 +6310,22 @@ function MailSection({
             })
             return next
         })
-        if (activeTabId && activeTab?.kind === 'mail' && ids.has(activeTab.mail.id)) {
+        if (activeTabId && activeTab?.kind === 'mail' && ids.has(mailKey(activeTab.mail, selectedFolder))) {
             setActiveTabId(null)
         }
     }
 
-    const patchOpenTabsForMail = (mailId, patch) => {
-        setTabs((prev) => prev.map((tab) => (
-            tab.kind === 'mail' && tab.mail.id === mailId ? { ...tab, mail: { ...tab.mail, ...patch } } : tab
-        )))
-    }
-
     const handleActiveTabDeleteAction = async () => {
         if (!activeTabMail) return
-        await deleteMailsOptimistic([activeTabMail.id])
-        closeTabsForMailIds([activeTabMail.id])
+        await deleteMailsOptimistic([mailKey(activeTabMail, selectedFolder)])
+        closeTabsForMailIds([mailKey(activeTabMail, selectedFolder)])
         closeActionMenus()
     }
 
     const handleActiveTabMoveAction = async (destination) => {
         if (!activeTabMail || !destination) return
-        await moveMailsOptimistic([activeTabMail.id], destination)
-        closeTabsForMailIds([activeTabMail.id])
+        await moveMailsOptimistic([mailKey(activeTabMail, selectedFolder)], destination)
+        closeTabsForMailIds([mailKey(activeTabMail, selectedFolder)])
         closeActionMenus()
     }
 
@@ -6497,18 +6355,17 @@ function MailSection({
     const handleActiveTabReadToggleAction = async () => {
         if (!activeTabMail) return
         const nextSeen = activeTabMail.seen !== true
-        await setMailsSeenState([activeTabMail.id], nextSeen)
-        patchOpenTabsForMail(activeTabMail.id, { seen: nextSeen })
+        await setMailsSeenState([mailKey(activeTabMail, selectedFolder)], nextSeen)
     }
 
     const handleActiveTabLabelToggleAction = async (labelKey, shouldAdd) => {
         if (!activeTabMail) return
-        await toggleLabelsOptimistic([activeTabMail.id], labelKey, shouldAdd)
+        await toggleLabelsOptimistic([mailKey(activeTabMail, selectedFolder)], labelKey, shouldAdd)
     }
 
     const handleActiveTabCreateLabelAction = async () => {
         if (!activeTabMail) return
-        await createAndApplyLabel([activeTabMail.id])
+        await createAndApplyLabel([mailKey(activeTabMail, selectedFolder)])
     }
 
     const handleCreateFolderAndMoveFromTab = async () => {
@@ -7002,7 +6859,7 @@ function MailSection({
                                         title={openActionTitle}
                                         onClick={() => {
                                             const mail = actionableMails[0]
-                                            const content = selectedMail?.id === mail?.id ? mailContent : null
+                                            const content = sameMail(selectedMail, mail, selectedFolder) ? mailContent : null
                                             openHeadersPanel(mail, content, mail?.mailbox || selectedFolder || 'INBOX')
                                         }}
                                     >
@@ -7154,7 +7011,7 @@ function MailSection({
 
     const centerPlaneTabNode = activeTabId ? (
                 <div className="mail-tab-content">
-                    {activeTab?.kind === 'mail' && loadingTab ? (
+                    {activeTab?.kind === 'mail' && !Object.hasOwn(tabContents, activeTabId) ? (
                         <div className="db-loading" style={{ paddingTop: 60 }}><div className="db-spinner" />Loading...</div>
                     ) : activeComposeTab ? (
                         <ComposeMailContent
@@ -7197,7 +7054,11 @@ function MailSection({
                                 <div className="db-mail-body">
                                     <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-tertiary, #888)' }}>
                                         <img src="/img/icons/offline.svg" style={{ width: 48, height: 48, opacity: 0.5, marginBottom: '1rem' }} alt="" />
-                                        <div>{remoteMailAvailable ? 'Failed to load message content.' : 'Message not downloaded for offline use.'}</div>
+                                        <div>{remoteMailAvailable ? t('Failed to load message content.') : t('Message not downloaded for offline use.')}</div>
+                                        <button type="button" className="db-advanced-search-btn db-advanced-search-btn--secondary"
+                                            onClick={() => loadMailTabContent(activeTab.id, activeTabMail, activeTab.mailbox)}>
+                                            {t('Retry loading message')}
+                                        </button>
                                     </div>
                                 </div>
                             ) : activeTabContent.html_body ? (
@@ -7726,6 +7587,11 @@ function MailSection({
                                                     ? t('Search failed.')
                                                     : t('Search results found', { count: activeSearch?.totalCount ?? mails.length })}
                                         </div>
+                                        {activeSearch?.criteria?.from?.trim() && (
+                                            <span className="db-search-results-banner__sender">
+                                                {t('From {{sender}}', { sender: activeSearch.criteria.from.trim() })}
+                                            </span>
+                                        )}
                                         <button
                                             type="button"
                                             className="db-search-results-banner__clear"
@@ -7766,9 +7632,7 @@ function MailSection({
                                             {threadedEnabled ? (
                                                 pagedVisibleThreads.map((thread) => {
                                                     const mailsInThread = Array.isArray(thread?.mails) ? thread.mails : []
-                                                    const mailIds = Array.isArray(thread?.mail_ids)
-                                                        ? thread.mail_ids
-                                                        : mailsInThread.map((m) => String(m?.id ?? '')).filter(Boolean)
+                                                    const mailIds = mailsInThread.map((mail) => mailKey(mail, selectedFolder)).filter(Boolean)
 
                                                     const selectedCount = mailIds.reduce(
                                                         (acc, id) => acc + (selectedMailIds.has(id) ? 1 : 0),
@@ -7781,7 +7645,7 @@ function MailSection({
                                                     const latestMail = mailsInThread.length > 0 ? mailsInThread[mailsInThread.length - 1] : null
                                                     const isThread = mailsInThread.length > 1
                                                     const childMails = isThread ? mailsInThread.slice().reverse() : []
-                                                    const isAnchorSelected = !!(latestMail && selectedMail?.id === latestMail.id)
+                                                    const isAnchorSelected = !!(latestMail && sameMail(selectedMail, latestMail, selectedFolder))
                                                     const threadSender = latestMail?.name || latestMail?.address || thread?.latest_from || 'Unknown'
                                                     const threadTime = getShortTime(latestMail?.date || thread?.latest_date || '')
                                                     const threadSubject = latestMail?.subject || thread?.subject_display || '(No Subject)'
@@ -7799,7 +7663,7 @@ function MailSection({
                                                             else mailIds.forEach((id) => next.add(id))
                                                             return next
                                                         })
-                                                        if (latestMail?.id) setLastSelectedMailId(latestMail.id)
+                                                        if (latestMail) setLastSelectedMailId(mailKey(latestMail, selectedFolder))
                                                     }
 
                                                     return (
@@ -7902,11 +7766,11 @@ function MailSection({
 	                                                                )}
 	                                                            </li>
 	                                                            {isExpanded && childMails.map((mail) => {
-	                                                                const isChecked = selectedMailIds.has(mail.id)
+	                                                                const isChecked = selectedMailIds.has(mailKey(mail, selectedFolder))
 	                                                                return (
                                                                     <li
                                                                         key={`${thread.id}-${mail.id}`}
-                                                                        className={`db-mail-item db-mail-item--thread-child ${mail.seen !== true ? 'unread' : ''} ${selectedMail?.id === mail.id ? 'selected' : ''} ${selectMode ? 'select-mode' : ''} ${isChecked ? 'checked' : ''}`}
+                                                                        className={`db-mail-item db-mail-item--thread-child ${mail.seen !== true ? 'unread' : ''} ${sameMail(selectedMail, mail, selectedFolder) ? 'selected' : ''} ${selectMode ? 'select-mode' : ''} ${isChecked ? 'checked' : ''}`}
                                                                         onClick={() => {
                                                                             if (isDraggingRef.current) return
                                                                             setActiveThreadReaderId(null)
@@ -7928,7 +7792,7 @@ function MailSection({
                                                                             <button
                                                                                 type="button"
                                                                                 className={`db-mail-avatar-toggle ${selectMode ? 'visible' : ''} ${isChecked ? 'checked' : ''}`}
-                                                                                onClick={(event) => handleMailSelectionToggle(event, mail.id)}
+                                                                                onClick={(event) => handleMailSelectionToggle(event, mailKey(mail, selectedFolder))}
                                                                                 aria-pressed={isChecked}
                                                                                 aria-label={isChecked ? 'Unselect mail' : 'Select mail'}
                                                                                 title={selectMode ? 'Select mail' : 'Enter selection mode'}
@@ -7961,15 +7825,15 @@ function MailSection({
                                                 })
                                             ) : (
                                                 pagedVisibleMails.map((mail) => {
-                                                    const isChecked = selectedMailIds.has(mail.id)
+                                                    const isChecked = selectedMailIds.has(mailKey(mail, selectedFolder))
                                                     const mailLabels = getMailLabels(mail)
                                                     const visibleMailLabels = mailLabels.slice(0, 2)
                                                     const remainingMailLabelCount = Math.max(0, mailLabels.length - visibleMailLabels.length)
 
                                                     return (
                                                         <li
-                                                            key={mail.id}
-                                                            className={`db-mail-item ${mail.seen !== true ? 'unread' : ''} ${selectedMail?.id === mail.id ? 'selected' : ''} ${selectMode ? 'select-mode' : ''} ${isChecked ? 'checked' : ''}`}
+                                                            key={mailKey(mail, selectedFolder)}
+                                                            className={`db-mail-item ${mail.seen !== true ? 'unread' : ''} ${sameMail(selectedMail, mail, selectedFolder) ? 'selected' : ''} ${selectMode ? 'select-mode' : ''} ${isChecked ? 'checked' : ''}`}
                                                             onClick={() => {
                                                                 if (isDraggingRef.current) return
                                                                 attemptOpenMail(mail)
@@ -7990,7 +7854,7 @@ function MailSection({
                                                                 <button
                                                                     type="button"
                                                                     className={`db-mail-avatar-toggle ${selectMode ? 'visible' : ''} ${isChecked ? 'checked' : ''}`}
-                                                                    onClick={(event) => handleMailSelectionToggle(event, mail.id)}
+                                                                    onClick={(event) => handleMailSelectionToggle(event, mailKey(mail, selectedFolder))}
                                                                     aria-pressed={isChecked}
                                                                     aria-label={isChecked ? 'Unselect mail' : 'Select mail'}
                                                                     title={selectMode ? 'Select mail' : 'Enter selection mode'}
@@ -8050,6 +7914,22 @@ function MailSection({
                                                     <button type="button" className="db-submenu-popover__item" onClick={handleMailItemMenuArchive}>
                                                         <img src="/img/icons/archive.svg" className="svg-icon-inline" /> Archive
                                                     </button>
+                                                    {mailItemMenuMail.address?.trim() && (
+                                                        <button
+                                                            type="button"
+                                                            className="db-submenu-popover__item"
+                                                            disabled={!backendReachable}
+                                                            onClick={() => {
+                                                                setActiveFilter('all')
+                                                                resetBulkSelection()
+                                                                closeMailItemMenu()
+                                                                onSearchBySender(mailItemMenuMail.address)
+                                                            }}
+                                                        >
+                                                            <img src="/img/icons/search.svg" alt="" className="svg-icon-inline" />
+                                                            {t('Find emails from this sender')}
+                                                        </button>
+                                                    )}
                                                     <button type="button" className="db-submenu-popover__item" onClick={handleMailItemMenuReply}>
                                                         <img src="/img/icons/reply.svg" className="svg-icon-inline" /> Reply
                                                     </button>
@@ -8329,7 +8209,7 @@ function MailSection({
 	                                        {showThreadReader && selectedThread ? (
 	                                            <div className="db-thread-reader" aria-label="Conversation">
 	                                                {(selectedThread.mails || []).slice().reverse().map((m) => {
-	                                                    const id = String(m?.id ?? '')
+	                                                    const id = mailKey(m, selectedFolder)
 	                                                    const isOpen = threadReaderOpenIds.has(id)
 	                                                    const isLoading = threadReaderLoadingIds.has(id)
 	                                                    const content = threadReaderContentByIdSafe?.[id] || null
@@ -8394,7 +8274,10 @@ function MailSection({
                                                     <div className="db-mail-body">
                                                         <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-tertiary, #888)' }}>
                                                             <img src="/img/icons/offline.svg" style={{ width: 48, height: 48, opacity: 0.5, marginBottom: '1rem' }} alt="" />
-                                                            <div>{remoteMailAvailable ? 'Failed to load message content.' : 'Message not downloaded for offline use.'}</div>
+                                                            <div>{remoteMailAvailable ? t('Failed to load message content.') : t('Message not downloaded for offline use.')}</div>
+                                                            <button type="button" className="db-advanced-search-btn db-advanced-search-btn--secondary" onClick={() => openMail(selectedMail)}>
+                                                                {t('Retry loading message')}
+                                                            </button>
                                                         </div>
                                                     </div>
                                                 ) : mailContent.html_body ? (

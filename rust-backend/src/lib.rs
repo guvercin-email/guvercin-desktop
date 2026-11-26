@@ -74,6 +74,7 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
     let mail_state = Arc::new(MailAppState {
         _db: db_state.clone(),
         imap: imap_state.clone(),
+        sync_locks: Default::default(),
     });
 
     let cors = CorsLayer::new()

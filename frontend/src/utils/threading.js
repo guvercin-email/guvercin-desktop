@@ -33,12 +33,21 @@ export function normalizeSubject(subject) {
   return s
 }
 
-export function computeThreadKey(mail, { mailbox = '' } = {}) {
-  const refs = filterThreadingIds(parseMessageIdList(mail?.references))
-  if (refs.length > 0) return refs[0]
+function replyRoot(mail) {
+  return filterThreadingIds(parseMessageIdList(mail?.references))[0]
+    || filterThreadingIds(parseMessageIdList(mail?.in_reply_to))[0]
+}
 
-  const irt = filterThreadingIds(parseMessageIdList(mail?.in_reply_to))
-  if (irt.length > 0) return irt[0]
+function ownMessageId(mail) {
+  const parsed = filterThreadingIds(parseMessageIdList(mail?.message_id))[0]
+  if (parsed) return parsed
+  const raw = typeof mail?.message_id === 'string' ? mail.message_id.trim() : ''
+  return raw && !isProtonInternalId(raw) ? raw : ''
+}
+
+export function computeThreadKey(mail, { mailbox = '' } = {}) {
+  const root = replyRoot(mail)
+  if (root) return root
 
   const mb = String(mailbox || mail?.mailbox || '').trim().toLowerCase()
   const fromRaw = String(mail?.address || '').trim().toLowerCase()
@@ -51,11 +60,8 @@ export function computeThreadKey(mail, { mailbox = '' } = {}) {
     if (fromKey) return `smart:${mb}::${fromKey}::${subjectNorm}`
   }
 
-  const mid = filterThreadingIds(parseMessageIdList(mail?.message_id))
-  if (mid.length > 0) return mid[0]
-
-  const rawMid = typeof mail?.message_id === 'string' ? mail.message_id.trim() : ''
-  if (rawMid && !isProtonInternalId(rawMid)) return rawMid
+  const messageId = ownMessageId(mail)
+  if (messageId) return messageId
 
   const uid = String(mail?.id ?? '')
   return `${mb}::${uid}`
@@ -101,10 +107,13 @@ export function buildThreads(mails, { threadOrder = 'asc', mailbox = '' } = {}) 
   const scopedMailbox = String(mailbox || '').trim()
 
   const items = Array.isArray(mails) ? mails : []
+  const referencedIds = new Set(items.map(replyRoot).filter(Boolean))
   for (const mail of items) {
     if (!mail || typeof mail !== 'object') continue
     const mailboxForKey = scopedMailbox || String(mail.mailbox || '').trim()
-    const id = computeThreadKey(mail, { mailbox: mailboxForKey })
+    const ownId = ownMessageId(mail)
+    const id = replyRoot(mail)
+      || (referencedIds.has(ownId) ? ownId : computeThreadKey(mail, { mailbox: mailboxForKey }))
     const existing = threadsById.get(id)
     if (existing) {
       existing.mails.push(mail)

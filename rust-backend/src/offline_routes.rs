@@ -623,12 +623,13 @@ fn apply_advanced_search_filters(
     }
 
     if let Some(value) = req.from.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        let pattern = format!("%{}%", value);
+        let literal = value.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+        let pattern = format!("%{literal}%");
         qb.push(" AND (LOWER(COALESCE(sender_address, '')) LIKE LOWER(")
             .push_bind(pattern.clone())
-            .push(") OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
+            .push(") ESCAPE '!' OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
             .push_bind(pattern)
-            .push("))");
+            .push(") ESCAPE '!')");
     }
 
     if let Some(value) = req.to.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -895,15 +896,16 @@ pub async fn get_mailbox_counts_cached(
         Err(_) => return Ok(Json(json!({ "counts": {} }))),
     };
 
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"
         SELECT folder AS folder,
                COUNT(*) AS total,
                COALESCE(SUM(CASE WHEN COALESCE(seen, 0) = 0 THEN 1 ELSE 0 END), 0) AS unread
         FROM local_mail_cache
+        WHERE {VISIBLE_CACHED_MAIL}
         GROUP BY folder
         "#,
-    )
+    ))
     .fetch_all(&pool)
     .await?;
 
@@ -918,6 +920,18 @@ pub async fn get_mailbox_counts_cached(
     Ok(Json(json!({ "counts": counts })))
 }
 
+// Keep the source copy available for retries. Only the server can assign the
+// destination UID, so a pending move never creates a destination cache row.
+const VISIBLE_CACHED_MAIL: &str = r#"
+    NOT EXISTS (
+        SELECT 1 FROM offline_sync_queue AS pending
+        WHERE pending.target_folder = local_mail_cache.folder
+          AND pending.target_uid = local_mail_cache.uid
+          AND pending.action_type = 'move'
+          AND pending.status IN ('pending', 'processing')
+    )
+"#;
+
 pub async fn get_local_mail_list(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
@@ -926,23 +940,25 @@ pub async fn get_local_mail_list(
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
     let offset = q.page.saturating_sub(1) * q.per_page;
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM local_mail_cache WHERE folder = ?")
-        .bind(&q.mailbox)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(1) FROM local_mail_cache WHERE folder = ? AND {VISIBLE_CACHED_MAIL}"
+    ))
+    .bind(&q.mailbox)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
 
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"
         SELECT uid, message_id, in_reply_to, references_value,
                sender_name, sender_address, recipient_to, subject, date_value,
                seen, flagged, size_bytes, importance_value, content_type, category, labels_json
         FROM local_mail_cache
-        WHERE folder = ?
+        WHERE folder = ? AND {VISIBLE_CACHED_MAIL}
         ORDER BY date_ms DESC, uid DESC
         LIMIT ? OFFSET ?
         "#,
-    )
+    ))
     .bind(&q.mailbox)
     .bind(q.per_page as i64)
     .bind(offset as i64)
@@ -1185,20 +1201,21 @@ pub async fn search_advanced(
         ));
     }
 
-    let mut count_qb =
-        QueryBuilder::<Sqlite>::new("SELECT COUNT(1) FROM local_mail_cache WHERE 1=1");
+    let mut count_qb = QueryBuilder::<Sqlite>::new(format!(
+        "SELECT COUNT(1) FROM local_mail_cache WHERE {VISIBLE_CACHED_MAIL}"
+    ));
     apply_advanced_search_filters(&mut count_qb, &body, &normalized_mailboxes);
     let (total,): (i64,) = count_qb.build_query_as::<(i64,)>().fetch_one(&pool).await?;
 
-    let mut qb = QueryBuilder::<Sqlite>::new(
+    let mut qb = QueryBuilder::<Sqlite>::new(format!(
         r#"
         SELECT uid, message_id, in_reply_to, references_value,
                sender_name, sender_address, recipient_to, subject, date_value, seen, flagged,
                size_bytes, importance_value, content_type, category, labels_json, folder
         FROM local_mail_cache
-        WHERE 1=1
+        WHERE {VISIBLE_CACHED_MAIL}
         "#,
-    );
+    ));
     apply_advanced_search_filters(&mut qb, &body, &normalized_mailboxes);
     qb.push(" ORDER BY date_ms DESC, uid DESC");
 
@@ -2251,16 +2268,15 @@ pub async fn post_offline_action(
     .execute(&mut *tx)
     .await?;
 
-    tx.commit().await?;
-
     apply_local_action_side_effects(
-        &pool,
+        &mut tx,
         &payload.action_type,
         payload.target_uid.as_deref(),
         payload.target_folder.as_deref(),
         &payload_value,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(OfflineActionResponse {
         status: "queued",
@@ -2273,6 +2289,17 @@ pub async fn sync_now(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<SyncNowResponse>, AppError> {
+    let sync_lock = {
+        let mut locks = state.sync_locks.lock().await;
+        locks.entry(account_id).or_default().clone()
+    };
+    let Ok(_guard) = sync_lock.try_lock() else {
+        return Ok(Json(SyncNowResponse {
+            status: "busy",
+            processed: 0,
+            failed: 0,
+        }));
+    };
     set_account_sync_status(&state._db, account_id, true).await?;
     let result = sync_now_impl(&state, account_id).await;
     let _ = set_account_sync_status(&state._db, account_id, false).await;
@@ -2312,7 +2339,7 @@ pub async fn process_queue_once(
         FROM offline_sync_queue
         WHERE status = 'pending'
            OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP))
-        ORDER BY created_at ASC
+        ORDER BY created_at ASC, id ASC
         LIMIT ?
         "#,
     )
@@ -2368,12 +2395,12 @@ pub async fn process_queue_once(
             .flatten()
             .unwrap_or(0);
 
-        let _ = sqlx::query(
+        sqlx::query(
             "UPDATE offline_sync_queue SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(id)
         .execute(&pool)
-        .await;
+        .await?;
 
         let parsed: serde_json::Value =
             serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
@@ -2404,13 +2431,17 @@ pub async fn process_queue_once(
                         .get("destination")
                         .and_then(|v| v.as_str())
                         .unwrap_or(target_folder.as_str());
-                    imap_session::move_mail(
-                        &state.imap,
-                        account_id,
-                        &target_folder,
-                        &target_uid,
-                        destination,
-                    )
+                    if destination == target_folder {
+                        Ok(())
+                    } else {
+                        imap_session::move_mail(
+                            &state.imap,
+                            account_id,
+                            &target_folder,
+                            &target_uid,
+                            destination,
+                        )
+                    }
                 }
                 "label_add" => {
                     let label = parsed
@@ -3151,8 +3182,14 @@ pub async fn process_queue_once(
 
         match result {
             Ok(_) => {
-                processed += 1;
-                let _ = sqlx::query(
+                let mut tx = pool.begin().await?;
+                if action_type == "move"
+                    && parsed.get("destination").and_then(|value| value.as_str())
+                        .is_some_and(|destination| destination != target_folder)
+                {
+                    remove_moved_source(&mut tx, &target_uid, &target_folder).await?;
+                }
+                sqlx::query(
                     r#"
                     UPDATE offline_sync_queue
                     SET status = 'done', last_error = NULL, updated_at = CURRENT_TIMESTAMP
@@ -3160,8 +3197,10 @@ pub async fn process_queue_once(
                     "#,
                 )
                 .bind(id)
-                .execute(&pool)
-                .await;
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                processed += 1;
             }
             Err(err_msg) => {
                 failed += 1;
@@ -3584,29 +3623,32 @@ async fn sync_specific_uids(
         for (uid, mut mail) in aligned {
             let mut is_blocked = false;
             for rule in &blocked_rules {
-                if mail.address.eq_ignore_ascii_case(&rule.sender) {
-                    is_blocked = true;
-                    let action = rule.action_type.clone();
-                    let target_folder = rule.target_folder.clone().unwrap_or_default();
-                    let action_payload = if action == "move" {
-                        json!({ "destination": target_folder })
-                    } else {
-                        json!({})
-                    };
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
-                        VALUES (?, ?, ?, ?)
-                        "#,
-                    )
-                    .bind(&action)
-                    .bind(uid.to_string())
-                    .bind(mailbox)
-                    .bind(action_payload.to_string())
-                    .execute(pool)
-                    .await;
-                    break;
+                if !mail.address.trim().eq_ignore_ascii_case(rule.sender.trim())
+                    || (rule.action_type == "move" && rule.target_folder.as_deref() == Some(mailbox))
+                {
+                    continue;
                 }
+                is_blocked = true;
+                let action = rule.action_type.clone();
+                let target_folder = rule.target_folder.clone().unwrap_or_default();
+                let action_payload = if action == "move" {
+                    json!({ "destination": target_folder })
+                } else {
+                    json!({})
+                };
+                sqlx::query(
+                    r#"
+                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(&action)
+                .bind(uid.to_string())
+                .bind(mailbox)
+                .bind(action_payload.to_string())
+                .execute(pool)
+                .await?;
+                break;
             }
 
             if is_blocked {
@@ -3742,8 +3784,21 @@ fn mailbox_is_selected(mailbox: &str, includes: &[String], excludes: &[String]) 
     included && !excluded
 }
 
+async fn remove_moved_source(
+    db: &mut sqlx::SqliteConnection,
+    uid: &str,
+    folder: &str,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
+        .bind(uid)
+        .bind(folder)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn apply_local_action_side_effects(
-    pool: &SqlitePool,
+    db: &mut sqlx::SqliteConnection,
     action_type: &str,
     target_uid: Option<&str>,
     target_folder: Option<&str>,
@@ -3761,7 +3816,7 @@ async fn apply_local_action_side_effects(
             )
             .bind(uid)
             .bind(folder)
-            .execute(pool)
+            .execute(&mut *db)
             .await?;
         }
         "mark_unread" => {
@@ -3770,175 +3825,55 @@ async fn apply_local_action_side_effects(
             )
             .bind(uid)
             .bind(folder)
-            .execute(pool)
+            .execute(&mut *db)
             .await?;
         }
         "delete" => {
             sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
                 .bind(uid)
                 .bind(folder)
-                .execute(pool)
+                .execute(&mut *db)
                 .await?;
         }
-        "move" => {
-            let destination = payload
-                .get("destination")
+        "label_add" | "label_remove" => {
+            let Some(label) = payload
+                .get("label")
                 .and_then(|value| value.as_str())
-                .unwrap_or(folder);
-            if destination == folder {
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
                 return Ok(());
-            }
-
-            let mut tx = pool.begin().await?;
-
-            let destination_has_same_uid: bool =
-                sqlx::query("SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? LIMIT 1")
-                    .bind(uid)
-                    .bind(destination)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .is_some();
-
-            if destination_has_same_uid {
-                // IMAP UIDs are scoped to a mailbox; reusing the same UID in another mailbox is common.
-                // If the destination already has a row with the same UID, don't try to "move" by changing
-                // the folder key (it violates UNIQUE(uid, folder) and may overwrite another message).
-                // Instead, remove the message from the source view and let the next sync populate the
-                // destination mailbox with its new UID.
-                sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
-                    .bind(uid)
-                    .bind(folder)
-                    .execute(&mut *tx)
-                    .await?;
-                tx.commit().await?;
-                return Ok(());
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO folders (path_by_name, path_by_id, name, type, is_visible)
-                VALUES (?, ?, ?, 'USER', 1)
-                ON CONFLICT(path_by_name) DO UPDATE SET name = excluded.name
-                "#,
+            };
+            let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT category, labels_json FROM local_mail_cache WHERE uid = ? AND folder = ?",
             )
-            .bind(destination)
-            .bind(destination)
-            .bind(destination)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "UPDATE local_mail_cache SET folder = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
-            )
-            .bind(destination)
             .bind(uid)
             .bind(folder)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *db)
             .await?;
-
-            tx.commit().await?;
-        }
-        "label_add" => {
-            let label = payload
-                .get("label")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(label) = label {
-                let rows = sqlx::query(
-                    "SELECT folder, category, labels_json FROM local_mail_cache WHERE uid = ?",
-                )
-                .bind(uid)
-                .fetch_all(pool)
-                .await?;
-
-                for row in rows {
-                    let row_folder = row
-                        .try_get::<Option<String>, _>("folder")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| folder.to_string());
-                    let existing_category =
-                        row.try_get::<Option<String>, _>("category").ok().flatten();
-                    let existing_labels_json = row
-                        .try_get::<Option<String>, _>("labels_json")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "[]".to_string());
-
-                    let mutation = compute_local_label_mutation(
-                        &existing_labels_json,
-                        existing_category.as_deref(),
-                        label,
-                        true,
-                        &row_folder,
-                    );
-
+            if let Some((category, labels_json)) = row {
+                let mutation = compute_local_label_mutation(
+                    labels_json.as_deref().unwrap_or("[]"),
+                    category.as_deref(),
+                    label,
+                    action_type == "label_add",
+                    folder,
+                );
+                if mutation.delete_row {
+                    sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
+                        .bind(uid)
+                        .bind(folder)
+                        .execute(&mut *db)
+                        .await?;
+                } else {
                     sqlx::query(
                         "UPDATE local_mail_cache SET category = ?, labels_json = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
                     )
                     .bind(mutation.next_category.as_deref())
                     .bind(&mutation.labels_json)
                     .bind(uid)
-                    .bind(&row_folder)
-                    .execute(pool)
-                    .await?;
-                }
-            }
-        }
-        "label_remove" => {
-            let label = payload
-                .get("label")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(label) = label {
-                let rows = sqlx::query(
-                    "SELECT folder, category, labels_json FROM local_mail_cache WHERE uid = ?",
-                )
-                .bind(uid)
-                .fetch_all(pool)
-                .await?;
-
-                for row in rows {
-                    let row_folder = row
-                        .try_get::<Option<String>, _>("folder")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| folder.to_string());
-                    let existing_category =
-                        row.try_get::<Option<String>, _>("category").ok().flatten();
-                    let existing_labels_json = row
-                        .try_get::<Option<String>, _>("labels_json")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "[]".to_string());
-
-                    let mutation = compute_local_label_mutation(
-                        &existing_labels_json,
-                        existing_category.as_deref(),
-                        label,
-                        false,
-                        &row_folder,
-                    );
-
-                    if mutation.delete_row {
-                        sqlx::query("DELETE FROM local_mail_cache WHERE uid = ? AND folder = ?")
-                            .bind(uid)
-                            .bind(&row_folder)
-                            .execute(pool)
-                            .await?;
-                        continue;
-                    }
-
-                    sqlx::query(
-                        "UPDATE local_mail_cache SET category = ?, labels_json = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
-                    )
-                    .bind(mutation.next_category.as_deref())
-                    .bind(&mutation.labels_json)
-                    .bind(uid)
-                    .bind(&row_folder)
-                    .execute(pool)
+                    .bind(folder)
+                    .execute(&mut *db)
                     .await?;
                 }
             }
@@ -4098,29 +4033,32 @@ async fn sync_single_mailbox(
 
             let mut is_blocked = false;
             for rule in &blocked_rules {
-                if mail.address.eq_ignore_ascii_case(&rule.sender) {
-                    is_blocked = true;
-                    let action = rule.action_type.clone();
-                    let target_folder = rule.target_folder.clone().unwrap_or_default();
-                    let action_payload = if action == "move" {
-                        json!({ "destination": target_folder })
-                    } else {
-                        json!({})
-                    };
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
-                        VALUES (?, ?, ?, ?)
-                        "#,
-                    )
-                    .bind(&action)
-                    .bind(uid.to_string())
-                    .bind(mailbox)
-                    .bind(action_payload.to_string())
-                    .execute(pool)
-                    .await;
-                    break;
+                if !mail.address.trim().eq_ignore_ascii_case(rule.sender.trim())
+                    || (rule.action_type == "move" && rule.target_folder.as_deref() == Some(mailbox))
+                {
+                    continue;
                 }
+                is_blocked = true;
+                let action = rule.action_type.clone();
+                let target_folder = rule.target_folder.clone().unwrap_or_default();
+                let action_payload = if action == "move" {
+                    json!({ "destination": target_folder })
+                } else {
+                    json!({})
+                };
+                sqlx::query(
+                    r#"
+                    INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(&action)
+                .bind(uid.to_string())
+                .bind(mailbox)
+                .bind(action_payload.to_string())
+                .execute(pool)
+                .await?;
+                break;
             }
 
             if is_blocked {
@@ -4274,7 +4212,12 @@ pub async fn add_blocked_sender(
     Path(account_id): Path<i64>,
     Json(payload): Json<crate::models::CreateBlockedSenderRequest>,
 ) -> Result<Json<crate::models::BlockedSenderRecord>, AppError> {
+    let sender = payload.sender.trim();
+    if sender.is_empty() {
+        return Err(AppError::BadRequest("Sender is required.".to_string()));
+    }
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    let mut tx = pool.begin().await?;
 
     let result = sqlx::query(
         r#"
@@ -4282,10 +4225,10 @@ pub async fn add_blocked_sender(
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         "#,
     )
-    .bind(&payload.sender)
+    .bind(sender)
     .bind(&payload.action_type)
     .bind(&payload.target_folder)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     let new_id = result.last_insert_rowid();
@@ -4294,16 +4237,15 @@ pub async fn add_blocked_sender(
         "SELECT id, sender, action_type, target_folder, created_at FROM blocked_senders WHERE id = ?"
     )
     .bind(new_id)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     if payload.apply_to_existing {
-        let pattern = format!("%{}%", payload.sender);
         let rows = sqlx::query(
-            "SELECT uid, folder FROM local_mail_cache WHERE LOWER(COALESCE(sender_address, '')) LIKE LOWER(?)"
+            "SELECT uid, folder FROM local_mail_cache WHERE TRIM(sender_address) = ? COLLATE NOCASE"
         )
-        .bind(&pattern)
-        .fetch_all(&pool)
+        .bind(sender)
+        .fetch_all(&mut *tx)
         .await?;
 
         for row in rows {
@@ -4313,22 +4255,25 @@ pub async fn add_blocked_sender(
             let action = payload.action_type.clone();
             let target_folder = payload.target_folder.clone().unwrap_or_default();
 
+            if action == "move" && target_folder == folder {
+                continue;
+            }
             let action_payload = if action == "move" {
                 json!({ "destination": target_folder })
             } else {
                 json!({})
             };
 
-            let _ = apply_local_action_side_effects(
-                &pool,
+            apply_local_action_side_effects(
+                &mut tx,
                 &action,
                 Some(&uid),
                 Some(&folder),
                 &action_payload,
             )
-            .await;
+            .await?;
 
-            let _ = sqlx::query(
+            sqlx::query(
                 r#"
                 INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json)
                 VALUES (?, ?, ?, ?)
@@ -4338,11 +4283,12 @@ pub async fn add_blocked_sender(
             .bind(&uid)
             .bind(&folder)
             .bind(action_payload.to_string())
-            .execute(&pool)
-            .await;
+            .execute(&mut *tx)
+            .await?;
         }
     }
 
+    tx.commit().await?;
     Ok(Json(record))
 }
 
@@ -4984,6 +4930,42 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    #[tokio::test]
+    async fn advanced_sender_search_treats_address_characters_literally() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE mail (sender_address TEXT, sender_name TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO mail VALUES ('a_b@example.com', 'First'), ('axb@example.com', 'Second')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT sender_address FROM mail WHERE 1 = 1");
+        apply_advanced_search_filters(
+            &mut query,
+            &AdvancedSearchRequest {
+                from: Some("A_B@example.com".to_string()),
+                ..Default::default()
+            },
+            &[],
+        );
+
+        let matching = query
+            .build_query_scalar::<String>()
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(matching, ["a_b@example.com"]);
+    }
+
     fn preview(id: &str) -> MailPreview {
         MailPreview {
             id: id.to_string(),
@@ -5114,86 +5096,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_local_action_move_deletes_source_on_uid_collision() {
+    async fn label_changes_are_scoped_to_mailbox_and_rollback_with_the_transaction() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-
         sqlx::query(
-            r#"
-            CREATE TABLE folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path_by_name TEXT UNIQUE NOT NULL,
-                path_by_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                is_visible BOOLEAN NOT NULL DEFAULT 1
-            )
-            "#,
+            "CREATE TABLE local_mail_cache (
+                uid TEXT, folder TEXT, category TEXT, labels_json TEXT,
+                updated_at DATETIME, UNIQUE(uid, folder)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO local_mail_cache (uid, folder, labels_json)
+             VALUES ('123', 'INBOX', '[]'), ('123', 'Archive', '[]')",
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        sqlx::query(
-            r#"
-            CREATE TABLE local_mail_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uid TEXT NOT NULL,
-                folder TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(uid, folder)
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
-            .bind("123")
-            .bind("INBOX")
-            .execute(&pool)
+        let payload = json!({ "label": "Work" });
+        let mut tx = pool.begin().await.unwrap();
+        apply_local_action_side_effects(&mut tx, "label_add", Some("123"), Some("INBOX"), &payload)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO local_mail_cache (uid, folder) VALUES (?, ?)")
-            .bind("123")
-            .bind("Trash")
-            .execute(&pool)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
 
+        let mut tx = pool.begin().await.unwrap();
         apply_local_action_side_effects(
-            &pool,
+            &mut tx, "label_remove", Some("123"), Some("INBOX"), &payload,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT folder, labels_json FROM local_mail_cache ORDER BY folder")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Archive".to_string(), "[]".to_string()),
+                ("INBOX".to_string(), "[\"Work\"]".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_move_preserves_the_source_for_retry_and_never_reuses_its_uid() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE local_mail_cache (uid TEXT, folder TEXT, UNIQUE(uid, folder))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE offline_sync_queue (
+                target_uid TEXT, target_folder TEXT, action_type TEXT, status TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO local_mail_cache VALUES ('123', 'INBOX'), ('123', 'Trash')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO offline_sync_queue VALUES ('123', 'INBOX', 'move', 'pending')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        apply_local_action_side_effects(
+            &mut tx,
             "move",
             Some("123"),
             Some("INBOX"),
-            &serde_json::json!({ "destination": "Trash" }),
+            &json!({ "destination": "Archive" }),
         )
         .await
         .unwrap();
+        tx.commit().await.unwrap();
 
-        let inbox_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
-        )
-        .bind("123")
-        .bind("INBOX")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(inbox_count, 0);
+        let visible_query =
+            format!("SELECT folder FROM local_mail_cache WHERE {VISIBLE_CACHED_MAIL} ORDER BY folder");
+        let pending: Vec<String> = sqlx::query_scalar(&visible_query)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, ["Trash"]);
 
-        let trash_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM local_mail_cache WHERE uid = ? AND folder = ?",
-        )
-        .bind("123")
-        .bind("Trash")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(trash_count, 1);
+        sqlx::query("UPDATE offline_sync_queue SET status = 'failed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failed: Vec<String> = sqlx::query_scalar(&visible_query)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed, ["INBOX", "Trash"]);
+
+        let mut tx = pool.begin().await.unwrap();
+        remove_moved_source(&mut tx, "123", "INBOX").await.unwrap();
+        sqlx::query("UPDATE offline_sync_queue SET status = 'done'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let remaining: Vec<String> = sqlx::query_scalar("SELECT folder FROM local_mail_cache")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, ["Trash"]);
     }
 
     #[test]

@@ -15,6 +15,8 @@ export function OfflineSyncProvider({ children }) {
   const [lastSyncAt, setLastSyncAt] = useState(null)
   const [lastError, setLastError] = useState(null)
   const [transfer, setTransfer] = useState(null)
+  const activeAccountIdRef = useRef(activeAccountId)
+  const statusRequestIdRef = useRef(0)
   const lastFlushAtRef = useRef(0)
   const pollInFlightRef = useRef(false)
   const lastSyncAttemptAtRef = useRef(0)
@@ -33,20 +35,26 @@ export function OfflineSyncProvider({ children }) {
   useEffect(() => {
     const onSessionChanged = (event) => {
       const next = event?.detail?.accountId
-      setActiveAccountId(next ? next.toString() : null)
+      activeAccountIdRef.current = next ? next.toString() : null
+      statusRequestIdRef.current += 1
+      lastFlushAtRef.current = 0
+      lastSyncAttemptAtRef.current = 0
+      setActiveAccountId(activeAccountIdRef.current)
     }
     window.addEventListener('guvercin-account-session-changed', onSessionChanged)
     return () => window.removeEventListener('guvercin-account-session-changed', onSessionChanged)
   }, [])
 
   const refreshStatus = useCallback(async (accountId) => {
-    if (!accountId) return
+    if (!accountId || (activeAccountIdRef.current && String(accountId) !== activeAccountIdRef.current)) return null
+    const requestId = ++statusRequestIdRef.current
     try {
       const response = await fetch(apiUrl(`/api/offline/${accountId}/status`), { cache: 'no-store' })
       if (!response.ok) {
         throw new Error('Status endpoint failed')
       }
       const data = await response.json()
+      if (requestId !== statusRequestIdRef.current) return null
       
       setBackendReachable(prev => prev === !!data.backend_reachable ? prev : !!data.backend_reachable)
       setImapReachable(prev => prev === !!data.imap_reachable ? prev : !!data.imap_reachable)
@@ -65,6 +73,7 @@ export function OfflineSyncProvider({ children }) {
 
       return data
     } catch (err) {
+      if (requestId !== statusRequestIdRef.current) return null
       setBackendReachable(false)
       setImapReachable(false)
       setSmtpReachable(false)
@@ -79,7 +88,7 @@ export function OfflineSyncProvider({ children }) {
     if (!accountId) return false
     try {
       const res = await fetch(apiUrl(`/api/offline/${accountId}/sync-now`), { method: 'POST' })
-      return res.ok
+      return res.ok && (await res.json())?.status === 'ok'
     } catch {
       return false
     }
@@ -89,7 +98,7 @@ export function OfflineSyncProvider({ children }) {
     if (!accountId) return
     try {
       const ok = await runSyncNow(accountId)
-      if (ok) {
+      if (ok && String(accountId) === activeAccountIdRef.current) {
         lastFlushAtRef.current = Date.now()
       }
       await refreshStatus(accountId)
@@ -124,6 +133,7 @@ export function OfflineSyncProvider({ children }) {
       pollInFlightRef.current = true
       try {
         const data = await refreshStatus(accountId)
+        if (accountId !== activeAccountIdRef.current) return
         const depth = Number(data?.queue_depth || 0)
         const lastFlushAt = lastFlushAtRef.current
         const isStale = lastFlushAt > 0 && Date.now() - lastFlushAt > STALE_FLUSH_MS
@@ -141,7 +151,7 @@ export function OfflineSyncProvider({ children }) {
         if (shouldFlush) {
           lastSyncAttemptAtRef.current = Date.now()
           const ok = await runSyncNow(accountId)
-          if (ok) lastFlushAtRef.current = Date.now()
+          if (ok && accountId === activeAccountIdRef.current) lastFlushAtRef.current = Date.now()
           await refreshStatus(accountId)
         }
       } finally {

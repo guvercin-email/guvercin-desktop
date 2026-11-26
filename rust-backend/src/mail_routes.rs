@@ -15,7 +15,8 @@ use mailparse::MailHeaderMap;
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 
 use crate::{
     imap_session::{self, ImapState},
@@ -28,6 +29,7 @@ use crate::{
 pub struct MailAppState {
     pub _db: Arc<crate::db::AppState>,
     pub imap: Arc<ImapState>,
+    pub sync_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
 #[derive(Debug, Deserialize)]
