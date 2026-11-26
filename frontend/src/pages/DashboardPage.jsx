@@ -1345,9 +1345,6 @@ const DashboardPage = () => {
     const [appMenuVisible, setAppMenuVisible] = useState(true)
     const [isSyncing, setIsSyncing] = useState(false)
     const [actionNotices, setActionNotices] = useState([])
-    // NOTE: this never ticks — the notice countdown at the action-notice
-    // renderer is therefore frozen at mount time.
-    const [noticeNow] = useState(Date.now())
 
     const accountIdRef = useRef(accountId)
     const selectedFolderRef = useRef(selectedFolder)
@@ -1356,6 +1353,7 @@ const DashboardPage = () => {
     const remoteMailAvailableRef = useRef(false)
     const mailsRef = useRef(mails)
     const mailLoadRequestIdRef = useRef(0)
+    const searchRequestRef = useRef(null)
 
     useEffect(() => {
         accountIdRef.current = accountId
@@ -2199,6 +2197,10 @@ const DashboardPage = () => {
 
 
     const exitSearchMode = useCallback(() => {
+        searchRequestRef.current?.abort()
+        searchRequestRef.current = null
+        listModeRef.current = 'mailbox'
+        setLoadingMails(false)
         setListMode('mailbox')
         setActiveSearch(null)
         setSearchText('')
@@ -2208,6 +2210,11 @@ const DashboardPage = () => {
         setCurrentPage(1)
         lastMailboxBeforeSearchRef.current = null
     }, [])
+
+    useEffect(() => {
+        exitSearchMode()
+        return () => searchRequestRef.current?.abort()
+    }, [accountId, exitSearchMode])
 
     const clearAdvancedSearch = useCallback(() => {
         const backFolder = lastMailboxBeforeSearchRef.current || selectedFolder || 'INBOX'
@@ -2231,13 +2238,22 @@ const DashboardPage = () => {
         const criteria = { ...advancedSearchDraft, ...(draftOverride || {}) }
         const payload = buildAdvancedSearchPayload(criteria)
 
-        if (listMode !== 'search') {
+        if (listModeRef.current !== 'search') {
             lastMailboxBeforeSearchRef.current = selectedFolder || 'INBOX'
         }
+
+        searchRequestRef.current?.abort()
+        const controller = new AbortController()
+        searchRequestRef.current = controller
+        const { signal } = controller
+        mailLoadRequestIdRef.current += 1
+        listModeRef.current = 'search'
 
         setActiveSection('mail')
         setCurrentPage(1)
         setListMode('search')
+        setActiveSearch(null)
+        setIsAdvancedSearchOpen(false)
         setSelectedMail(null)
         setMailContent(null)
         setMails([])
@@ -2256,26 +2272,23 @@ const DashboardPage = () => {
                 }
             }
 
-            setActiveSearch({ criteria, totalCount: null, source, startedAt })
+            if (signal.aborted) return
 
             const res = await fetch(apiUrl(endpoint), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
                 cache: 'no-store',
+                signal,
             })
 
             if (!res.ok) {
                 const errBody = await res.json().catch(() => null)
-                const msg = errBody?.error || errBody?.message || 'Search failed.'
-                console.error('Advanced search error:', msg)
-                window.alert(msg)
-                setActiveSearch({ criteria, totalCount: 0, source, startedAt })
-                setMails([])
-                return
+                throw new Error(errBody?.error || errBody?.message || 'Search failed.')
             }
 
-            const data = await res.json().catch(() => ({}))
+            const data = await res.json()
+            if (signal.aborted) return
             const items = Array.isArray(data?.mails) ? data.mails : []
             const normalized = items
                 .map((mail) => (
@@ -2292,14 +2305,15 @@ const DashboardPage = () => {
                 source,
                 startedAt,
             })
-            setIsAdvancedSearchOpen(false)
         } catch (error) {
+            if (signal.aborted) return
             console.error('Advanced search failed:', error)
-            window.alert('Search failed.')
-            setActiveSearch({ criteria, totalCount: 0, source, startedAt })
-            setMails([])
+            setActiveSearch({ criteria, source, startedAt, failed: true })
         } finally {
-            setLoadingMails(false)
+            if (searchRequestRef.current === controller && !signal.aborted) {
+                searchRequestRef.current = null
+                setLoadingMails(false)
+            }
         }
     }, [
         accountId,
@@ -2307,7 +2321,6 @@ const DashboardPage = () => {
         backendReachable,
         canUseRemoteMail,
         ensureImapConnected,
-        listMode,
         networkOnline,
         selectedFolder,
     ])
@@ -2412,10 +2425,9 @@ const DashboardPage = () => {
     const enqueueUndoableAction = useCallback(({ label, apply, undo, commit, variant = 'default', commitLabel = 'Apply now', undoLabel = 'Undo', durationMs = 10_000 }) => {
         nextNoticeIdRef.current += 1
         const id = nextNoticeIdRef.current
-        const expiresAt = Date.now() + durationMs
 
         apply()
-        setActionNotices((prev) => [...prev, { id, label, durationMs, expiresAt, variant, commitLabel, undoLabel }])
+        setActionNotices((prev) => [...prev, { id, label, durationMs, variant, commitLabel, undoLabel }])
 
         const timeoutId = window.setTimeout(async () => {
             const pending = pendingNoticeActionsRef.current.get(id)
@@ -3263,40 +3275,36 @@ const DashboardPage = () => {
             {dashboardContent}
             {actionNotices.length > 0 && (
                 <div className="db-action-notices" aria-live="polite">
-                    {actionNotices.map((notice) => {
-                        const remaining = Math.max(0, notice.expiresAt - noticeNow)
-                        const progress = notice.durationMs > 0 ? (remaining / notice.durationMs) * 100 : 0
-                        return (
-                            <div key={notice.id} className={`db-action-notice ${notice.variant === 'warning' ? 'db-action-notice--warning' : ''}`}>
-                                <div className="db-action-notice__body">
-                                    <span className="db-action-notice__text">{notice.label}</span>
-                                    <div className="db-action-notice__actions">
-                                        <button
-                                            type="button"
-                                            className="db-action-notice__icon-btn db-action-notice__icon-btn--confirm"
-                                            onClick={() => commitActionNotice(notice.id)}
-                                            aria-label={notice.commitLabel || 'Apply now'}
-                                            title={notice.commitLabel || 'Apply now'}
-                                        >
-                                            ✓
-                                        </button>
-                                        <button
-                                            type="button"
-                                            className="db-action-notice__icon-btn db-action-notice__icon-btn--cancel"
-                                            onClick={() => undoActionNotice(notice.id)}
-                                            aria-label={notice.undoLabel || 'Cancel'}
-                                            title={notice.undoLabel || 'Cancel'}
-                                        >
-                                            <img src="/img/icons/close.svg" className="svg-icon-inline" />
-                                        </button>
-                                    </div>
-                                </div>
-                                <div className="db-action-notice__progress">
-                                    <span className="db-action-notice__progress-bar" style={{ width: `${progress}%` }} />
+                    {actionNotices.map((notice) => (
+                        <div key={notice.id} className={`db-action-notice ${notice.variant === 'warning' ? 'db-action-notice--warning' : ''}`}>
+                            <div className="db-action-notice__body">
+                                <span className="db-action-notice__text">{notice.label}</span>
+                                <div className="db-action-notice__actions">
+                                    <button
+                                        type="button"
+                                        className="db-action-notice__icon-btn db-action-notice__icon-btn--confirm"
+                                        onClick={() => commitActionNotice(notice.id)}
+                                        aria-label={notice.commitLabel || 'Apply now'}
+                                        title={notice.commitLabel || 'Apply now'}
+                                    >
+                                        ✓
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="db-action-notice__icon-btn db-action-notice__icon-btn--cancel"
+                                        onClick={() => undoActionNotice(notice.id)}
+                                        aria-label={notice.undoLabel || 'Cancel'}
+                                        title={notice.undoLabel || 'Cancel'}
+                                    >
+                                        <img src="/img/icons/close.svg" className="svg-icon-inline" />
+                                    </button>
                                 </div>
                             </div>
-                        )
-                    })}
+                            <div className="db-action-notice__progress">
+                                <span className="db-action-notice__progress-bar" style={{ animationDuration: `${notice.durationMs}ms` }} />
+                            </div>
+                        </div>
+                    ))}
                 </div>
             )}
             {isAdvancedSearchOpen && (
@@ -7711,17 +7719,19 @@ function MailSection({
                                 </div>
                                 {listMode === 'search' && (
                                     <div className="db-search-results-banner">
-                                        <div className="db-search-results-banner__text">
-                                            {t('Search results found', {
-                                                count: typeof activeSearch?.totalCount === 'number' ? activeSearch.totalCount : mails.length,
-                                            })}
+                                        <div className="db-search-results-banner__text" role="status">
+                                            {loadingMails
+                                                ? t('Searching…')
+                                                : activeSearch?.failed
+                                                    ? t('Search failed.')
+                                                    : t('Search results found', { count: activeSearch?.totalCount ?? mails.length })}
                                         </div>
                                         <button
                                             type="button"
                                             className="db-search-results-banner__clear"
                                             onClick={onClearSearch}
                                         >
-                                            {t('Clear search')}
+                                            {loadingMails ? t('Cancel search') : t('Clear search')}
                                         </button>
                                     </div>
                                 )}
@@ -7742,7 +7752,7 @@ function MailSection({
                                     <div className="db-empty-state">
                                         <div className="db-empty-icon">{listMode === 'search' ? <img src="/img/icons/search.svg" style={{ width: '240px', height: 'auto' }} /> : <img src="/img/icons/inbox.svg" style={{ width: '240px', height: 'auto' }} />}</div>
                                         <div className="db-empty-text">
-                                            {listMode === 'search' ? t('No results found.') : 'This folder is empty'}
+                                            {listMode === 'search' ? (activeSearch?.failed ? null : t('No results found.')) : 'This folder is empty'}
                                         </div>
                                     </div>
                                 ) : visibleMails.length === 0 ? (

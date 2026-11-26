@@ -113,7 +113,12 @@
   display: block;
   height: 100%;
   background: var(--c-primary);
-  transition: width 0.1s linear;
+  transform-origin: left;
+  animation: db-action-notice-countdown linear forwards;
+}
+
+@keyframes db-action-notice-countdown {
+  to { transform: scaleX(0); }
 }
 
 .db-action-notice--warning {
