@@ -1,3 +1,4 @@
+import { apiUrl } from './api.js'
 import { invoke } from '@tauri-apps/api/core'
 
 const WEB_FALLBACK_KEY = 'guv_link_click_behavior'
@@ -115,7 +116,7 @@ function isRemoteUrl(value) {
 function blockRemoteAssets(doc) {
   let blocked = 0
 
-  doc.querySelectorAll('img[src], input[type="image"][src]').forEach((el) => {
+  doc.querySelectorAll('img[src]:not([data-guv-cached])').forEach((el) => {
     const src = el.getAttribute('src')
     if (!isRemoteUrl(src)) return
     el.setAttribute('data-blocked-src', src)
@@ -148,13 +149,9 @@ function blockRemoteAssets(doc) {
  * Add the "remote images were not loaded / load images" bar to a document
  * whose assets were withheld.
  *
- * The button is wired by a script we inject ourselves, after every script the
- * message brought with it has already been removed. Doing it this way means
- * the control works in every reading surface (pane, tab, detached window)
- * without each one having to wire up a handler, and restoring an image costs
- * nothing extra — the URL is already parked on the element.
+ * The parent frame handles the button click.
  */
-function appendRemoteImageBar(doc, labels) {
+function appendRemoteImageBar(doc, labels, accountId) {
   const body = doc.body
   if (!body) return
 
@@ -164,6 +161,7 @@ function appendRemoteImageBar(doc, labels) {
   text.textContent = labels.blocked
   const button = doc.createElement('button')
   button.type = 'button'
+  if (accountId) button.dataset.accountId = String(accountId)
   button.textContent = labels.load
   bar.appendChild(text)
   bar.appendChild(button)
@@ -179,38 +177,21 @@ function appendRemoteImageBar(doc, labels) {
     'color:inherit !important;font:inherit;font-size:inherit}'
   doc.head.appendChild(style)
 
-  const script = doc.createElement('script')
-  script.textContent =
-    `(function(){var b=document.getElementById(${JSON.stringify(REMOTE_BAR_ID)});` +
-    'if(!b)return;var t=b.querySelector("button");if(!t)return;' +
-    't.addEventListener("click",function(){' +
-    'document.querySelectorAll("[data-blocked-src]").forEach(function(el){' +
-    'el.setAttribute("src",el.getAttribute("data-blocked-src"));' +
-    'el.removeAttribute("data-blocked-src")});' +
-    'document.querySelectorAll("[data-blocked-style]").forEach(function(el){' +
-    'el.setAttribute("style",el.getAttribute("data-blocked-style"));' +
-    'el.removeAttribute("data-blocked-style")});' +
-    `document.body.removeAttribute(${JSON.stringify(BLOCKED_REMOTE_ATTR)});` +
-    'b.remove();' +
-    'window.dispatchEvent(new Event("guvercin-remote-images-loaded"))})})()'
-  body.appendChild(script)
+
 }
 
 /**
  * Put back what blockRemoteAssets() withheld, in a live document. Used by the
  * "load images" control so the message does not have to be re-fetched.
  */
-export function allowRemoteAssets(doc) {
+export function allowRemoteAssets(doc, accountId) {
   if (!doc) return 0
   let restored = 0
   doc.querySelectorAll('[data-blocked-src]').forEach((el) => {
-    el.setAttribute('src', el.getAttribute('data-blocked-src'))
+    const url = normalizeExternalUrl(el.getAttribute('data-blocked-src'))
+    if (!accountId || !url || !/^https?:/i.test(url)) return
+    el.setAttribute('src', apiUrl(`/api/mail/${accountId}/proxy-image?url=${encodeURIComponent(url)}`))
     el.removeAttribute('data-blocked-src')
-    restored += 1
-  })
-  doc.querySelectorAll('[data-blocked-style]').forEach((el) => {
-    el.setAttribute('style', el.getAttribute('data-blocked-style'))
-    el.removeAttribute('data-blocked-style')
     restored += 1
   })
   doc.getElementById?.(REMOTE_BAR_ID)?.remove()
@@ -292,21 +273,14 @@ export function sanitizeMailHtml(html, options = {}) {
     // Scripts, iframes, objects, embeds, applets, and forms can all
     // execute code or trick the user into submitting data.
     doc.querySelectorAll(
-      'script, iframe, object, embed, applet, form, link[rel="import"]'
+      'script, iframe, frame, frameset, object, embed, applet, form, link, svg, math, audio, video, source, template, base, meta[http-equiv]'
     ).forEach((el) => el.remove())
 
-    // Remove <base> elements — they can redirect relative link resolution
-    doc.querySelectorAll('base').forEach((el) => el.remove())
-
-    // Remove CSP meta tags from the email — they serve no purpose in our
-    // sandboxed iframe and can trigger browser warnings (e.g. manifest-src)
-    doc.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach((el) => el.remove())
-    doc.querySelectorAll('meta[http-equiv="content-security-policy"]').forEach((el) => el.remove())
-
-    // ── Strip inline event handlers & javascript: URLs ─────────────
-    // This prevents any script execution from email HTML, even with
-    // allow-scripts in the sandbox (needed for parent event listeners).
     doc.querySelectorAll('*').forEach((el) => {
+      for (const attribute of ['data-blocked-src', 'data-blocked-style', 'data-guv-cached', BLOCKED_REMOTE_ATTR]) {
+        el.removeAttribute(attribute)
+      }
+      if (el.id === REMOTE_BAR_ID) el.removeAttribute('id')
       // Remove all on* attributes (onclick, onload, onerror, etc.)
       const attrsToRemove = []
       for (const attr of el.attributes) {
@@ -371,6 +345,8 @@ export function sanitizeMailHtml(html, options = {}) {
         linkEl.getAttribute('data-link'),
       ]
       const normalized = candidates.map((c) => normalizeExternalUrl(c)).find(Boolean) || null
+      linkEl.removeAttribute('ping')
+      linkEl.removeAttribute('href')
       if (normalized) {
         // Store original URL and neutralize the link
         linkEl.setAttribute('data-external-href', normalized)
@@ -405,6 +381,24 @@ export function sanitizeMailHtml(html, options = {}) {
       } catch {
         // ignore any DOM quirks
       }
+      const src = img.getAttribute('src') || ''
+      const cachedPath = src.replace(/^http:\/\/127\.0\.0\.1:5000(?=\/api\/offline\/)/, '')
+      const attachment = /^\/api\/(?:offline|mail)\/(\d+)\/(?:local-content|content)\/\d+\/attachments\/\d+\?/.exec(cachedPath)
+      const inlineAsset = /^\/api\/offline\/(\d+)\/inline-assets\/[\w-]+(?:\?|$)/.exec(cachedPath)
+      const assetAccount = (attachment || inlineAsset)?.[1]
+      const cachedAsset = assetAccount && (!options.accountId || String(options.accountId) === assetAccount)
+      if (cachedAsset) {
+        img.setAttribute('src', apiUrl(cachedPath))
+        img.setAttribute('data-guv-cached', '')
+      } else if (!/^(?:https?:\/\/|\/\/|cid:|data:image\/(?:png|jpeg|gif|webp|avif);base64,)/i.test(src)) {
+        img.removeAttribute('src')
+      }
+      if (!cachedAsset && remoteImages === 'auto' && isRemoteUrl(src)) {
+        const url = normalizeExternalUrl(src)
+        if (options.accountId && url) {
+          img.setAttribute('src', apiUrl(`/api/mail/${options.accountId}/proxy-image?url=${encodeURIComponent(url)}`))
+        }
+      }
       img.removeAttribute('loading')
       // Some emails use srcset which can cause similar issues in WebKit/WebView2
       // if the source resolutions fail or are blocked. We'll strip it to ensure
@@ -432,7 +426,16 @@ export function sanitizeMailHtml(html, options = {}) {
       'html,body{color-scheme:normal !important;background:transparent !important}' +
       `html,body,body *{background-color:transparent !important;background-image:none !important;color:${textColor} !important}` +
       'a,a *{color:inherit !important;text-decoration:underline}'
-    head.appendChild(baseStyle)
+    if (!options.forPrint) head.appendChild(baseStyle)
+    const policy = doc.createElement('meta')
+    policy.httpEquiv = 'Content-Security-Policy'
+    const images = new URL(apiUrl('/')).origin
+    policy.content = `default-src 'none'; style-src 'unsafe-inline'; img-src data: blob: ${images}; base-uri 'none'; form-action 'none'`
+    head.prepend(policy)
+    const referrer = doc.createElement('meta')
+    referrer.name = 'referrer'
+    referrer.content = 'no-referrer'
+    head.prepend(referrer)
 
     // ── Withhold remote assets ─────────────────────────────────────
     // Last, so it also catches the src values moved out of srcset above.
@@ -442,7 +445,7 @@ export function sanitizeMailHtml(html, options = {}) {
         doc.body.setAttribute(BLOCKED_REMOTE_ATTR, String(blocked))
         // 'block' is "never load"; only 'prompt' offers the way back.
         if (remoteImages === 'prompt') {
-          appendRemoteImageBar(doc, { ...DEFAULT_REMOTE_LABELS, ...(options.labels || {}) })
+          appendRemoteImageBar(doc, { ...DEFAULT_REMOTE_LABELS, ...(options.labels || {}) }, options.accountId)
         }
       }
     }
@@ -451,8 +454,7 @@ export function sanitizeMailHtml(html, options = {}) {
     // so styles/meta are preserved
     return doc.documentElement.outerHTML
   } catch {
-    // If parsing fails, return original HTML as-is (better than nothing)
-    return html
+    return ''
   }
 }
 
@@ -618,6 +620,13 @@ export function installIframeLinkInterceptor(iframe, onUrl) {
     attachedDoc = doc
     handler = (event) => {
       try {
+        const remoteButton = doc.getElementById(REMOTE_BAR_ID)?.querySelector('button')
+        if (remoteButton && event.target === remoteButton) {
+          if (event.type === 'click' && event.isTrusted) {
+            allowRemoteAssets(doc, remoteButton.dataset.accountId)
+          }
+          return
+        }
         const anchor = findAnchorFromEvent(event)
         if (!anchor) return
 
@@ -653,8 +662,6 @@ export function installIframeLinkInterceptor(iframe, onUrl) {
 
     doc.addEventListener('click', handler, true)
     doc.addEventListener('auxclick', handler, true)
-    doc.addEventListener('mousedown', handler, true)
-    doc.addEventListener('pointerdown', handler, true)
     doc.addEventListener('keydown', keyHandler, true)
   }
 
@@ -666,8 +673,6 @@ export function installIframeLinkInterceptor(iframe, onUrl) {
       if (attachedDoc && handler) {
         attachedDoc.removeEventListener('click', handler, true)
         attachedDoc.removeEventListener('auxclick', handler, true)
-        attachedDoc.removeEventListener('mousedown', handler, true)
-        attachedDoc.removeEventListener('pointerdown', handler, true)
       }
       if (attachedDoc && keyHandler) {
         attachedDoc.removeEventListener('keydown', keyHandler, true)

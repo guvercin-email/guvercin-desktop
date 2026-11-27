@@ -1,9 +1,13 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use lettre::{
     message::{header, header::ContentType, Attachment, MultiPart, SinglePart},
-    transport::smtp::authentication::{Credentials, Mechanism},
-    transport::smtp::client::{Tls, TlsParameters},
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    transport::smtp::authentication::{Credentials, Mechanism, DEFAULT_MECHANISMS},
+    transport::smtp::{
+        client::{AsyncSmtpConnection, TlsParameters},
+        commands::{Data, Mail, Rcpt},
+        extension::{ClientId, Extension, MailBodyParameter, MailParameter},
+    },
+    Message,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -315,102 +319,90 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
 
     let email_message = build_message(msg)?;
 
-    let credentials = Credentials::new(email.to_string(), password.to_string());
-    let is_loopback = is_loopback_smtp_host(smtp_host);
-
-    // For OAuth2 (Gmail) force the XOAUTH2 SASL mechanism; the "password" is the
-    // access token. Applied via a small helper so every branch stays consistent.
-    let auth_mech: Option<Vec<Mechanism>> = if xoauth2 {
-        Some(vec![Mechanism::Xoauth2])
+    let tls = if matches!(upper_ssl_mode.as_str(), "SSL" | "STARTTLS") {
+        Some(if is_loopback_smtp_host(smtp_host) {
+            build_local_tls_parameters()?
+        } else {
+            TlsParameters::new(smtp_host.to_owned()).map_err(|error| error.to_string())?
+        })
     } else {
         None
     };
-    let apply_auth = |builder: lettre::transport::smtp::AsyncSmtpTransportBuilder| {
-        let builder = builder.credentials(credentials.clone());
-        match &auth_mech {
-            Some(mechs) => builder.authentication(mechs.clone()),
-            None => builder,
-        }
-    };
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> = match upper_ssl_mode.as_str() {
-        "SSL" => {
-            if is_loopback {
-                let tls = build_local_tls_parameters()?;
-                apply_auth(
-                    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_host)
-                        .port(smtp_port)
-                        .tls(Tls::Wrapper(tls)),
-                )
-                .build()
-            } else {
-                apply_auth(
-                    AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
-                        .map_err(|e| {
-                            format!("Failed to create SMTPS relay for {}: {}", smtp_host, e)
-                        })?
-                        .port(smtp_port),
-                )
-                .build()
-            }
-        }
-        "STARTTLS" => {
-            if is_loopback {
-                let tls = build_local_tls_parameters()?;
-                apply_auth(
-                    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_host)
-                        .port(smtp_port)
-                        .tls(Tls::Required(tls)),
-                )
-                .build()
-            } else {
-                apply_auth(
-                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-                        .map_err(|e| {
-                            format!("Failed to create STARTTLS relay for {}: {}", smtp_host, e)
-                        })?
-                        .port(smtp_port),
-                )
-                .build()
-            }
-        }
-        _ => apply_auth(
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_host).port(smtp_port),
-        )
-        .build(),
+    let timeout = std::time::Duration::from_secs(30);
+    let hello = ClientId::default();
+    let (implicit_tls, upgrade_tls) = if upper_ssl_mode == "SSL" {
+        (tls, None)
+    } else {
+        (None, tls)
     };
+    let mut connection = tokio::time::timeout(timeout, async {
+        let mut connection = AsyncSmtpConnection::connect_tokio1(
+            (smtp_host, smtp_port), Some(timeout), &hello, implicit_tls, None,
+        ).await?;
+        if let Some(tls) = upgrade_tls {
+            connection.starttls(tls, &hello).await?;
+        }
+        let credentials = Credentials::new(email.to_owned(), password.to_owned());
+        let mechanisms = if xoauth2 { &[Mechanism::Xoauth2] } else { DEFAULT_MECHANISMS };
+        connection.auth(mechanisms, &credentials).await?;
+        Ok::<_, lettre::transport::smtp::Error>(connection)
+    }).await
+        .map_err(|_| "SMTP connection or authentication timed out".to_string())?
+        .map_err(|error| format!("SMTP connection or authentication failed: {error}"))?;
 
-    match mailer.send(email_message).await {
-        Ok(_) => {
+    let formatted = email_message.formatted();
+    let envelope = email_message.envelope();
+    let mut mail_options = Vec::new();
+    if envelope.from().into_iter().chain(envelope.to()).any(|address| !AsRef::<str>::as_ref(address).is_ascii()) {
+        if !connection.server_info().supports_feature(Extension::SmtpUtfEight) {
+            return Err("SMTP server does not support SMTPUTF8".into());
+        }
+        mail_options.push(MailParameter::SmtpUtfEight);
+    }
+    if !formatted.is_ascii() {
+        if !connection.server_info().supports_feature(Extension::EightBitMime) {
+            return Err("SMTP server does not support 8BITMIME".into());
+        }
+        mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+
+    let data_ready = tokio::time::timeout(timeout, async {
+        connection.command(Mail::new(envelope.from().cloned(), mail_options)).await?;
+        for recipient in envelope.to() {
+            connection.command(Rcpt::new(recipient.clone(), Vec::new())).await?;
+        }
+        connection.command(Data).await
+    }).await
+        .map_err(|_| "SMTP envelope or DATA command timed out".to_string())?
+        .map_err(|error| format!("SMTP rejected the envelope or DATA command: {error}"))?;
+    if u16::from(data_ready.code()) != 354 {
+        return Err(format!("SMTP did not accept message data: {}", data_ready.code()).into());
+    }
+
+    match tokio::time::timeout(timeout, connection.message(&formatted)).await {
+        Ok(Ok(_)) => {
             info!("Email sent successfully");
             Ok(())
         }
-        Err(e) => {
-            error!(
-                "Could not send email via {}:{} ({}): {}",
-                smtp_host, smtp_port, ssl_mode, e
-            );
-            let mut cause = std::error::Error::source(&e);
-            let mut connection_refused = false;
-            while let Some(error) = cause {
-                if let Some(io) = error.downcast_ref::<std::io::Error>() {
-                    connection_refused = io.kind() == std::io::ErrorKind::ConnectionRefused;
-                    break;
-                }
-                cause = error.source();
-            }
-            let delivery_uncertain = e.status().is_none() && !connection_refused && !e.is_tls();
-            let message = if delivery_uncertain {
-                format!("SMTP delivery could not be confirmed: {e}")
-            } else {
-                format!("SMTP send failed: {e}")
-            };
+        Ok(Err(error)) => {
+            let delivery_uncertain = error.status().is_none() && !error.is_client();
+            error!("SMTP send failed: {error}");
             Err(SmtpSendError {
-                message,
+                message: if delivery_uncertain {
+                    format!("SMTP delivery could not be confirmed: {error}")
+                } else {
+                    format!("SMTP send failed: {error}")
+                },
                 delivery_uncertain,
             })
         }
+        Err(_) => Err(SmtpSendError {
+            message: "SMTP delivery could not be confirmed before the timeout".into(),
+            delivery_uncertain: true,
+        }),
     }
+
 }
 
 #[cfg(test)]
@@ -434,7 +426,7 @@ mod tests {
 
         for (outcome, expected_uncertainty, expected_messages) in [
             (SmtpOutcome::RejectAuthentication, false, 0),
-            (SmtpOutcome::DropBeforeData, true, 0),
+            (SmtpOutcome::DropBeforeData, false, 0),
             (SmtpOutcome::AfterData(Some("451 try again later\r\n")), false, 1),
             (SmtpOutcome::AfterData(Some("550 message rejected\r\n")), false, 1),
             (SmtpOutcome::AfterData(None), true, 1),

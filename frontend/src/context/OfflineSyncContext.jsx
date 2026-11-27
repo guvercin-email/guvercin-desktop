@@ -12,6 +12,8 @@ export function OfflineSyncProvider({ children }) {
   const [smtpReachable, setSmtpReachable] = useState(false)
   const [syncState, setSyncState] = useState('idle')
   const [queueDepth, setQueueDepth] = useState(0)
+  const [retryableFailures, setRetryableFailures] = useState(0)
+  const [stoppedActions, setStoppedActions] = useState(0)
   const [lastSyncAt, setLastSyncAt] = useState(null)
   const [lastError, setLastError] = useState(null)
   const [transfer, setTransfer] = useState(null)
@@ -39,6 +41,9 @@ export function OfflineSyncProvider({ children }) {
       statusRequestIdRef.current += 1
       lastFlushAtRef.current = 0
       lastSyncAttemptAtRef.current = 0
+      setRetryableFailures(0)
+      setStoppedActions(0)
+      setLastError(null)
       setActiveAccountId(activeAccountIdRef.current)
     }
     window.addEventListener('guvercin-account-session-changed', onSessionChanged)
@@ -60,6 +65,8 @@ export function OfflineSyncProvider({ children }) {
       setImapReachable(prev => prev === !!data.imap_reachable ? prev : !!data.imap_reachable)
       setSmtpReachable(prev => prev === !!data.smtp_reachable ? prev : !!data.smtp_reachable)
       setSyncState(prev => prev === (data.sync_state || 'idle') ? prev : (data.sync_state || 'idle'))
+      setRetryableFailures(Number(data.retryable_failures || 0))
+      setStoppedActions(Number(data.stopped_actions || 0))
       setQueueDepth(prev => prev === Number(data.queue_depth || 0) ? prev : Number(data.queue_depth || 0))
       setLastSyncAt(prev => prev === (data.last_sync_at || null) ? prev : (data.last_sync_at || null))
       setLastError(prev => prev === (data.last_error || null) ? prev : (data.last_error || null))
@@ -187,6 +194,8 @@ export function OfflineSyncProvider({ children }) {
       remoteMailAvailable,
       syncState,
       queueDepth,
+      retryableFailures,
+      stoppedActions,
       lastSyncAt,
       lastError,
       transfer,
@@ -201,6 +210,8 @@ export function OfflineSyncProvider({ children }) {
       remoteMailAvailable,
       syncState,
       queueDepth,
+      retryableFailures,
+      stoppedActions,
       lastSyncAt,
       lastError,
       transfer,

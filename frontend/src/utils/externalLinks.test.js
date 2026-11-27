@@ -110,3 +110,28 @@ test('scripts the message brings with it are still removed in prompt mode', () =
     assert.doesNotMatch(out, /steal\(\)/)
   })
 })
+
+
+test('mail documents have a restrictive policy and no active navigation markup', () => {
+  withDom(() => {
+    const input = '<meta http-equiv="refresh" content="0;url=https://example.test/">'
+      + '<base href="https://example.test/"><svg><animate attributeName="href"></animate></svg>'
+      + '<a href="data:text/html,content">Unsafe link</a><a href="https://example.test/">Safe link</a>'
+    const out = new DOMParser().parseFromString(sanitizeMailHtml(input), 'text/html')
+    assert.equal(out.querySelector('base, svg, meta[http-equiv="refresh"]'), null)
+    assert.equal(out.querySelector('a').hasAttribute('href'), false)
+    assert.equal(out.querySelectorAll('a')[1].dataset.externalHref, 'https://example.test/')
+    assert.match(out.querySelector('meta[http-equiv="Content-Security-Policy"]').content, /default-src 'none'/)
+  })
+})
+
+test('cached inline attachments work with relative and legacy backend URLs while remote images are blocked', () => {
+  withDom(() => {
+    const path = '/api/offline/1/local-content/42/attachments/0?mailbox=INBOX'
+    const html = `<img src="${path}"><img src="http://127.0.0.1:5000${path}">`
+    const out = new DOMParser().parseFromString(sanitizeMailHtml(html), 'text/html')
+    assert.equal(out.images[0].getAttribute('src'), out.images[1].getAttribute('src'))
+    assert.equal(new URL(out.images[0].src).pathname, path.split('?')[0])
+    assert.equal(out.querySelector('[data-blocked-src]'), null)
+  })
+})

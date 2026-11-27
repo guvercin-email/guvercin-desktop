@@ -15,6 +15,7 @@ import { getUIPreferences } from './uiPreferences.js'
 export function getMailSanitizeOptions(accountId, t) {
   const translate = typeof t === 'function' ? t : (key) => key
   return {
+    accountId,
     remoteImages: getUIPreferences(accountId).remoteImageMode,
     labels: {
       // Keys are the English strings, matching the rest of the catalogue.

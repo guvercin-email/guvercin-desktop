@@ -1,7 +1,7 @@
 import React, { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { apiUrl, getApiBaseUrl } from '../utils/api'
+import { apiUrl } from '../utils/api'
 import {
     normalizeMailboxResponse,
     indexInOrderIgnoreCase,
@@ -125,6 +125,24 @@ function resizeIframeToContent(iframe) {
     }
 }
 
+function MarkOpenThreadMessageRead({ mail, mailId, delaySeconds, markSeen }) {
+    const handled = useRef(false)
+    const seen = mail.seen === true
+    const uidValidity = mail.uid_validity
+
+    useEffect(() => {
+        if (seen) handled.current = true
+        if (handled.current || !mailId) return
+        const timer = window.setTimeout(() => {
+            handled.current = true
+            void markSeen([mailId], true, uidValidity)
+        }, delaySeconds * 1000)
+        return () => window.clearTimeout(timer)
+    }, [delaySeconds, mailId, markSeen, seen, uidValidity])
+
+    return null
+}
+
 function ResizableHtmlIframe({ html, title, onLinkClick, accountId }) {
     const { t } = useTranslation()
     const ref = useRef(null)
@@ -167,7 +185,7 @@ function ResizableHtmlIframe({ html, title, onLinkClick, accountId }) {
         }
     }, [html, onLinkClick, accountId, t])
 
-    return <iframe ref={ref} title={title} sandbox="allow-same-origin allow-scripts" />
+    return <iframe ref={ref} title={title} sandbox="allow-same-origin" />
 }
 
 const SubmenuBar = ({ children, submenuScrollRef, submenuMoreRef, submenuVisibleCount, setSubmenuVisibleCount }) => {
@@ -359,7 +377,7 @@ function folderInfo(name, role) {
     const clean = name
         .replace(/^Folders\//i, '')
         .replace(/^Labels\//i, '')
-        .replace(/^Labels\//i, '')
+        .replace(/^Etiketler\//i, '')
         .replace(/^\[Labels\]\//i, '')
     // Show only the leaf segment; the parent hierarchy (e.g. "[Gmail]/") is
     // already conveyed by the tree indentation, so repeating it is noise.
@@ -477,11 +495,11 @@ function getSortDirectionLabel(sortBy, direction) {
 }
 
 function isLabelMailbox(value) {
-    return /^(Labels|\[Labels\])(\/|$)/i.test((value || '').trim())
+    return /^(Labels|Etiketler|\[Labels\])(\/|$)/i.test((value || '').trim())
 }
 
 function isMailboxSectionRoot(value) {
-    return ['Folders', 'Labels'].includes((value || '').trim())
+    return ['Folders', 'Labels', 'Etiketler', '[Labels]'].includes((value || '').trim())
 }
 
 function isMoveTargetMailbox(value) {
@@ -511,12 +529,12 @@ function parseDraggedMailIds(dataTransfer) {
     }
 }
 
-const LABEL_NAMESPACE_ROOTS = ['Labels', '[Labels]']
+const LABEL_NAMESPACE_ROOTS = ['Labels', 'Etiketler', '[Labels]']
 
 function stripLabelMailboxNamespace(value) {
     return (value || '')
         .trim()
-        .replace(/^Labels\//i, '')
+        .replace(/^(Labels|Etiketler)\//i, '')
         .replace(/^\[Labels\]\//i, '')
 }
 
@@ -1051,6 +1069,7 @@ async function saveBlobWithPicker(blob, options) {
 function printMailHtml(html) {
     return new Promise((resolve, reject) => {
         const frame = document.createElement('iframe')
+        frame.setAttribute('sandbox', 'allow-same-origin allow-modals')
         frame.style.position = 'fixed'
         frame.style.right = '0'
         frame.style.bottom = '0'
@@ -1098,7 +1117,7 @@ function printMailHtml(html) {
         }
 
         document.body.appendChild(frame)
-        frame.srcdoc = html
+        frame.srcdoc = sanitizeMailHtml(html, { forPrint: true })
     })
 }
 
@@ -1118,6 +1137,7 @@ async function buildVisualPdfBytesFromHtml(html, { accountId } = {}) {
     frame.style.border = '0'
     frame.style.background = 'white'
     frame.setAttribute('aria-hidden', 'true')
+    frame.setAttribute('sandbox', 'allow-same-origin')
 
     const cleanup = () => {
         window.setTimeout(() => frame.remove(), 200)
@@ -1132,7 +1152,7 @@ async function buildVisualPdfBytesFromHtml(html, { accountId } = {}) {
     })
 
     document.body.appendChild(frame)
-    frame.srcdoc = html
+    frame.srcdoc = sanitizeMailHtml(html, { accountId, forPrint: true })
     await awaitLoad()
 
     const doc = frame.contentDocument
@@ -1141,23 +1161,12 @@ async function buildVisualPdfBytesFromHtml(html, { accountId } = {}) {
         throw new Error('HTML render failed.')
     }
 
-    if (accountId) {
-        const imgs = Array.from(doc.querySelectorAll('img'))
-        imgs.forEach((img) => {
-            const src = `${img.getAttribute('src') || ''}`.trim()
-            if (/^https?:\/\//i.test(src)) {
-                img.setAttribute('crossorigin', 'anonymous')
-                img.src = apiUrl(`/api/mail/${accountId}/proxy-image?url=${encodeURIComponent(src)}`)
-            }
-        })
-    }
-
     const images = Array.from(doc.images || [])
     const awaitImages = async () => {
         const start = Date.now()
         await Promise.all(images.map((img) => new Promise((resolve) => {
             if (!img) return resolve()
-            if (img.complete && img.naturalWidth > 0) return resolve()
+            if (img.complete || !img.hasAttribute('src')) return resolve()
             const done = () => {
                 img.removeEventListener('load', done)
                 img.removeEventListener('error', done)
@@ -1253,6 +1262,8 @@ const DashboardPage = () => {
         smtpReachable,
         remoteMailAvailable,
         queueDepth,
+        retryableFailures,
+        stoppedActions,
         syncState,
         lastSyncAt,
         lastError,
@@ -1270,7 +1281,9 @@ const DashboardPage = () => {
                     ? t('{{count}} messages are syncing.', { count: queueDepth || 1 })
                     : queueDepth > 0
                         ? t('{{count}} messages are waiting to sync.', { count: queueDepth })
-                        : t('Messages are up to date.')
+                        : stoppedActions > 0
+                            ? t('Some mail actions could not be synchronized.')
+                            : t('Messages are up to date.')
 
     const [activeSection, setActiveSection] = useState('mail')
     // Shared search box for the non-mail workspaces (Contacts / Calendar / Todo).
@@ -1344,6 +1357,7 @@ const DashboardPage = () => {
     const mailsRef = useRef(mails)
     const mailLoadRequestIdRef = useRef(0)
     const cacheListRequestIdRef = useRef(0)
+    const loadedMailboxRef = useRef(null)
     const searchNetworkOnlineRef = useRef(networkOnline)
     const searchRequestRef = useRef(null)
     const activeSearchRef = useRef(activeSearch)
@@ -1597,6 +1611,7 @@ const DashboardPage = () => {
 
     useEffect(() => {
         const onKeyDown = (event) => {
+            if (event.defaultPrevented || settingsPageOpen || isAdvancedSearchOpen || externalLinkPromptUrl) return
             const actionId = matchShortcut(event, globalShortcutComboMap)
             if (!actionId) return
             const action = globalShortcutActionsRef.current[actionId]
@@ -1606,7 +1621,7 @@ const DashboardPage = () => {
         }
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
-    }, [globalShortcutComboMap])
+    }, [globalShortcutComboMap, settingsPageOpen, isAdvancedSearchOpen, externalLinkPromptUrl])
 
     useEffect(() => {
         const syncToolbarStyle = () => {
@@ -1622,6 +1637,7 @@ const DashboardPage = () => {
             const res = await fetch(apiUrl(`/api/offline/${accountId}/mailbox-counts`), { cache: 'no-store' })
             if (!res.ok) return
             const data = await res.json()
+            if (accountIdRef.current !== accountId) return
             if (data.counts && typeof data.counts === 'object') {
                 setMailboxCounts(data.counts)
             }
@@ -1774,6 +1790,7 @@ const DashboardPage = () => {
             let localRes = await fetch(apiUrl(`/api/offline/${accountId}/local-mailboxes`), { cache: 'no-store' })
             if (localRes.ok) {
                 const data = await localRes.json()
+                if (accountIdRef.current !== accountId) return
                 const normalized = normalizeMailboxResponse(data)
                 setFolders(prev => (JSON.stringify(prev) === JSON.stringify(normalized.allMailboxes) ? prev : normalized.allMailboxes))
                 setLabels(prev => (JSON.stringify(prev) === JSON.stringify(normalized.labels) ? prev : normalized.labels))
@@ -1786,10 +1803,11 @@ const DashboardPage = () => {
             // Then try remote if online and backend is reachable
             if (networkOnline && backendReachable) {
                 const ok = remoteMailAvailable || (await ensureImapConnected())
-                if (ok) {
+                if (ok && accountIdRef.current === accountId) {
                     const remoteRes = await fetch(apiUrl(`/api/mail/${accountId}/mailboxes`), { cache: 'no-store' })
                     if (remoteRes.ok) {
                         const data = await remoteRes.json()
+                        if (accountIdRef.current !== accountId) return
                         const normalized = normalizeMailboxResponse(data)
                         setFolders(prev => (JSON.stringify(prev) === JSON.stringify(normalized.allMailboxes) ? prev : normalized.allMailboxes))
                         setLabels(prev => (JSON.stringify(prev) === JSON.stringify(normalized.labels) ? prev : normalized.labels))
@@ -1804,6 +1822,17 @@ const DashboardPage = () => {
             console.error('Error loading folders:', err)
         }
     }, [accountId, backendReachable, remoteMailAvailable, ensureImapConnected, networkOnline, fetchMailboxCounts])
+
+    const retryOfflineActions = async () => {
+        try {
+            const response = await fetch(apiUrl(`/api/offline/${accountId}/retry-actions`), { method: 'POST' })
+            if (!response.ok) throw new Error(t('Could not retry mail actions.'))
+            if (accountIdRef.current !== accountId) return
+            await flushQueue(accountId)
+        } catch (error) {
+            window.alert(error.message)
+        }
+    }
 
     const handleReconnectImap = useCallback(async () => {
         if (!accountId || !backendReachable || !networkOnline || connecting) return
@@ -1823,16 +1852,27 @@ const DashboardPage = () => {
         try {
             const pageSize = 250
             const allMails = []
+            const loaded = loadedMailboxRef.current
+            const revisionQuery = loaded?.accountId === accountId && loaded.mailbox === mailbox
+                ? `&revision=${loaded.revision}`
+                : ''
+            let revision
             let nextPage = 1
 
             while (true) {
                 const res = await fetch(
-                    apiUrl(`/api/offline/${accountId}/local-list?mailbox=${encodeURIComponent(mailbox)}&page=${nextPage}&per_page=${pageSize}`),
+                    apiUrl(`/api/offline/${accountId}/local-list?mailbox=${encodeURIComponent(mailbox)}&page=${nextPage}&per_page=${pageSize}${nextPage === 1 ? revisionQuery : ''}`),
                     { cache: 'no-store' },
                 )
-                if (!res.ok || requestId !== cacheListRequestIdRef.current) return 0
+                if (requestId !== cacheListRequestIdRef.current) return 0
+                if (res.status === 304) return loaded?.count || 0
+                if (!res.ok) return 0
 
                 const data = await res.json()
+                if (nextPage === 1) revision = data.revision
+                // A concurrent update can shift page boundaries. The next
+                // poll retries from page 1 if this snapshot was invalidated.
+                else if (revision !== data.revision) return loaded?.count || 0
                 const chunk = Array.isArray(data.mails) ? data.mails : []
                 const chunkWithMailbox = chunk.map(m => ({ ...m, mailbox }))
                 allMails.push(...chunkWithMailbox)
@@ -1851,6 +1891,7 @@ const DashboardPage = () => {
                 && currentSelectedFolder
                 && mailboxIdentity(currentSelectedFolder) === mailboxIdentity(mailbox)
             ) {
+                loadedMailboxRef.current = { accountId, mailbox, revision, count: allMails.length }
                 setMails(allMails)
             }
 
@@ -1966,8 +2007,7 @@ const DashboardPage = () => {
         }
     }, [transfer, activeSection, accountId, listMode, loadMailsFromCache, selectedFolder, fetchMailboxCounts])
 
-    // While a background sync is actively downloading, poll cache every 3 s so newly
-    // synced emails appear in the list without waiting for the full sync to finish.
+    // Check the mailbox revision while a background sync is downloading.
     useEffect(() => {
         if (!accountId || activeSection !== 'mail' || listMode === 'search') return
         if (!transfer || !selectedFolder) return
@@ -2019,13 +2059,12 @@ const DashboardPage = () => {
             if (cancelled) return
             if (autoRefreshInFlightRef.current) return
             autoRefreshInFlightRef.current = true
-	            try {
-	                await loadMails({ allowCache: true, forceRemote: false, background: true, skipRemoteSync: true })
-	                if (cancelled) return
-	                void fetchMailboxCounts()
-	            } finally {
-	                autoRefreshInFlightRef.current = false
-	            }
+            try {
+                await loadMailsFromCache(selectedFolder)
+                if (!cancelled) await fetchMailboxCounts()
+            } finally {
+                autoRefreshInFlightRef.current = false
+            }
         }
 
         const timer = window.setInterval(tick, MAIL_AUTO_REFRESH_INTERVAL_MS)
@@ -2039,7 +2078,7 @@ const DashboardPage = () => {
         backendReachable,
         fetchMailboxCounts,
         listMode,
-        loadMails,
+        loadMailsFromCache,
         selectedFolder,
     ])
 
@@ -2151,6 +2190,7 @@ const DashboardPage = () => {
         setListMode('mailbox')
         setActiveSearch(null)
         setSearchText('')
+        loadedMailboxRef.current = null
         setMails([])
         setSelectedMail(null)
         setMailContent(null)
@@ -2286,13 +2326,18 @@ const DashboardPage = () => {
 
             if (signal.aborted) return
 
-            const res = await fetch(apiUrl(endpoint), {
+            const search = (path) => fetch(apiUrl(path), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
                 cache: 'no-store',
                 signal,
             })
+            let res = await search(endpoint)
+            if (!res.ok && source === 'remote' && !signal.aborted) {
+                source = 'offline'
+                res = await search(`/api/offline/${accountId}/search-advanced`)
+            }
 
             if (!res.ok) {
                 const errBody = await res.json().catch(() => null)
@@ -2362,17 +2407,7 @@ const DashboardPage = () => {
                 )
                 if (!res.ok) return null
                 const data = await res.json().catch(() => null)
-                let html = data?.html_body || null
-                if (html) {
-                    try {
-                        const base = getApiBaseUrl() || apiUrl('/')
-                        // Replace hardcoded backend base returned by server (dev default)
-                        html = html.replace(/http:\/\/127\.0\.0\.1:5000/g, base)
-                    } catch {
-                        // ignore replacement errors
-                    }
-                }
-                return html
+                return data?.html_body || null
             } catch {
                 return null
             }
@@ -2727,13 +2762,18 @@ const DashboardPage = () => {
 
     useEffect(() => {
         const handleKeyDown = (e) => {
-            if (e.key === 'Escape' && isMailFullscreen) {
+            if (e.key !== 'Escape' || e.defaultPrevented || settingsPageOpen || externalLinkPromptUrl) return
+            if (isAdvancedSearchOpen) {
+                e.preventDefault()
+                setIsAdvancedSearchOpen(false)
+            } else if (isMailFullscreen) {
+                e.preventDefault()
                 setIsMailFullscreen(false)
             }
         }
         window.addEventListener('keydown', handleKeyDown)
         return () => window.removeEventListener('keydown', handleKeyDown)
-    }, [isMailFullscreen])
+    }, [isMailFullscreen, settingsPageOpen, isAdvancedSearchOpen, externalLinkPromptUrl])
 
     const getShortTime = (dateValue) => {
         if (!dateValue) return ''
@@ -2992,6 +3032,19 @@ const DashboardPage = () => {
                                 {lastSyncAt && <div className="db-sync-popover__row">Last sync: {lastSyncAt}</div>}
                                 {formatTransfer(transfer?.receiving) && <div className="db-sync-popover__row">{formatTransfer(transfer.receiving)}</div>}
                                 {formatTransfer(transfer?.sending) && <div className="db-sync-popover__row">{formatTransfer(transfer.sending)}</div>}
+                                {stoppedActions > 0 && (
+                                    <div className="db-sync-popover__row">{t('Failed mail actions')}: {stoppedActions}</div>
+                                )}
+                                {retryableFailures > 0 && (
+                                    <button
+                                        type="button"
+                                        className="db-sync-popover__action"
+                                        onClick={retryOfflineActions}
+                                        disabled={!networkOnline || !backendReachable}
+                                    >
+                                        {t('Retry mail actions')}
+                                    </button>
+                                )}
                                 {lastError && <div className="db-sync-popover__error">Error: {lastError}</div>}
                             </div>
                         </div>
@@ -3192,6 +3245,7 @@ const DashboardPage = () => {
                                 injectedAppsBar={appsBarNode}
                                 appLayout={appLayout}
                                 onExternalLink={handleExternalLink}
+                                shortcutsBlocked={settingsPageOpen || isAdvancedSearchOpen || !!externalLinkPromptUrl}
                                 accountId={accountId}
                                 accountEmail={accountEmailLabel}
                                 backendReachable={backendReachable}
@@ -3240,6 +3294,7 @@ const DashboardPage = () => {
                                 deleteMailsOptimistic={deleteMailsOptimistic}
                                 moveMailsOptimistic={moveMailsOptimistic}
                                 setMailsSeenState={setMailsSeenState}
+                                markAsReadDelaySeconds={markAsReadDelaySeconds}
                                 queueAction={queueAction}
                                 createMailbox={createMailbox}
                                 canUseRemoteMail={canUseRemoteMail}
@@ -3590,6 +3645,8 @@ function MailSection({
     appMenuVisible,
     setAppMenuVisible,
     toolbarStyle,
+    shortcutsBlocked,
+    markAsReadDelaySeconds,
 }) {
     const { t } = useTranslation()
     const hasFolderAccess = folders.length > 0
@@ -3903,6 +3960,12 @@ function MailSection({
     }, [selectedThread?.id, showThreadReader])
 
     const selectedMessageKey = mailKey(selectedMail, selectedFolder)
+    useEffect(() => {
+        if (showThreadReader && selectedMessageKey) {
+            setThreadReaderOpenIds(new Set([selectedMessageKey]))
+        }
+    }, [selectedMessageKey, selectedThread?.id, showThreadReader])
+
     useEffect(() => {
         if (!threadedEnabled || !showThreadReader || !selectedMessageKey || !mailContent) return
         setThreadReaderContentById((prev) => ({ ...(prev || {}), [selectedMessageKey]: mailContent }))
@@ -4497,9 +4560,9 @@ function MailSection({
         }
     }, [accountId, closeComposeExitPrompt, closeComposeTarget, composeExitPrompt, continueComposeExitIntent, enqueueDelayedSend, saveComposeDraft])
 
-    const attemptOpenMail = useCallback(async (mail) => {
+    const attemptOpenMail = useCallback(async (mail, threadId = null) => {
         if (!mail) return
-        setActiveThreadReaderId(null)
+        setActiveThreadReaderId(threadId)
         if (!inlineComposeSession) {
             await openMailOrDraft(mail)
             return
@@ -4525,38 +4588,6 @@ function MailSection({
             pendingMail: mail,
         })
     }, [inlineComposeSession, openMailOrDraft, setInlineComposeSession])
-
-    const attemptSelectMailPreview = useCallback(async (mail) => {
-        if (!mail) return
-        if (!inlineComposeSession) {
-            setSelectedMail(mail)
-            setMailContent(null)
-            setLoadingContent(false)
-            return
-        }
-
-        const hasMeaningfulChanges = inlineComposeSession?.baselineDraft
-            ? isComposeDraftModified(inlineComposeSession.draft, inlineComposeSession.baselineDraft)
-            : isComposeDraftDirty(inlineComposeSession.draft)
-        if (!hasMeaningfulChanges) {
-            setInlineComposeSession(null)
-            setSelectedMail(mail)
-            setMailContent(null)
-            setLoadingContent(false)
-            return
-        }
-
-        setComposeExitPrompt({
-            target: {
-                type: 'inline',
-                id: inlineComposeSession.id,
-                source: inlineComposeSession.source,
-            },
-            draft: inlineComposeSession.draft,
-            intent: 'select_mail',
-            pendingMail: mail,
-        })
-    }, [inlineComposeSession, setInlineComposeSession, setLoadingContent, setMailContent, setSelectedMail])
 
     const composeDraft = useCallback((draft, source = 'new') => {
         openInlineCompose({ source, draft })
@@ -5443,8 +5474,9 @@ function MailSection({
                 img.addEventListener('load', () => resizeIframeToContent(ref), { once: true })
                 img.addEventListener('error', () => resizeIframeToContent(ref), { once: true })
             })
+            return installIframeLinkInterceptor(ref, onExternalLink)
         }
-    }, [activeTabId, tabContents, accountId, t])
+    }, [activeTabId, tabContents, accountId, onExternalLink, t])
 
     useEffect(() => {
         const handleClickOutside = (e) => {
@@ -5514,7 +5546,7 @@ function MailSection({
 
     useEffect(() => {
         const handleKeyDown = (e) => {
-            if (e.key === 'Escape') {
+            if (e.key === 'Escape' && !e.defaultPrevented && !shortcutsBlocked && !isMailFullscreen && !composeExitPrompt) {
                 if (mailItemMenu) {
                     closeMailItemMenu()
                     return
@@ -5553,7 +5585,7 @@ function MailSection({
         }
         window.addEventListener('keydown', handleKeyDown)
         return () => window.removeEventListener('keydown', handleKeyDown)
-    }, [closeMailItemMenu, isFilterMenuOpen, isLabelMenuOpen, isMoveMenuOpen, isSelectionMenuOpen, isSortMenuOpen, mailItemMenu, selectMode, selectedMail, setMailContent, setSelectedMail])
+    }, [shortcutsBlocked, isMailFullscreen, composeExitPrompt, closeMailItemMenu, isFilterMenuOpen, isLabelMenuOpen, isMoveMenuOpen, isSelectionMenuOpen, isSortMenuOpen, mailItemMenu, selectMode, selectedMail, setMailContent, setSelectedMail])
 
     useEffect(() => {
         if (!mailItemMenu) return
@@ -6570,6 +6602,25 @@ function MailSection({
     // MailSection handles the mail- and compose-scoped shortcuts (it owns those
     // handlers). Navigation/search/settings shortcuts are dispatched by the
     // outer DashboardPage, which owns that state.
+    const handleManualRefresh = async () => {
+        if (!backendReachable) return
+        setIsSyncing(true)
+        setIsManualRefreshing(true)
+        try {
+            if (networkOnline) {
+                const ok = canUseRemoteMail || (await ensureImapConnected({ force: true }))
+                if (ok) {
+                    await syncMailsFromRemote(selectedFolder, currentPage, perPage)
+                }
+            }
+            await loadMailsFromCache(selectedFolder, currentPage, perPage)
+        } catch (err) {
+            console.error('Error during refresh:', err)
+        } finally {
+            setIsSyncing(false)
+            setIsManualRefreshing(false)
+        }
+    }
     const shortcutActionsRef = useRef({})
     shortcutActionsRef.current = {
         compose_new: () => { void handleNewMail() },
@@ -6582,8 +6633,8 @@ function MailSection({
         mark_spam: () => { if (hasAnyActionMail) void handleMoveAction(resolveFolderDestination('Spam')) },
         toggle_read: () => { void handleReadToggleAction() },
         add_label: () => { void handleCreateLabelAction() },
-        print: () => { window.print() },
-        refresh: () => { void syncMailsFromRemote(selectedFolder) },
+        print: handlePrintMail,
+        refresh: handleManualRefresh,
         // Cmd/Ctrl+W closes the focused mail tab; with no tab open it falls
         // through to the platform meaning of the shortcut and closes the window
         // itself — the browser-style behaviour of closing the last tab.
@@ -6618,6 +6669,7 @@ function MailSection({
 
     useEffect(() => {
         const onKeyDown = (event) => {
+            if (shortcutsBlocked || composeExitPrompt || event.defaultPrevented) return
             const actionId = matchShortcut(event, shortcutComboMap)
             if (!actionId) return
             const action = shortcutActionsRef.current[actionId]
@@ -6627,7 +6679,7 @@ function MailSection({
         }
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
-    }, [shortcutComboMap])
+    }, [shortcutComboMap, shortcutsBlocked, composeExitPrompt])
 
     const activeFolderKey = selectedFolder || 'INBOX'
     const activeFolderInfo = folderInfo(activeFolderKey)
@@ -7126,7 +7178,7 @@ function MailSection({
                                     <iframe
                                         ref={el => { tabIframeRefs.current[activeTabId] = el }}
                                         title={`tab-${activeTabId}`}
-                                        sandbox="allow-same-origin allow-scripts"
+                                        sandbox="allow-same-origin"
                                     />
                                 </div>
                             ) : (
@@ -7359,25 +7411,7 @@ function MailSection({
                                     <button
                                         type="button"
                                         className="db-mail-toolbar-btn"
-                                        onClick={async () => {
-                                            if (!backendReachable) return
-                                            setIsSyncing(true)
-                                            setIsManualRefreshing(true)
-                                            try {
-                                                if (networkOnline) {
-                                                    const ok = canUseRemoteMail || (await ensureImapConnected({ force: true }))
-                                                    if (ok) {
-                                                        await syncMailsFromRemote(selectedFolder, currentPage, perPage)
-                                                    }
-                                                }
-                                                await loadMailsFromCache(selectedFolder, currentPage, perPage)
-                                            } catch (err) {
-                                                console.error('Error during refresh:', err)
-                                            } finally {
-                                                setIsSyncing(false)
-                                                setIsManualRefreshing(false)
-                                            }
-                                        }}
+                                        onClick={handleManualRefresh}
                                         title={isSyncing ? 'Syncing...' : (canUseRemoteMail ? 'Refresh from server' : 'Load from cache')}
                                         disabled={isSyncing}
                                     >
@@ -7741,8 +7775,7 @@ function MailSection({
                                                                     }
                                                                     if (!latestMail) return
                                                                     if (isThread) {
-                                                                        setActiveThreadReaderId(thread.id)
-                                                                        await attemptSelectMailPreview(latestMail)
+                                                                        await attemptOpenMail(latestMail, thread.id)
                                                                     } else {
                                                                         setActiveThreadReaderId(null)
                                                                         await attemptOpenMail(latestMail)
@@ -8301,6 +8334,14 @@ function MailSection({
                                                             </button>
                                                             {isOpen && (
                                                                 <div className="db-thread-reader-body">
+                                                                    {content && id !== selectedMessageKey && !shortcutsBlocked && (
+                                                                        <MarkOpenThreadMessageRead
+                                                                            mail={m}
+                                                                            mailId={id}
+                                                                            delaySeconds={markAsReadDelaySeconds}
+                                                                            markSeen={setMailsSeenState}
+                                                                        />
+                                                                    )}
                                                                     {isLoading && !content ? (
                                                                         <div className="db-thread-reader-loading">Loading...</div>
                                                                     ) : !content ? (
@@ -8341,7 +8382,7 @@ function MailSection({
                                                         </div>
                                                     </div>
                                                 ) : mailContent.html_body ? (
-                                                    <div className="db-mail-body-html"><iframe ref={iframeRef} title="mail-content" sandbox="allow-same-origin allow-scripts" /></div>
+                                                    <div className="db-mail-body-html"><iframe ref={iframeRef} title="mail-content" sandbox="allow-same-origin" /></div>
                                                 ) : (
                                                     <div className="db-mail-body">{mailContent.plain_body || '(No content)'}</div>
                                                 )}

@@ -108,7 +108,7 @@ pub async fn setup_account(
         let imap_server = form.imap_server.trim().to_string();
         let password = form.password.trim().to_string();
         let (ok, msg) =
-            imap_client::authorize(&imap_server, &email, &password, imap_port, false, ssl_mode)
+            imap_client::authorize(&imap_server, &email, &password, imap_port, ssl_mode)
                 .await;
         (ok, msg)
     };
@@ -186,26 +186,12 @@ pub async fn preview_mailboxes(Json(payload): Json<MailboxPreviewRequest>) -> im
         payload.email.trim(),
         payload.password.trim(),
         imap_port,
-        false,
         ssl_mode,
     )
     .await
     {
         Ok(mailboxes) => {
-            let mut folders = Vec::new();
-            let mut labels = Vec::new();
-
-            for mailbox in &mailboxes {
-                let lower = mailbox.to_lowercase();
-                if lower.starts_with("labels/")
-                    || lower.starts_with("labels/")
-                    || lower.starts_with("[labels]/")
-                {
-                    labels.push(mailbox.clone());
-                } else {
-                    folders.push(mailbox.clone());
-                }
-            }
+            let (folders, labels) = crate::mail_models::split_mailboxes(&mailboxes);
 
             (
                 StatusCode::OK,

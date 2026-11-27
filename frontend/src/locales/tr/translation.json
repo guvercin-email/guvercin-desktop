@@ -1,4 +1,8 @@
 {
+  "Retry mail actions": "Posta işlemlerini yeniden dene",
+  "Failed mail actions": "Başarısız posta işlemleri",
+  "Could not retry mail actions.": "Posta işlemleri yeniden denenemedi.",
+  "Some mail actions could not be synchronized.": "Bazı posta işlemleri eşitlenemedi.",
   "An error occurred during saving.": "Kaydetme sırasında bir hata oluştu.",
   "An error occurred while creating the account.": "Hesap oluşturulurken bir hata oluştu.",
   "An unknown error occurred. Please check the console logs.": "Bilinmeyen bir hata oluştu. Lütfen konsol günlüklerini kontrol edin.",

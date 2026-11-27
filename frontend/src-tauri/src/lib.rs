@@ -24,9 +24,9 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "guvercin-tray";
 
 /// Shared state holding the port the Rust backend is listening on.
-/// Set once during app setup; read by the `get_backend_port` command.
+/// Set once during app setup; read by the `get_backend_connection` command.
 #[derive(Default)]
-struct BackendPort(Mutex<Option<u16>>);
+struct BackendPort(Mutex<Option<(u16, String)>>);
 
 /// WebKitGTK builds its context menu before the page sees the event, so a
 /// `preventDefault()` in the webview does not always suppress it — the guard in
@@ -301,7 +301,7 @@ where
     if let Some(path) = arg.strip_prefix("--file-attachment=") {
       collecting_attachments = true;
       if !path.trim().is_empty() {
-        attachments.push(path.to_string());
+        attachments.push(decode_file_url(path));
       }
       continue;
     }
@@ -788,8 +788,8 @@ fn percent_decode(input: &str) -> String {
 }
 
 #[tauri::command]
-fn get_backend_port(state: State<'_, BackendPort>) -> Option<u16> {
-  *state.0.lock().unwrap()
+fn get_backend_connection(state: State<'_, BackendPort>) -> Option<(u16, String)> {
+  state.0.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -1367,11 +1367,12 @@ pub fn run() {
           use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
           
           loop {
-            match rust_backend::run(db_dir.clone()).await {
+            let token = rust_backend::new_api_token();
+            match rust_backend::run(db_dir.clone(), token.clone(), 0).await {
               Ok(port) => {
                 // Store the port so the frontend can retrieve it.
                 let state = _app_handle.state::<BackendPort>();
-                *state.0.lock().unwrap() = Some(port);
+                *state.0.lock().unwrap() = Some((port, token));
                 // Keep the runtime alive so the spawned axum server keeps running.
                 std::future::pending::<()>().await;
                 break;
@@ -1451,7 +1452,7 @@ pub fn run() {
       list_user_themes,
       read_user_theme,
       write_user_theme,
-      get_backend_port,
+      get_backend_connection,
       read_eml_file,
       take_launch_files,
       take_launch_attachments,
@@ -1576,6 +1577,16 @@ mod tests {
       "file:///tmp/report%202.pdf",
     ]));
     assert_eq!(attachments, vec!["/tmp/report 2.pdf".to_string()]);
+
+    let (_, attachments) = parse_launch_args(args(&[
+      "guvercin",
+      "--file-attachment=file:///tmp/rapor%20%C3%BC.pdf",
+      "file:///tmp/ikinci%20ek.png",
+    ]));
+    assert_eq!(
+      attachments,
+      vec!["/tmp/rapor ü.pdf".to_string(), "/tmp/ikinci ek.png".to_string()],
+    );
 
     // A plain path is untouched, and a remote URL names nothing we can read.
     assert_eq!(decode_file_url("/tmp/plain.eml"), "/tmp/plain.eml");

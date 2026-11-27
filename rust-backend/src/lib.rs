@@ -28,16 +28,16 @@ mod sync_reconcile;
 mod todo_routes;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
 use crate::db::AppState;
@@ -62,7 +62,59 @@ fn init_tracing() {
         .try_init();
 }
 
-pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError> {
+pub fn new_api_token() -> String {
+    use rand::{rngs::OsRng, RngCore};
+    let mut secret = [0_u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    hex::encode(secret)
+}
+
+fn has_api_token(uri: &axum::http::Uri, token: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    uri.query().unwrap_or_default().split('&').any(|part| {
+        part.strip_prefix("_guv_token=")
+            .is_some_and(|value| bool::from(value.as_bytes().ct_eq(token.as_bytes())))
+    })
+}
+
+async fn require_api_token(
+    State(token): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let allowed = has_api_token(request.uri(), &token);
+    if !allowed {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let mut response = next.run(request).await;
+    response.headers_mut().insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response.headers_mut().insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    Ok(response)
+}
+
+fn api_cors(token: Arc<str>) -> CorsLayer {
+    let mut origins = vec![
+        HeaderValue::from_static("tauri://localhost"),
+        HeaderValue::from_static("http://tauri.localhost"),
+        HeaderValue::from_static("https://tauri.localhost"),
+    ];
+    if cfg!(debug_assertions) {
+        origins.push(HeaderValue::from_static("http://127.0.0.1:5173"));
+        origins.push(HeaderValue::from_static("http://localhost:5173"));
+    }
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, request| {
+            origins.contains(origin)
+                // Some WebViews serialize custom-scheme origins as opaque.
+                || (origin.as_bytes() == b"null" && has_api_token(&request.uri, &token))
+        }))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u16, crate::error::AppError> {
     dotenvy::dotenv().ok();
 
     init_tracing();
@@ -77,10 +129,8 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
         sync_locks: Default::default(),
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let token: Arc<str> = token.into();
+    let cors = api_cors(token.clone());
 
     let auth_router = Router::new()
         .route("/health", get(routes::health_check))
@@ -368,6 +418,10 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
                 .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
+            "/api/offline/:account_id/retry-actions",
+            post(offline_routes::retry_offline_actions),
+        )
+        .route(
             "/api/offline/:account_id/sync-now",
             post(offline_routes::sync_now),
         )
@@ -420,12 +474,12 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
 
     let app = auth_router
         .merge(mail_router)
-        .layer(cors)
-        .layer(TraceLayer::new_for_http());
+        .layer(middleware::from_fn_with_state(token, require_api_token))
+        .layer(cors);
 
     // Bind to port 0: the OS assigns a free ephemeral port automatically,
     // which avoids conflicts with AirPlay (macOS 5000) or any other service.
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| crate::error::AppError::BadRequest(format!("Bind error: {e}")))?;
     let bound_port = listener
@@ -442,4 +496,37 @@ pub async fn run(db_dir: Option<PathBuf>) -> Result<u16, crate::error::AppError>
     });
 
     Ok(port)
+}
+
+
+#[cfg(test)]
+mod api_access_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_api_requires_the_launch_token_and_limits_cors() {
+        let token: Arc<str> = new_api_token().into();
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(token.clone(), require_api_token))
+            .layer(api_cors(token.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health = format!("http://{}/health", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let denied = client.get(&health).header("origin", "https://example.test").send().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(denied.headers().get("access-control-allow-origin").is_none());
+
+        let authenticated = format!("{health}?_guv_token={token}");
+        for origin in ["tauri://localhost", "null"] {
+            let response = client.get(&authenticated).header("origin", origin).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["access-control-allow-origin"], origin);
+        }
+        let foreign = client.get(&authenticated).header("origin", "https://example.test").send().await.unwrap();
+        assert!(foreign.headers().get("access-control-allow-origin").is_none());
+        server.abort();
+    }
 }

@@ -209,16 +209,21 @@ flowchart LR
 
     UI -- "fetch" --> API
     UI -- "invoke" --> OS
-    OS -- "get_backend_port" --> API
+    OS -- "get_backend_connection" --> API
     API --> DB
     API <-- "IMAP · SMTP · CalDAV · CardDAV · TLS" --> REMOTE
 ```
 
-arka uç `127.0.0.1:0` adresine bağlanır, yani işletim sistemi ona boş bir geçici
-port verir ve hiçbir çakışma olmaz (macos 5000'i airplay için tutar). ön yüz gerçek
-portu tauri `get_backend_port` komutuyla öğrenir — bkz.
-[api.js](frontend/src/utils/api.js). dışarıya açık hiçbir arayüzde dinleme yok;
-http katmanı bir servis değil, içeride bir sınır.
+masaüstü uygulamasının arka ucu boş bir loopback portuna bağlanır. ön yüz
+portu ve her açılışta üretilen API anahtarını tauri `get_backend_connection`
+komutuyla alır. loopback API istekleri bu anahtarı gerektirir.
+bkz. [api.js](frontend/src/utils/api.js).
+
+yalnız tarayıcıda geliştirmek için rastgele bir 64 karakterlik hex anahtarı
+arka uç ve Vite ortamlarında sırasıyla `GUVERCIN_API_TOKEN` ve
+`VITE_API_TOKEN` olarak tanımlayın. arka uç varsayılan olarak
+`127.0.0.1:5500` adresini kullanır. değiştirmek için `GUVERCIN_API_PORT` ve
+ona karşılık gelen `VITE_API_URL` değerlerini ayarlayın.
 
 ---
 

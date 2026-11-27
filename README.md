@@ -205,16 +205,20 @@ flowchart LR
 
     UI -- "fetch" --> API
     UI -- "invoke" --> OS
-    OS -- "get_backend_port" --> API
+    OS -- "get_backend_connection" --> API
     API --> DB
     API <-- "IMAP · SMTP · CalDAV · CardDAV · TLS" --> REMOTE
 ```
 
-the backend binds to `127.0.0.1:0`, so the os hands it a free ephemeral port and
-nothing collides (macos holds 5000 for airplay). the frontend discovers the real
-port through the tauri `get_backend_port` command — see
-[api.js](frontend/src/utils/api.js). nothing listens on an external interface; the
-http layer is an internal boundary, not a service.
+the desktop backend binds to a free loopback port. the webview obtains that
+port and a per-launch API token through the tauri `get_backend_connection`
+command. requests to the loopback API require the token.
+see [api.js](frontend/src/utils/api.js).
+
+for browser-only development, export the same random 64-character hex string
+as `GUVERCIN_API_TOKEN` and `VITE_API_TOKEN` in the environments that launch
+the backend and Vite. the standalone backend listens on `127.0.0.1:5500` by
+default. set `GUVERCIN_API_PORT` and the matching `VITE_API_URL` to override it.
 
 ---
 

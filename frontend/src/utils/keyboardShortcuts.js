@@ -44,17 +44,13 @@ export const SHORTCUT_DEFINITIONS = [
   { id: 'archive', category: 'mail', label: 'Archive', defaultKeys: 'E', enabled: true },
   { id: 'mark_spam', category: 'mail', label: 'Mark as spam', defaultKeys: 'Shift+S', enabled: true },
   { id: 'toggle_read', category: 'mail', label: 'Toggle read / unread', defaultKeys: 'Ctrl+U', enabled: true },
-  { id: 'move_to_folder', category: 'mail', label: 'Move to folder…', defaultKeys: 'V', enabled: false },
   { id: 'add_label', category: 'mail', label: 'Add label…', defaultKeys: 'L', enabled: false },
   { id: 'print', category: 'mail', label: 'Print message', defaultKeys: 'Ctrl+P', enabled: true },
-  { id: 'select_all', category: 'mail', label: 'Select all messages', defaultKeys: 'Ctrl+Shift+A', enabled: false },
 
   /* ── Navigation & tabs ────────────────────────────────────────── */
   { id: 'search', category: 'navigation', label: 'Search mail', defaultKeys: 'Ctrl+F', enabled: true },
   { id: 'advanced_search', category: 'navigation', label: 'Advanced search', defaultKeys: 'Ctrl+Shift+K', enabled: false },
   { id: 'refresh', category: 'navigation', label: 'Refresh / sync', defaultKeys: 'F5', enabled: true },
-  { id: 'next_message', category: 'navigation', label: 'Next message', defaultKeys: 'J', enabled: false },
-  { id: 'previous_message', category: 'navigation', label: 'Previous message', defaultKeys: 'K', enabled: false },
   { id: 'close_tab', category: 'navigation', label: 'Close current tab', defaultKeys: 'Ctrl+W', enabled: true },
   { id: 'go_mail', category: 'navigation', label: 'Go to Mail', defaultKeys: 'Ctrl+Alt+1', enabled: false },
   { id: 'go_calendar', category: 'navigation', label: 'Go to Calendar', defaultKeys: 'Ctrl+Alt+2', enabled: false },
@@ -63,11 +59,6 @@ export const SHORTCUT_DEFINITIONS = [
 
   /* ── View & layout ────────────────────────────────────────────── */
   { id: 'toggle_fullscreen', category: 'view', label: 'Toggle reading fullscreen', defaultKeys: 'F11', enabled: false },
-  { id: 'toggle_thread_view', category: 'view', label: 'Toggle conversation view', defaultKeys: null, enabled: false },
-  { id: 'toggle_preview_panel', category: 'view', label: 'Toggle preview panel position', defaultKeys: null, enabled: false },
-  { id: 'zoom_in', category: 'view', label: 'Zoom in', defaultKeys: 'Ctrl+=', enabled: false },
-  { id: 'zoom_out', category: 'view', label: 'Zoom out', defaultKeys: 'Ctrl+-', enabled: false },
-  { id: 'zoom_reset', category: 'view', label: 'Reset zoom', defaultKeys: 'Ctrl+0', enabled: false },
 
   /* ── Compose (active within a compose view) ───────────────────── */
   { id: 'compose_send', category: 'compose', label: 'Send message', defaultKeys: 'Ctrl+Enter', enabled: true },
@@ -77,7 +68,6 @@ export const SHORTCUT_DEFINITIONS = [
 
   /* ── Application ──────────────────────────────────────────────── */
   { id: 'open_settings', category: 'application', label: 'Open settings', defaultKeys: 'Ctrl+,', enabled: true },
-  { id: 'lock_screen', category: 'application', label: 'Lock screen', defaultKeys: null, enabled: false },
 ]
 
 const DEFINITION_BY_ID = SHORTCUT_DEFINITIONS.reduce((acc, def) => {

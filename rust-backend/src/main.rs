@@ -1,10 +1,12 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // args no longer needed
-
-
-    // Start backend and receive assigned ephemeral port
-    let port = rust_backend::run(None)
+    dotenvy::dotenv().ok();
+    let token = std::env::var("GUVERCIN_API_TOKEN")
+        .ok()
+        .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("Set GUVERCIN_API_TOKEN to a randomly generated 64-character hex string"))?;
+    let port = std::env::var("GUVERCIN_API_PORT").unwrap_or_else(|_| "5500".into()).parse()?;
+    let port = rust_backend::run(None, token, port)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 

@@ -311,6 +311,8 @@ pub struct OfflineStatusResponse {
     pub imap_reachable: bool,
     pub smtp_reachable: bool,
     pub queue_depth: i64,
+    pub retryable_failures: i64,
+    pub stopped_actions: i64,
     pub sync_state: String,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,

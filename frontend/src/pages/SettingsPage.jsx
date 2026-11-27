@@ -2521,10 +2521,10 @@ function BlockedSendersSettings({ accountId, searchQuery = '' }) {
 }
 
 function isLabelMailbox(value) {
-    return /^(Labels|Labels|\[Labels\])(\/|$)/i.test((value || '').trim())
+    return /^(Labels|Etiketler|\[Labels\])(\/|$)/i.test((value || '').trim())
 }
 function isMailboxSectionRoot(value) {
-    return ['Folders', 'Labels', 'Labels'].includes((value || '').trim())
+    return ['Folders', 'Etiketler', 'Labels', '[Labels]'].includes((value || '').trim())
 }
 const MAILBOX_COUNT_DISPLAY_OPTIONS = [
     { value: 'unread_only', label: 'Unread count only' },

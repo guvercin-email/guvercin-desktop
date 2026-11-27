@@ -1,29 +1,20 @@
-// Dynamically resolved base URL.
-//
-// Strategy:
-//   1. On module load we immediately start resolving the backend port via the
-//      Tauri `get_backend_port` command (retrying every 100 ms for up to 5 s).
-//   2. While resolving, _resolvedBase starts as the env-var / legacy fallback so
-//      calls during startup still work.
-//   3. Once the real port is known, _resolvedBase is updated — all future calls
-//      pick it up automatically.
-//   4. `apiReady()` returns a Promise that resolves once the real port is known,
-//      so critical initialisation code can await it before the first fetch.
-
 import { invoke } from '@tauri-apps/api/core'
 
-const _fallback = import.meta.env.VITE_API_URL || 'http://127.0.0.1:5000';
+const _fallback = import.meta.env?.VITE_API_URL || 'http://127.0.0.1:5500';
 
 // Start with the fallback; replaced as soon as the real port arrives.
 let _resolvedBase = _fallback;
+let apiToken = import.meta.env?.DEV ? import.meta.env.VITE_API_TOKEN || '' : '';
 let _readyResolve;
 export const apiReady = new Promise(res => { _readyResolve = res; });
 
 (async () => {
   try {
     for (let i = 0; i < 50; i++) {
-      const port = await invoke('get_backend_port');
-      if (port) {
+      const connection = await invoke('get_backend_connection');
+      if (connection) {
+        const [port, token] = connection;
+        apiToken = token;
         _resolvedBase = `http://127.0.0.1:${port}`;
         break;
       }
@@ -38,8 +29,10 @@ export const apiReady = new Promise(res => { _readyResolve = res; });
 // Synchronous — safe to call from non-async contexts.
 export const apiUrl = (path) => {
   if (path.startsWith('http')) return path;
-  return `${_resolvedBase}${path}`;
+  const url = new URL(path, _resolvedBase);
+  if (apiToken && url.origin === new URL(_resolvedBase).origin
+    && (url.pathname.startsWith('/api/') || url.pathname === '/health')) {
+    url.searchParams.set('_guv_token', apiToken);
+  }
+  return url.href;
 };
-
-// Backward-compat export (some files may import this directly).
-export const getApiBaseUrl = () => _resolvedBase;

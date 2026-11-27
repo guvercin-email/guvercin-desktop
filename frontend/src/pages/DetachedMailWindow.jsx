@@ -48,12 +48,12 @@ function safeParse(json) {
 }
 
 function isLabelMailbox(value) {
-  return /^(Labels|Labels)(\/|$)/i.test((value || '').trim())
+  return /^(Labels|Etiketler|\[Labels\])(\/|$)/i.test((value || '').trim())
 }
 
 function isMoveTargetMailbox(value) {
   const mailbox = (value || '').trim()
-  if (!mailbox || ['Folders', 'Labels', 'Labels'].includes(mailbox)) return false
+  if (!mailbox || ['Folders', 'Etiketler', 'Labels', '[Labels]'].includes(mailbox)) return false
   return !isLabelMailbox(mailbox)
 }
 
@@ -825,7 +825,7 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
                     key={mail?.id}
                     ref={iframeRef}
                     title="mail-content"
-                    sandbox="allow-same-origin allow-scripts"
+                    sandbox="allow-same-origin"
                     srcDoc={sanitizeMailHtml(mailContent.html_body, getMailSanitizeOptions(accountId, t))}
                     onLoad={handleIframeLoad}
                   />

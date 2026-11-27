@@ -1,6 +1,5 @@
 use native_tls::TlsConnector;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use crate::i18n::tr;
 use tracing::warn;
@@ -57,15 +56,7 @@ fn inner_preview_mailboxes_xoauth2(
     port: u16,
     ssl_mode: &str,
 ) -> Result<Vec<String>, String> {
-    let mut builder = TlsConnector::builder();
-    #[allow(deprecated)]
-    {
-        builder.danger_accept_invalid_certs(true);
-        builder.danger_accept_invalid_hostnames(true);
-    }
-    let tls = builder
-        .build()
-        .map_err(|e| format!("Unexpected error: {e}"))?;
+    let tls = TlsConnector::new().map_err(|e| format!("Unexpected error: {e}"))?;
 
     let auth = XOAuth2 {
         user: email.to_string(),
@@ -74,7 +65,7 @@ fn inner_preview_mailboxes_xoauth2(
 
     match ssl_mode.to_uppercase().as_str() {
         "STARTTLS" => {
-            let client = imap::connect_starttls((server, port), server, &tls)
+            let client = crate::imap_session::connect_tls(server, port, &tls, true)
                 .map_err(|e| format!("Unexpected error: {e}"))?;
             let mut session = client
                 .authenticate("XOAUTH2", &auth)
@@ -87,7 +78,7 @@ fn inner_preview_mailboxes_xoauth2(
             Ok(mailboxes)
         }
         _ => {
-            let client = imap::connect((server, port), server, &tls)
+            let client = crate::imap_session::connect_tls(server, port, &tls, false)
                 .map_err(|e| format!("Unexpected error: {e}"))?;
             let mut session = client
                 .authenticate("XOAUTH2", &auth)
@@ -107,7 +98,6 @@ pub async fn authorize(
     email: &str,
     password: &str,
     port: u16,
-    verify_ssl: bool,
     ssl_mode: &str,
 ) -> (bool, String) {
     let server = server.to_string();
@@ -116,7 +106,7 @@ pub async fn authorize(
     let ssl_mode = ssl_mode.to_string();
 
     tokio::task::spawn_blocking(move || {
-        inner_authorize(&server, &email, &password, port, verify_ssl, &ssl_mode)
+        inner_authorize(&server, &email, &password, port, &ssl_mode)
     })
     .await
     .unwrap_or_else(|e| (false, tr(&format!("Unexpected error: {e}"))))
@@ -127,7 +117,6 @@ pub async fn preview_mailboxes(
     email: &str,
     password: &str,
     port: u16,
-    verify_ssl: bool,
     ssl_mode: &str,
 ) -> Result<Vec<String>, String> {
     let server = server.to_string();
@@ -136,7 +125,7 @@ pub async fn preview_mailboxes(
     let ssl_mode = ssl_mode.to_string();
 
     tokio::task::spawn_blocking(move || {
-        inner_preview_mailboxes(&server, &email, &password, port, verify_ssl, &ssl_mode)
+        inner_preview_mailboxes(&server, &email, &password, port, &ssl_mode)
     })
     .await
     .unwrap_or_else(|e| Err(format!("Unexpected error: {e}")))
@@ -167,24 +156,20 @@ pub async fn probe_server(
 }
 
 fn probe_single_server(server: &str, port: u16, ssl_mode: &str) -> Result<(), String> {
-    let mut builder = TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
-
-    let tls = builder.build().map_err(|e| format!("{e}"))?;
+    let tls = TlsConnector::new().map_err(|e| format!("{e}"))?;
 
     match ssl_mode.to_uppercase().as_str() {
         "SSL" => {
-            let _ = imap::connect((server, port), server, &tls).map_err(|e| format!("{e}"))?;
+            let _ = crate::imap_session::connect_tls(server, port, &tls, false)?;
             Ok(())
         }
         "STARTTLS" => {
             let _ =
-                imap::connect_starttls((server, port), server, &tls).map_err(|e| format!("{e}"))?;
+                crate::imap_session::connect_tls(server, port, &tls, true)?;
             Ok(())
         }
         _ => {
-            let stream = TcpStream::connect((server, port)).map_err(|e| format!("{e}"))?;
+            let stream = crate::imap_session::connect_tcp(server, port)?;
             let mut client = imap::Client::new(stream);
             client.read_greeting().map_err(|e| format!("{e}"))?;
             Ok(())
@@ -193,7 +178,7 @@ fn probe_single_server(server: &str, port: u16, ssl_mode: &str) -> Result<(), St
 }
 
 fn probe_tcp_port(server: &str, port: u16) -> Result<(), String> {
-    let stream = TcpStream::connect((server, port)).map_err(|e| format!("{e}"))?;
+    let stream = crate::imap_session::connect_tcp(server, port)?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
     Ok(())
@@ -204,19 +189,10 @@ fn inner_authorize(
     email: &str,
     password: &str,
     port: u16,
-    verify_ssl: bool,
     ssl_mode: &str,
 ) -> (bool, String) {
-    let mut builder = TlsConnector::builder();
-    if !verify_ssl {
-        #[allow(deprecated)]
-        {
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-        }
-    }
 
-    let tls = match builder.build() {
+    let tls = match TlsConnector::new() {
         Ok(t) => t,
         Err(e) => {
             return (false, tr(&format!("Unexpected error: {e}")));
@@ -224,14 +200,14 @@ fn inner_authorize(
     };
 
     match ssl_mode.to_uppercase().as_str() {
-        "SSL" => match imap::connect((server, port), server, &tls) {
+        "SSL" => match crate::imap_session::connect_tls(server, port, &tls, false) {
             Ok(client) => perform_auth(client, email, password),
             Err(e) => {
                 warn!("IMAP SSL connect failed for {}:{} - {}", server, port, e);
                 (false, tr(&format!("Unexpected error: {e}")))
             }
         },
-        "STARTTLS" => match imap::connect_starttls((server, port), server, &tls) {
+        "STARTTLS" => match crate::imap_session::connect_tls(server, port, &tls, true) {
             Ok(client) => perform_auth(client, email, password),
             Err(e) => {
                 warn!(
@@ -241,7 +217,7 @@ fn inner_authorize(
                 (false, tr(&format!("Unexpected error: {e}")))
             }
         },
-        _ => match std::net::TcpStream::connect((server, port)) {
+        _ => match crate::imap_session::connect_tcp(server, port) {
             Ok(stream) => {
                 let mut client = imap::Client::new(stream);
                 if let Err(e) = client.read_greeting() {
@@ -289,39 +265,29 @@ fn inner_preview_mailboxes(
     email: &str,
     password: &str,
     port: u16,
-    verify_ssl: bool,
     ssl_mode: &str,
 ) -> Result<Vec<String>, String> {
-    let mut builder = TlsConnector::builder();
-    if !verify_ssl {
-        #[allow(deprecated)]
-        {
-            builder.danger_accept_invalid_certs(true);
-            builder.danger_accept_invalid_hostnames(true);
-        }
-    }
 
-    let tls = builder
-        .build()
+    let tls = TlsConnector::new()
         .map_err(|e| format!("Unexpected error: {e}"))?;
 
     match ssl_mode.to_uppercase().as_str() {
         "SSL" => {
-            let client = imap::connect((server, port), server, &tls).map_err(|e| {
+            let client = crate::imap_session::connect_tls(server, port, &tls, false).map_err(|e| {
                 warn!("IMAP SSL probe failed for {}:{} - {}", server, port, e);
                 format!("Unexpected error: {e}")
             })?;
             perform_preview(client, email, password)
         }
         "STARTTLS" => {
-            let client = imap::connect_starttls((server, port), server, &tls).map_err(|e| {
+            let client = crate::imap_session::connect_tls(server, port, &tls, true).map_err(|e| {
                 warn!("IMAP STARTTLS probe failed for {}:{} - {}", server, port, e);
                 format!("Unexpected error: {e}")
             })?;
             perform_preview(client, email, password)
         }
         _ => {
-            let stream = std::net::TcpStream::connect((server, port)).map_err(|e| {
+            let stream = crate::imap_session::connect_tcp(server, port).map_err(|e| {
                 warn!("TCP probe to IMAP failed for {}:{} - {}", server, port, e);
                 format!("Unexpected error: {e}")
             })?;

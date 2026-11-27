@@ -22,7 +22,7 @@ use crate::{
     imap_session::{self, ImapState},
     mail_models::{
         merge_mailbox_label_into_preview, AdvancedSearchRequest, AdvancedSearchResponse,
-        MailContent, MailListResponse, MailPreview, MailSearchPreview, MailboxListResponse,
+        MailContent, MailPreview, MailSearchPreview, MailboxListResponse,
         ReadStatus, SearchScope,
     },
     mail_routes::MailAppState,
@@ -46,6 +46,7 @@ pub struct LocalMailListQuery {
     #[serde(default = "default_per_page")]
     pub per_page: usize,
     pub uid_validity: Option<u32>,
+    pub revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -724,30 +725,13 @@ fn apply_advanced_search_filters(
     }
 }
 
-fn strip_label_mailbox_prefix(mailbox: &str) -> Option<String> {
-    let trimmed = mailbox.trim();
-    let lower = trimmed.to_ascii_lowercase();
-
-    if lower.starts_with("labels/") {
-        return Some(trimmed[7..].trim_matches('/').to_string());
-    }
-    if lower.starts_with("labels/") {
-        return Some(trimmed[10..].trim_matches('/').to_string());
-    }
-    if lower.starts_with("[labels]/") {
-        return Some(trimmed[9..].trim_matches('/').to_string());
-    }
-
-    None
-}
-
 fn mailbox_matches_label(mailbox: &str, label: &str) -> bool {
     let normalized_label = label.trim();
     if normalized_label.is_empty() {
         return false;
     }
 
-    strip_label_mailbox_prefix(mailbox)
+    crate::mail_models::label_key_from_mailbox(mailbox)
         .map(|candidate| candidate.eq_ignore_ascii_case(normalized_label))
         .unwrap_or(false)
 }
@@ -936,15 +920,21 @@ pub async fn get_local_mail_list(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
     Query(q): Query<LocalMailListQuery>,
-) -> Result<Json<MailListResponse>, AppError> {
+) -> Result<Response, AppError> {
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    let mut tx = pool.begin().await?;
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM mailbox_list_revision WHERE folder = ?")
+        .bind(&q.mailbox).fetch_optional(&mut *tx).await?.unwrap_or(0);
+    if q.revision == Some(revision) {
+        return Ok(StatusCode::NOT_MODIFIED.into_response());
+    }
     let offset = q.page.saturating_sub(1) * q.per_page;
 
     let total: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(1) FROM local_mail_cache WHERE folder = ? AND {VISIBLE_CACHED_MAIL}"
     ))
     .bind(&q.mailbox)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(0);
 
@@ -962,10 +952,11 @@ pub async fn get_local_mail_list(
     .bind(&q.mailbox)
     .bind(q.per_page as i64)
     .bind(offset as i64)
-    .fetch_all(&pool)
+    .fetch_all(&mut *tx)
     .await?;
 
-    let mails = rows
+    tx.commit().await?;
+    let mails: Vec<MailPreview> = rows
         .into_iter()
         .map(|r| {
             let mut preview = MailPreview {
@@ -1060,10 +1051,11 @@ pub async fn get_local_mail_list(
         })
         .collect();
 
-    Ok(Json(MailListResponse {
-        total_count: total.max(0) as usize,
-        mails,
-    }))
+    Ok(Json(json!({
+        "total_count": total.max(0),
+        "mails": mails,
+        "revision": revision,
+    })).into_response())
 }
 
 pub async fn sync_mailbox(
@@ -1341,7 +1333,7 @@ pub async fn get_local_mail_content(
 
     let row = sqlx::query(
         r#"
-        SELECT uid, subject, sender_name, sender_address, date_value, cc_value, bcc_value, plain_body, html_body, raw_rfc822
+        SELECT uid, subject, sender_name, sender_address, date_value, cc_value, bcc_value, plain_body, html_body, raw_rfc822, uid_validity
         FROM local_mail_cache
         WHERE uid = ? AND folder = ? AND COALESCE(uid_validity, 0) = COALESCE(?, uid_validity, 0)
         "#,
@@ -1358,7 +1350,15 @@ pub async fn get_local_mail_content(
                 let content = if is_drafts_mailbox_name(&q.mailbox) {
                     imap_session::parse_mail_content_with_attachment_data(uid, &raw)
                 } else {
-                    imap_session::parse_mail_content(uid, &raw)
+                    let mut content = imap_session::parse_mail_content(uid.clone(), &raw);
+                    let generation = r.try_get::<Option<u32>, _>("uid_validity").ok().flatten();
+                    content.html_body = rewrite_inline_attachment_urls(
+                        &content,
+                        &format!("/api/offline/{account_id}/local-content/{uid}"),
+                        &q.mailbox,
+                        generation,
+                    );
+                    content
                 };
                 return Json(content).into_response();
             }
@@ -1448,8 +1448,7 @@ struct InlinePrefetchResponse {
 }
 
 fn build_inline_cid_attachment_map(
-    account_id: i64,
-    uid: &str,
+    content_path: &str,
     mailbox: &str,
     generation: Option<u32>,
     attachments: &[crate::mail_models::AttachmentInfo],
@@ -1466,9 +1465,7 @@ fn build_inline_cid_attachment_map(
             Some((
                 format!("cid:{}", content_id),
                 format!(
-                    "http://127.0.0.1:5000/api/offline/{}/local-content/{}/attachments/{}?mailbox={}&uid_validity={}",
-                    account_id,
-                    uid,
+                    "{content_path}/attachments/{}?mailbox={}&uid_validity={}",
                     attachment.id,
                     encoded_mailbox,
                     generation.unwrap_or(0),
@@ -1476,6 +1473,16 @@ fn build_inline_cid_attachment_map(
             ))
         })
         .collect()
+}
+
+pub(crate) fn rewrite_inline_attachment_urls(
+    content: &MailContent,
+    content_path: &str,
+    mailbox: &str,
+    generation: Option<u32>,
+) -> String {
+    let attachments = build_inline_cid_attachment_map(content_path, mailbox, generation, &content.attachments);
+    rewrite_html_inline_image_srcs(&content.html_body, &attachments)
 }
 
 pub async fn prefetch_local_inline_assets(
@@ -1527,7 +1534,7 @@ pub async fn prefetch_local_inline_assets(
         .as_deref()
         .map(|raw_bytes| {
             let content = imap_session::parse_mail_content(uid.clone(), raw_bytes);
-            build_inline_cid_attachment_map(account_id, &uid, &q.mailbox, generation, &content.attachments)
+            build_inline_cid_attachment_map(&format!("/api/offline/{account_id}/local-content/{uid}"), &q.mailbox, generation, &content.attachments)
         })
         .unwrap_or_default();
     let rewritten = rewrite_html_inline_image_srcs(&html, &cid_to_attachment);
@@ -1973,6 +1980,13 @@ pub async fn get_offline_status(
     .await
     .unwrap_or(0);
 
+    let retryable_failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_sync_queue WHERE status IN ('failed', 'dead') AND manual_retry = 1",
+    ).fetch_one(&pool).await?;
+    let stopped_actions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM offline_sync_queue WHERE status = 'dead'",
+    ).fetch_one(&pool).await?;
+
     let status_row = sqlx::query(
         "SELECT sync_status, last_sync_time, smtp_host FROM accounts WHERE account_id = ?",
     )
@@ -2015,7 +2029,7 @@ pub async fn get_offline_status(
         row.and_then(|r| r.try_get::<Option<String>, _>("last_error").ok().flatten())
     };
 
-    let imap_reachable = imap_session::is_connected(&state.imap, account_id);
+    let imap_reachable = imap_session::has_session(&state.imap, account_id);
     let sync_state = if account_syncing || (imap_reachable && queue_depth > 0) {
         "syncing".to_string()
     } else if imap_reachable {
@@ -2030,11 +2044,28 @@ pub async fn get_offline_status(
         imap_reachable,
         smtp_reachable,
         queue_depth,
+        retryable_failures,
+        stopped_actions,
         sync_state,
         last_sync_at,
         last_error,
         transfer: get_transfer_snapshot(&state._db, account_id).await,
     }))
+}
+
+pub async fn retry_offline_actions(
+    State(state): State<Arc<MailAppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let sync_lock = state.account_sync_lock(account_id).await;
+    let _guard = sync_lock.lock().await;
+    let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    let result = sqlx::query(
+        "UPDATE offline_sync_queue SET status = 'pending', attempt_count = 0, next_retry_at = NULL,
+         last_error = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE status IN ('failed', 'dead') AND manual_retry = 1",
+    ).execute(&pool).await?;
+    Ok(Json(json!({ "retried": result.rows_affected() })))
 }
 
 pub async fn post_offline_action(
@@ -2065,18 +2096,16 @@ pub async fn post_offline_action(
         .unwrap_or_default();
 
         ensure_imap_connected(&state._db, &state.imap, account_id).await?;
-        let mut drafts_mailbox =
-            resolve_drafts_mailbox_name(&imap_session::list_mailboxes(&state.imap, account_id))
-                .unwrap_or_else(|| "Drafts".to_string());
-        if !imap_session::list_mailboxes(&state.imap, account_id)
-            .iter()
-            .any(|mailbox| mailbox.eq_ignore_ascii_case(&drafts_mailbox))
-        {
-            let _ = imap_session::create_mailbox(&state.imap, account_id, &drafts_mailbox);
-            drafts_mailbox =
-                resolve_drafts_mailbox_name(&imap_session::list_mailboxes(&state.imap, account_id))
-                    .unwrap_or(drafts_mailbox);
-        }
+        let imap = state.imap.clone();
+        let drafts_mailbox = tokio::task::spawn_blocking(move || {
+            let mailboxes = imap_session::list_mailboxes(&imap, account_id);
+            if let Some(mailbox) = resolve_drafts_mailbox_name(&mailboxes) {
+                return Ok(mailbox);
+            }
+            imap_session::create_mailbox(&imap, account_id, "Drafts")?;
+            Ok::<_, String>("Drafts".to_string())
+        }).await.map_err(|e| AppError::BadRequest(e.to_string()))?
+            .map_err(AppError::BadRequest)?;
 
         let existing_draft_id = payload_value
             .get("draft_id")
@@ -2114,7 +2143,13 @@ pub async fn post_offline_action(
             .unwrap_or_default()
             .to_string();
         let attachments = parse_send_attachments(&payload_value);
-        let tracking_key = format!("draft-{}-{:08x}", now_ms(), rand::random::<u32>());
+        use sha2::{Digest, Sha256};
+        let tracking_key = format!("draft-{}", hex::encode(Sha256::digest(payload_json.as_bytes())));
+        let previous_attempt: Option<String> = sqlx::query_scalar(
+            "SELECT folder FROM remote_draft_writes WHERE tracking_key = ?",
+        ).bind(&tracking_key).fetch_optional(&pool).await?;
+        let append_new = previous_attempt.is_none();
+        let drafts_mailbox = previous_attempt.unwrap_or(drafts_mailbox);
         let raw_rfc822 = build_rfc822_message(OutgoingMessage {
             from: &from_addr,
             to: to_addrs,
@@ -2128,14 +2163,27 @@ pub async fn post_offline_action(
             raw_headers: &[("X-Guvercin-Draft-Key".to_string(), tracking_key.clone())],
         })
         .map_err(AppError::BadRequest)?;
-        let (draft_uid, generation) = imap_session::append_draft(
-            &state.imap,
-            account_id,
-            &drafts_mailbox,
-            &raw_rfc822,
-            &tracking_key,
-        )
-        .map_err(AppError::BadRequest)?;
+        if append_new {
+            sqlx::query("INSERT INTO remote_draft_writes(tracking_key, folder) VALUES (?, ?)")
+                .bind(&tracking_key).bind(&drafts_mailbox).execute(&pool).await?;
+        }
+        let imap = state.imap.clone();
+        let folder = drafts_mailbox.clone();
+        let key = tracking_key.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = imap_session::append_draft(&imap, account_id, &folder, &raw_rfc822, &key, append_new);
+            result.map(|identity| (identity, raw_rfc822))
+        }).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let ((draft_uid, generation), raw_rfc822) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if !error.may_exist {
+                    sqlx::query("DELETE FROM remote_draft_writes WHERE tracking_key = ?")
+                        .bind(&tracking_key).execute(&pool).await?;
+                }
+                return Err(AppError::BadRequest(error.message));
+            }
+        };
 
         record_mailbox_generation(&pool, &drafts_mailbox, generation).await?;
         cache_remote_draft_to_local_cache(
@@ -2155,15 +2203,24 @@ pub async fn post_offline_action(
             } else if previous_draft_id != draft_uid
                 && payload.uid_validity == Some(generation)
                 && payload.target_folder.as_deref() == Some(drafts_mailbox.as_str())
-                && imap_session::apply_queued_mail_action(
-                    &state.imap, account_id, &drafts_mailbox, &previous_draft_id,
-                    Some(generation), imap_session::QueuedMailAction::Delete,
-                ).is_ok()
             {
-                let mut connection = pool.acquire().await?;
-                remove_cached_source(&mut connection, &previous_draft_id, &drafts_mailbox, Some(generation)).await?;
+                let imap = state.imap.clone();
+                let folder = drafts_mailbox.clone();
+                let uid = previous_draft_id.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    imap_session::apply_queued_mail_action(
+                        &imap, account_id, &folder, &uid, Some(generation), imap_session::QueuedMailAction::Delete,
+                    ).is_ok()
+                }).await.unwrap_or(false);
+                if removed {
+                    let mut connection = pool.acquire().await?;
+                    remove_cached_source(&mut connection, &previous_draft_id, &drafts_mailbox, Some(generation)).await?;
+                }
             }
         }
+
+        sqlx::query("DELETE FROM remote_draft_writes WHERE tracking_key = ?")
+            .bind(&tracking_key).execute(&pool).await?;
 
         return Ok(Json(OfflineActionResponse {
             status: "saved",
@@ -2176,7 +2233,7 @@ pub async fn post_offline_action(
 
     let mut tx = pool.begin().await?;
 
-    if payload.action_type == "send" {
+    let outbox_id = if payload.action_type == "send" {
         let format_value = payload
             .payload
             .as_ref()
@@ -2237,7 +2294,7 @@ pub async fn post_offline_action(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "[]".to_string());
 
-        sqlx::query(
+        let outbox = sqlx::query(
             r#"
             INSERT INTO outbox_mails (
                 from_addr, to_addrs, cc_addrs, bcc_addrs, format_value, subject, body_text, body_html, attachments_json, status
@@ -2256,7 +2313,10 @@ pub async fn post_offline_action(
         .bind(attachments_json)
         .execute(&mut *tx)
         .await?;
-    }
+        Some(outbox.last_insert_rowid())
+    } else {
+        None
+    };
 
     let answered = parse_post_send_mark_answered(&payload_value);
     let (uid, folder) = if payload.action_type == "send" {
@@ -2285,6 +2345,14 @@ pub async fn post_offline_action(
     .bind(uid_validity)
     .execute(&mut *tx)
     .await?;
+
+    if let Some(outbox_id) = outbox_id {
+        sqlx::query("UPDATE outbox_mails SET queue_id = ? WHERE id = ?")
+            .bind(res.last_insert_rowid())
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     let cached_target = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity = ?)",
@@ -2343,13 +2411,11 @@ async fn sync_now_impl(
     state: &Arc<MailAppState>,
     account_id: i64,
 ) -> Result<(usize, usize), AppError> {
-    let result = process_queue_once(state, account_id, 200).await;
+    let imap_ready = ensure_imap_connected(&state._db, &state.imap, account_id).await.is_ok();
+    let result = process_queue_once(state, account_id, 200, imap_ready).await;
     set_transfer_sending(&state._db, account_id, None).await;
     let (processed, failed) = result?;
-    if ensure_imap_connected(&state._db, &state.imap, account_id)
-        .await
-        .is_ok()
-    {
+    if imap_ready && imap_session::has_session(&state.imap, account_id) {
         let result = sync_cached_mailboxes(&state._db, &state.imap, account_id).await;
         set_transfer_receiving(&state._db, account_id, None).await;
         result?;
@@ -2379,21 +2445,38 @@ async fn recover_interrupted_queue(pool: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-async fn discard_superseded_read_actions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+async fn discard_superseded_mail_actions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE offline_sync_queue AS older
         SET status = 'done', last_error = NULL, next_retry_at = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE older.status IN ('pending', 'failed')
-          AND older.action_type IN ('mark_read', 'mark_unread')
+          AND older.action_type IN ('mark_read', 'mark_unread', 'label_add', 'label_remove', 'move')
           AND EXISTS (
               SELECT 1 FROM offline_sync_queue AS newer
               WHERE newer.id > older.id
                 AND newer.target_uid = older.target_uid
                 AND newer.target_folder = older.target_folder
                 AND newer.uid_validity IS older.uid_validity
-                AND newer.action_type IN ('mark_read', 'mark_unread')
+                AND (
+                    (older.action_type IN ('mark_read', 'mark_unread')
+                     AND newer.action_type IN ('mark_read', 'mark_unread'))
+                    OR
+                    (older.action_type = 'move' AND newer.action_type IN ('move', 'delete')
+                     AND newer.status IN ('pending', 'failed', 'done'))
+                    OR
+                    (older.action_type IN ('label_add', 'label_remove')
+                     AND newer.action_type IN ('label_add', 'label_remove')
+                     AND older.action_type <> newer.action_type
+                     AND newer.status IN ('pending', 'failed', 'done')
+                     AND CASE WHEN json_valid(older.payload_json) AND json_valid(newer.payload_json) THEN
+                         json_type(older.payload_json, '$.label') = 'text'
+                         AND json_type(newer.payload_json, '$.label') = 'text'
+                         AND NULLIF(trim(json_extract(older.payload_json, '$.label')), '') =
+                             trim(json_extract(newer.payload_json, '$.label')) COLLATE NOCASE
+                     END)
+                )
           )
         "#,
     )
@@ -2410,26 +2493,30 @@ async fn process_queue_once(
     state: &Arc<MailAppState>,
     account_id: i64,
     limit: usize,
+    imap_ready: bool,
 ) -> Result<(usize, usize), AppError> {
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
     recover_interrupted_queue(&pool).await?;
-    discard_superseded_read_actions(&pool).await?;
+    discard_superseded_mail_actions(&pool).await?;
     let rows = sqlx::query(
         r#"
         SELECT id, action_type, target_uid, target_folder, payload_json, attempt_count, uid_validity
         FROM offline_sync_queue
-        WHERE status = 'pending'
-           OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP))
+        WHERE (status = 'pending'
+           OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)))
+          AND (? OR action_type = 'send')
         ORDER BY created_at ASC, id ASC
         LIMIT ?
         "#,
     )
+    .bind(imap_ready)
     .bind(limit as i64)
     .fetch_all(&pool)
     .await?;
 
     let mut processed = 0usize;
     let mut failed = 0usize;
+    let mut imap_available = imap_ready;
 
     let sending_total = rows.len() as i64;
     if sending_total > 0 {
@@ -2455,6 +2542,9 @@ async fn process_queue_once(
         let action_type = row
             .try_get::<String, _>("action_type")
             .unwrap_or_else(|_| "".to_string());
+        if !imap_available && action_type != "send" {
+            continue;
+        }
         let target_uid = row
             .try_get::<Option<String>, _>("target_uid")
             .ok()
@@ -2477,7 +2567,7 @@ async fn process_queue_once(
             .unwrap_or(0);
 
         sqlx::query(
-            "UPDATE offline_sync_queue SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE offline_sync_queue SET status = 'processing', manual_retry = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(id)
         .execute(&pool)
@@ -2489,14 +2579,24 @@ async fn process_queue_once(
         use imap_session::QueuedMailAction;
         let uid_validity = row.try_get::<Option<u32>, _>("uid_validity")?;
         let mut remote_outcome_uncertain = false;
-        let mut apply = |action| {
-            imap_session::apply_queued_mail_action(
-                &state.imap, account_id, &target_folder, &target_uid, uid_validity, action,
-            )
-            .map_err(|error| {
-                remote_outcome_uncertain = !error.retryable;
-                error.message
-            })
+        let apply = |action: QueuedMailAction| {
+            let imap = state.imap.clone();
+            let folder = target_folder.clone();
+            let uid = target_uid.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    imap_session::apply_queued_mail_action(&imap, account_id, &folder, &uid, uid_validity, action)
+                })
+                .await
+                .unwrap_or_else(|error| Err(imap_session::QueuedMailError {
+                    message: error.to_string(),
+                    retryable: false,
+                }))
+            }
+        };
+        let mut classify_imap_error = |error: imap_session::QueuedMailError| {
+            remote_outcome_uncertain = !error.retryable;
+            error.message
         };
         let result = if requires_queued_uid(&action_type) && uid_validity.filter(|value| *value > 0).is_none() {
             remote_outcome_uncertain = true;
@@ -2505,21 +2605,21 @@ async fn process_queue_once(
             Ok(())
         } else {
             match action_type.as_str() {
-                "mark_read" => apply(QueuedMailAction::Seen(true)),
-                "mark_unread" => apply(QueuedMailAction::Seen(false)),
-                "delete" => apply(QueuedMailAction::Delete),
+                "mark_read" => apply(QueuedMailAction::Seen(true)).await.map_err(&mut classify_imap_error),
+                "mark_unread" => apply(QueuedMailAction::Seen(false)).await.map_err(&mut classify_imap_error),
+                "delete" => apply(QueuedMailAction::Delete).await.map_err(&mut classify_imap_error),
                 "move" => {
                     let destination = parsed.get("destination").and_then(|value| value.as_str())
                         .unwrap_or(&target_folder);
                     if crate::mail_models::mailbox_identity(destination) == crate::mail_models::mailbox_identity(&target_folder) {
                         Ok(())
                     } else {
-                        apply(QueuedMailAction::Move(destination))
+                        apply(QueuedMailAction::Move(destination.to_owned())).await.map_err(&mut classify_imap_error)
                     }
                 }
                 "label_add" | "label_remove" => {
                     let label = parsed.get("label").and_then(|value| value.as_str()).unwrap_or_default();
-                    apply(QueuedMailAction::Label(label, action_type == "label_add"))
+                    apply(QueuedMailAction::Label(label.to_owned(), action_type == "label_add")).await.map_err(&mut classify_imap_error)
                 }
                 "send" => {
                     let account_row = sqlx::query(
@@ -3211,6 +3311,19 @@ async fn process_queue_once(
             }
         };
 
+        if result.is_err() && !remote_outcome_uncertain && requires_queued_uid(&action_type) {
+            let imap = state.imap.clone();
+            imap_available = tokio::task::spawn_blocking(move || imap_session::is_connected(&imap, account_id))
+                .await.unwrap_or(false);
+            if !imap_available {
+                // Leave retry attempts untouched. A later sync will reconnect
+                // before picking up this action again.
+                sqlx::query("UPDATE offline_sync_queue SET status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+                    .bind(id).execute(&pool).await?;
+                continue;
+            }
+        }
+
         match result {
             Ok(_) => {
                 let mut tx = pool.begin().await?;
@@ -3251,7 +3364,8 @@ async fn process_queue_once(
                     SET status = ?,
                         attempt_count = ?,
                         last_error = ?,
-                        next_retry_at = DATETIME('now', '+' || ? || ' seconds'),
+                        next_retry_at = CASE WHEN ? = 'failed' THEN DATETIME('now', '+' || ? || ' seconds') END,
+                        manual_retry = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     "#,
@@ -3259,7 +3373,9 @@ async fn process_queue_once(
                 .bind(new_status)
                 .bind(attempts)
                 .bind(err_msg)
+                .bind(new_status)
                 .bind(backoff_secs)
+                .bind(!remote_outcome_uncertain)
                 .bind(id)
                 .execute(&pool)
                 .await?;
@@ -3367,16 +3483,19 @@ async fn ensure_imap_connected(
     imap_state: &Arc<ImapState>,
     account_id: i64,
 ) -> Result<(), AppError> {
-    if imap_session::is_connected(imap_state, account_id) {
+    let current = imap_state.clone();
+    if tokio::task::spawn_blocking(move || imap_session::is_connected(&current, account_id))
+        .await.map_err(|e| AppError::BadRequest(e.to_string()))? {
+
         return Ok(());
     }
 
     let Some(settings) = load_account_imap_settings(app_state, account_id).await? else {
-        return Ok(());
+        return Err(AppError::BadRequest("Account does not exist".into()));
     };
 
     if settings.email.is_empty() || settings.imap_host.is_empty() {
-        return Ok(());
+        return Err(AppError::BadRequest("IMAP server settings are missing".into()));
     }
 
     let is_gmail = settings.is_gmail();
@@ -3392,7 +3511,7 @@ async fn ensure_imap_connected(
     };
 
     if secret.is_empty() {
-        return Ok(());
+        return Err(AppError::BadRequest("IMAP credentials are missing".into()));
     }
 
     let imap_state = imap_state.clone();
@@ -4449,6 +4568,23 @@ pub(crate) async fn cache_mail_preview(
             category = excluded.category,
             labels_json = excluded.labels_json,
             updated_at = CURRENT_TIMESTAMP
+        WHERE local_mail_cache.uid_validity IS NOT excluded.uid_validity
+           OR local_mail_cache.message_id IS NOT excluded.message_id
+           OR local_mail_cache.in_reply_to IS NOT excluded.in_reply_to
+           OR local_mail_cache.references_value IS NOT excluded.references_value
+           OR local_mail_cache.sender_name IS NOT excluded.sender_name
+           OR local_mail_cache.sender_address IS NOT excluded.sender_address
+           OR local_mail_cache.recipient_to IS NOT excluded.recipient_to
+           OR local_mail_cache.subject IS NOT excluded.subject
+           OR local_mail_cache.seen IS NOT excluded.seen
+           OR local_mail_cache.flagged IS NOT excluded.flagged
+           OR local_mail_cache.date_value IS NOT excluded.date_value
+           OR local_mail_cache.date_ms IS NOT excluded.date_ms
+           OR local_mail_cache.size_bytes IS NOT excluded.size_bytes
+           OR local_mail_cache.importance_value IS NOT excluded.importance_value
+           OR local_mail_cache.content_type IS NOT excluded.content_type
+           OR local_mail_cache.category IS NOT excluded.category
+           OR local_mail_cache.labels_json IS NOT excluded.labels_json
         "#,
     )
     .bind(&mail.id)
@@ -4489,8 +4625,8 @@ pub(crate) async fn cache_mail_preview(
                     recipient_cc, recipient_bcc, subject, date_sent, attach_amount, is_read,
                     is_flagged, folder_id, sync_status
                 )
-                VALUES (?, 0, NULL, NULL, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, 1)
-                ON CONFLICT(server_uid) DO UPDATE SET
+                VALUES (?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, 1)
+                ON CONFLICT(folder_id, uid_validity, server_uid) DO UPDATE SET
                     sender_from = excluded.sender_from,
                     recipient_to = excluded.recipient_to,
                     subject = excluded.subject,
@@ -4502,6 +4638,7 @@ pub(crate) async fn cache_mail_preview(
                 "#,
             )
             .bind(server_uid)
+            .bind(mail.uid_validity.unwrap_or_default())
             .bind(&mail.address)
             .bind(&mail.recipient_to)
             .bind(&mail.subject)
@@ -4574,7 +4711,7 @@ async fn cache_mail_body(
     };
     let content = imap_session::parse_mail_content(uid.to_string(), &raw);
     let cid_to_attachment =
-        build_inline_cid_attachment_map(account_id, uid, mailbox, uid_validity, &content.attachments);
+        build_inline_cid_attachment_map(&format!("/api/offline/{account_id}/local-content/{uid}"), mailbox, uid_validity, &content.attachments);
     let rewritten_html = rewrite_html_inline_image_srcs(&content.html_body, &cid_to_attachment);
     let date_ms: i64 = DateTime::parse_from_rfc2822(&content.date)
         .map(|dt| dt.timestamp_millis())
@@ -4610,7 +4747,8 @@ async fn cache_mail_body(
             r#"
             UPDATE emails
             SET body_text = ?, body_html = ?, attach_amount = ?, date_sent = ?, sync_status = 1
-            WHERE server_uid = ?
+            WHERE server_uid = ? AND uid_validity = ?
+              AND folder_id = (SELECT folder_id FROM folders WHERE path_by_name = ?)
             "#,
         )
         .bind(&content.plain_body)
@@ -4618,6 +4756,8 @@ async fn cache_mail_body(
         .bind(attach_amount)
         .bind(&content.date)
         .bind(server_uid)
+        .bind(uid_validity)
+        .bind(mailbox)
         .execute(pool)
         .await;
     }
@@ -4974,7 +5114,8 @@ mod tests {
         sqlx::query(
             "CREATE TABLE offline_sync_queue (
                 id INTEGER PRIMARY KEY, action_type TEXT, target_uid TEXT, target_folder TEXT,
-                status TEXT, last_error TEXT, next_retry_at TEXT, updated_at TEXT, uid_validity INTEGER
+                status TEXT, last_error TEXT, next_retry_at TEXT, updated_at TEXT,
+                uid_validity INTEGER, payload_json TEXT
              )",
         )
         .execute(&pool)
@@ -4990,12 +5131,48 @@ mod tests {
         .await
         .unwrap();
 
-        discard_superseded_read_actions(&pool).await.unwrap();
+        discard_superseded_mail_actions(&pool).await.unwrap();
         let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM offline_sync_queue ORDER BY id")
             .fetch_all(&pool)
             .await
             .unwrap();
         assert_eq!(statuses, ["done", "failed", "done"]);
+    }
+
+    #[tokio::test]
+    async fn delayed_label_and_move_retries_do_not_overwrite_newer_actions() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE offline_sync_queue (
+                id INTEGER PRIMARY KEY, action_type TEXT, target_uid TEXT, target_folder TEXT,
+                status TEXT, last_error TEXT, next_retry_at TEXT, updated_at TEXT,
+                uid_validity INTEGER, payload_json TEXT
+            )",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO offline_sync_queue
+                (action_type, target_uid, target_folder, status, uid_validity, payload_json) VALUES
+                ('label_remove', '42', 'INBOX', 'failed', 7, '{"label":"Work"}'),
+                ('label_remove', '42', 'INBOX', 'failed', 7, '{"label":"Other"}'),
+                ('label_remove', '42', 'Archive', 'failed', 7, '{"label":"Work"}'),
+                ('label_remove', '42', 'INBOX', 'failed', 6, '{"label":"Work"}'),
+                ('label_remove', '42', 'INBOX', 'failed', 7, 'invalid JSON'),
+                ('label_add', '42', 'INBOX', 'done', 7, '{"label":"Work"}'),
+                ('label_add', '43', 'INBOX', 'failed', 7, '{"label":"Planning"}'),
+                ('label_remove', '43', 'INBOX', 'done', 7, '{"label":"planning"}'),
+                ('move', '44', 'INBOX', 'failed', 7, '{"destination":"Folder A"}'),
+                ('move', '44', 'INBOX', 'done', 7, '{"destination":"Folder B"}'),
+                ('move', '45', 'INBOX', 'failed', 7, '{"destination":"Folder A"}'),
+                ('delete', '45', 'INBOX', 'done', 7, '{}')"#,
+        ).execute(&pool).await.unwrap();
+
+        discard_superseded_mail_actions(&pool).await.unwrap();
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM offline_sync_queue ORDER BY id")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(statuses, [
+            "done", "failed", "failed", "failed", "failed", "done",
+            "done", "done", "done", "done", "done", "done",
+        ]);
     }
 
     #[test]

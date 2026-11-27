@@ -64,7 +64,7 @@ pub struct MailboxListResponse {
 
 pub fn is_label_mailbox(mailbox: &str) -> bool {
     let lower = mailbox.trim().to_lowercase();
-    lower.starts_with("labels/") || lower.starts_with("[labels]/")
+    lower.starts_with("labels/") || lower.starts_with("etiketler/") || lower.starts_with("[labels]/")
 }
 
 pub fn label_key_from_mailbox(mailbox: &str) -> Option<String> {
@@ -73,6 +73,8 @@ pub fn label_key_from_mailbox(mailbox: &str) -> Option<String> {
 
     let key = if lower.starts_with("labels/") {
         &trimmed["Labels/".len()..]
+    } else if lower.starts_with("etiketler/") {
+        &trimmed["Etiketler/".len()..]
     } else if lower.starts_with("[labels]/") {
         &trimmed["[Labels]/".len()..]
     } else {
@@ -296,7 +298,8 @@ mod tests {
 
     #[test]
     fn label_classifier_matches_turkish_labels_namespace() {
-        assert!(is_label_mailbox("Labels/Projeler"));
+        assert!(is_label_mailbox("Etiketler/Projeler"));
+        assert_eq!(label_key_from_mailbox("Etiketler/Projeler").as_deref(), Some("Projeler"));
     }
 
     #[test]

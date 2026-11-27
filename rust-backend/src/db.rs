@@ -6,12 +6,14 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Connection, SqliteConnection, SqlitePool,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use crate::crypto::CryptoManager;
 use crate::error::AppError;
 use crate::keystore::{self, KeyStoreError};
 use crate::models::TransferSnapshot;
+
+type UserDbPools = HashMap<i64, Arc<OnceCell<SqlitePool>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,7 +21,7 @@ pub struct AppState {
     /// true = SQLCipher (default), false = plaintext SQLite
     pub encryption_enabled: bool,
     pub transfer_progress: Arc<Mutex<HashMap<i64, TransferSnapshot>>>,
-    user_db_pools: Arc<Mutex<HashMap<i64, SqlitePool>>>,
+    user_db_pools: Arc<Mutex<UserDbPools>>,
     inner: Arc<RwLock<Option<Arc<AppStateInner>>>>,
     // Prevent concurrent initialization which can cause duplicate keyring prompts
     init_lock: Arc<Mutex<()>>,
@@ -437,10 +439,11 @@ async fn connect_plain(path: &Path) -> sqlx::Result<SqlitePool> {
 }
 
 pub async fn get_user_db_pool(state: &AppState, account_id: i64) -> Result<SqlitePool, AppError> {
-    if let Some(pool) = state.user_db_pools.lock().await.get(&account_id).cloned() {
-        return Ok(pool);
-    }
+    let cell = state.user_db_pools.lock().await.entry(account_id).or_default().clone();
+    cell.get_or_try_init(|| open_user_db_pool(state, account_id)).await.cloned()
+}
 
+async fn open_user_db_pool(state: &AppState, account_id: i64) -> Result<SqlitePool, AppError> {
     let user_db_path = state.databases_dir.join(format!("{account_id}.db"));
     let user_db_path_str = user_db_path.to_string_lossy().into_owned();
 
@@ -479,11 +482,6 @@ pub async fn get_user_db_pool(state: &AppState, account_id: i64) -> Result<Sqlit
         .await
         .map_err(|e| AppError::db(e, &user_db_path_str))?;
 
-    state
-        .user_db_pools
-        .lock()
-        .await
-        .insert(account_id, pool.clone());
     Ok(pool)
 }
 
@@ -630,11 +628,10 @@ async fn init_general_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
+    let emails_schema = r#"
         CREATE TABLE IF NOT EXISTS emails (
             local_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            server_uid    INTEGER UNIQUE,
+            server_uid    INTEGER,
             uid_validity  INTEGER NOT NULL,
             message_id    TEXT UNIQUE,
             in_reply_to   TEXT,
@@ -653,12 +650,26 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             is_flagged    BOOLEAN DEFAULT 0,
             user_labels   TEXT,
             folder_id     INTEGER NOT NULL,
-            sync_status   INTEGER DEFAULT 0
+            sync_status   INTEGER DEFAULT 0,
+            UNIQUE(folder_id, uid_validity, server_uid)
         )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    "#;
+    let mut migration = pool.begin().await?;
+    let legacy_emails: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'emails' AND sql LIKE '%server_uid%INTEGER UNIQUE%')",
+    ).fetch_one(&mut *migration).await?;
+    if legacy_emails {
+        sqlx::query("ALTER TABLE emails RENAME TO emails_legacy")
+            .execute(&mut *migration).await?;
+    }
+    sqlx::query(emails_schema).execute(&mut *migration).await?;
+    if legacy_emails {
+        sqlx::query("INSERT INTO emails SELECT * FROM emails_legacy")
+            .execute(&mut *migration).await?;
+        sqlx::query("DROP TABLE emails_legacy")
+            .execute(&mut *migration).await?;
+    }
+    migration.commit().await?;
 
     sqlx::query(
         r#"
@@ -844,6 +855,9 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    let _ = sqlx::query("ALTER TABLE offline_sync_queue ADD COLUMN manual_retry INTEGER NOT NULL DEFAULT 0")
+        .execute(pool).await;
+
     let _ = sqlx::query("ALTER TABLE offline_sync_queue ADD COLUMN uid_validity INTEGER")
         .execute(pool)
         .await;
@@ -914,6 +928,36 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE outbox_mails ADD COLUMN attachments_json TEXT")
         .execute(pool)
         .await;
+
+    let _ = sqlx::query("ALTER TABLE outbox_mails ADD COLUMN queue_id INTEGER")
+        .execute(pool).await;
+    sqlx::raw_sql(r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_queue ON outbox_mails(queue_id);
+        WITH legacy_outbox AS (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS position
+            FROM outbox_mails WHERE queue_id IS NULL
+        ), legacy_queue AS (
+            SELECT q.*, ROW_NUMBER() OVER (ORDER BY q.id) AS position
+            FROM offline_sync_queue AS q
+            WHERE q.action_type = 'send'
+              AND NOT EXISTS (SELECT 1 FROM outbox_mails WHERE queue_id = q.id)
+        )
+        UPDATE outbox_mails AS outbox
+        SET queue_id = q.id, status = q.status, attempt_count = q.attempt_count,
+            last_error = q.last_error, next_retry_at = q.next_retry_at, updated_at = q.updated_at
+        FROM legacy_outbox AS old JOIN legacy_queue AS q ON old.position = q.position
+        WHERE old.id = outbox.id
+          AND (SELECT COUNT(*) FROM legacy_outbox) = (SELECT COUNT(*) FROM legacy_queue);
+
+        CREATE TRIGGER IF NOT EXISTS update_outbox_from_queue
+        AFTER UPDATE OF status ON offline_sync_queue WHEN NEW.action_type = 'send'
+        BEGIN
+            UPDATE outbox_mails
+            SET status = NEW.status, last_error = NEW.last_error, attempt_count = NEW.attempt_count,
+                next_retry_at = NEW.next_retry_at, updated_at = NEW.updated_at
+            WHERE queue_id = NEW.id;
+        END;
+    "#).execute(pool).await?;
 
     sqlx::query(
         r#"
@@ -1045,6 +1089,58 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE local_mail_cache ADD COLUMN labels_json TEXT DEFAULT '[]'")
         .execute(pool)
         .await;
+
+    sqlx::raw_sql(r#"
+        CREATE TABLE IF NOT EXISTS mailbox_list_revision (
+            folder TEXT PRIMARY KEY, revision INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_0
+        AFTER INSERT ON local_mail_cache
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (NEW.folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_1
+        AFTER DELETE ON local_mail_cache
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (OLD.folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_2
+        AFTER UPDATE OF uid, folder, uid_validity, message_id, in_reply_to, references_value, sender_name, sender_address, recipient_to, subject, seen, flagged, date_value, date_ms, size_bytes, importance_value, content_type, category, labels_json ON local_mail_cache
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (NEW.folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_3
+        AFTER UPDATE OF folder ON local_mail_cache WHEN NEW.folder IS NOT OLD.folder
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (OLD.folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_4
+        AFTER INSERT ON offline_sync_queue WHEN NEW.action_type IN ('move', 'delete') AND NEW.target_folder IS NOT NULL
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (NEW.target_folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_5
+        AFTER UPDATE OF status ON offline_sync_queue WHEN NEW.action_type IN ('move', 'delete') AND NEW.target_folder IS NOT NULL AND NEW.status IS NOT OLD.status
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (NEW.target_folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS mailbox_revision_6
+        AFTER DELETE ON offline_sync_queue WHEN OLD.action_type IN ('move', 'delete') AND OLD.target_folder IS NOT NULL
+        BEGIN
+            INSERT INTO mailbox_list_revision(folder, revision) VALUES (OLD.target_folder, 1)
+            ON CONFLICT(folder) DO UPDATE SET revision = revision + 1;
+        END;
+        CREATE TABLE IF NOT EXISTS remote_draft_writes (
+            tracking_key TEXT PRIMARY KEY,
+            folder TEXT NOT NULL
+        );
+    "#).execute(pool).await?;
 
     sqlx::query(
         r#"
@@ -1316,6 +1412,62 @@ pub async fn set_backend_pref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn existing_email_rows_migrate_to_mailbox_and_generation_scoped_uids() {
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        let new_schema: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'emails'")
+            .fetch_one(&pool).await.unwrap();
+        let old_schema = new_schema.replace("server_uid    INTEGER,", "server_uid    INTEGER UNIQUE,")
+            .replace(",\n            UNIQUE(folder_id, uid_validity, server_uid)", "");
+        sqlx::query("DROP TABLE emails").execute(&pool).await.unwrap();
+        sqlx::query(&old_schema).execute(&pool).await.unwrap();
+
+        let insert = "INSERT INTO emails (server_uid, uid_validity, sender_from, recipient_to, date_sent, folder_id)
+                      VALUES (42, ?, 'from', 'to', '2026-01-01', ?)";
+        sqlx::query(insert).bind(7).bind(9).execute(&pool).await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        sqlx::query(insert).bind(7).bind(10).execute(&pool).await.unwrap();
+        sqlx::query(insert).bind(8).bind(9).execute(&pool).await.unwrap();
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT server_uid, uid_validity, folder_id FROM emails ORDER BY local_id",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, [(42, 7, 9), (42, 7, 10), (42, 8, 9)]);
+    }
+
+    #[tokio::test]
+    async fn cache_revisions_follow_visible_changes_and_existing_outbox_tracks_queue() {
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        for query in [
+            "INSERT INTO local_mail_cache (uid, folder) VALUES ('42', 'INBOX')",
+            "UPDATE local_mail_cache SET html_body = 'body' WHERE uid = '42'",
+        ] {
+            sqlx::query(query).execute(&pool).await.unwrap();
+        }
+        let revision = "SELECT revision FROM mailbox_list_revision WHERE folder = 'INBOX'";
+        assert_eq!(sqlx::query_scalar::<_, i64>(revision).fetch_one(&pool).await.unwrap(), 1);
+        sqlx::query("UPDATE local_mail_cache SET seen = 1 WHERE uid = '42'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>(revision).fetch_one(&pool).await.unwrap(), 2);
+
+        sqlx::query("INSERT INTO offline_sync_queue (action_type, status, last_error) VALUES ('send', 'failed', 'SMTP unavailable')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO outbox_mails (status) VALUES ('pending')")
+            .execute(&pool).await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        let tracked: (i64, String, String) = sqlx::query_as("SELECT queue_id, status, last_error FROM outbox_mails")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(tracked, (1, "failed".into(), "SMTP unavailable".into()));
+        sqlx::query("UPDATE offline_sync_queue SET status = 'done', last_error = NULL WHERE id = 1")
+            .execute(&pool).await.unwrap();
+        let tracked: (String, Option<String>) = sqlx::query_as("SELECT status, last_error FROM outbox_mails")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(tracked, ("done".into(), None));
+    }
 
     #[tokio::test]
     async fn legacy_sqlcipher_queue_keeps_unknown_uid_validity_after_reopening() {

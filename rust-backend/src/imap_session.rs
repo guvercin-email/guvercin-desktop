@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    io::{Read, Write},
+    collections::{HashMap, VecDeque},
+    io::{self, BufRead, BufReader, Read, Write},
     net::TcpStream,
     sync::{Arc, Mutex},
 };
@@ -38,8 +38,10 @@ fn parse_threading_headers(headers: &[mailparse::MailHeader<'_>]) -> (String, St
     (message_id, in_reply_to, references)
 }
 
+type SharedSession = Arc<Mutex<ImapSession>>;
+
 pub struct ImapState {
-    sessions: Mutex<HashMap<i64, ImapSession>>,
+    sessions: Mutex<HashMap<i64, SharedSession>>,
 }
 
 impl ImapState {
@@ -48,11 +50,122 @@ impl ImapState {
             sessions: Mutex::new(HashMap::new()),
         }
     }
+
+    fn session(&self, account_id: i64) -> Option<SharedSession> {
+        self.sessions.lock().unwrap().get(&account_id).cloned()
+    }
+
+    fn insert_session(&self, account_id: i64, session: ImapSession) {
+        self.sessions.lock().unwrap().insert(account_id, Arc::new(Mutex::new(session)));
+    }
+
 }
 
-pub enum ImapSession {
-    Plain(imap::Session<TcpStream>),
-    Tls(imap::Session<native_tls::TlsStream<TcpStream>>),
+const UTF8_UID_SEARCH: &str = "UID SEARCH CHARSET UTF-8 ";
+
+/// The IMAP client accepts a complete SEARCH command but provides no API for
+/// synchronizing its literals. Hold only that generated command at the write
+/// boundary so each literal can wait for the server's continuation.
+#[derive(Debug)]
+pub(crate) struct ImapTransport<T> {
+    io: BufReader<T>,
+    search: Vec<u8>,
+    responses: VecDeque<u8>,
+    search_failed: bool,
+}
+
+impl<T: Read + Write> ImapTransport<T> {
+    fn new(io: T) -> Self {
+        Self {
+            io: BufReader::new(io),
+            search: Vec::new(),
+            responses: VecDeque::new(),
+            search_failed: false,
+        }
+    }
+
+    fn flush_search(&mut self, search: &[u8]) -> io::Result<()> {
+        let tag = search.split(|byte| *byte == b' ').next().unwrap_or_default();
+        let mut lines = search.split_inclusive(|byte| *byte == b'\n').peekable();
+        let mut response = Vec::new();
+
+        while let Some(line) = lines.next() {
+            self.io.get_mut().write_all(line)?;
+            self.io.get_mut().flush()?;
+            if lines.peek().is_none() {
+                break;
+            }
+
+            loop {
+                response.clear();
+                self.io.by_ref().take(65_536).read_until(b'\n', &mut response)?;
+                if !response.ends_with(b"\r\n") {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete IMAP literal continuation"));
+                }
+                if response.starts_with(b"+") {
+                    break;
+                }
+
+                // Pass unsolicited responses and any tagged rejection to the
+                // IMAP parser. No literal follows a tagged rejection.
+                if self.responses.len() + response.len() > 1024 * 1024 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Too much IMAP data before the literal continuation"));
+                }
+                self.responses.extend(&response);
+                if response.split(|byte| *byte == b' ').next() == Some(tag)
+                    || response.starts_with(b"* BYE")
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: Read> Read for ImapTransport<T> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.responses.is_empty() {
+            self.io.read(output)
+        } else {
+            self.responses.read(output)
+        }
+    }
+}
+
+impl<T: Read + Write> Write for ImapTransport<T> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.search_failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "IMAP literal exchange was interrupted"));
+        }
+        let mut words = input.splitn(2, |byte| *byte == b' ');
+        let tagged = words.next().and_then(|tag| tag.strip_prefix(b"a"))
+            .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit));
+        let utf8_search = tagged && words.next()
+            .is_some_and(|command| command.starts_with(UTF8_UID_SEARCH.as_bytes()));
+        if !self.search.is_empty() || utf8_search {
+            self.search.extend_from_slice(input);
+            Ok(input.len())
+        } else {
+            self.io.get_mut().write(input)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.search.is_empty() {
+            self.io.get_mut().flush()
+        } else {
+            let search = std::mem::take(&mut self.search);
+            let result = self.flush_search(&search);
+            self.search_failed = result.is_err();
+            result
+        }
+    }
+}
+
+enum ImapSession {
+    Plain(imap::Session<ImapTransport<TcpStream>>),
+    Tls(imap::Session<ImapTransport<native_tls::TlsStream<TcpStream>>>),
 }
 
 pub struct MoveError {
@@ -156,8 +269,15 @@ impl ImapSession {
                     let mut selectable = true;
                     for attr in n.attributes() {
                         match attr {
-                            imap::types::NameAttribute::NoSelect => selectable = false,
-                            imap::types::NameAttribute::Custom(value)
+                            imap_proto::NameAttribute::NoSelect => selectable = false,
+                            imap_proto::NameAttribute::All => role = Some("all".to_owned()),
+                            imap_proto::NameAttribute::Archive => role = Some("archive".to_owned()),
+                            imap_proto::NameAttribute::Drafts => role = Some("drafts".to_owned()),
+                            imap_proto::NameAttribute::Flagged => role = Some("flagged".to_owned()),
+                            imap_proto::NameAttribute::Junk => role = Some("junk".to_owned()),
+                            imap_proto::NameAttribute::Sent => role = Some("sent".to_owned()),
+                            imap_proto::NameAttribute::Trash => role = Some("trash".to_owned()),
+                            imap_proto::NameAttribute::Extension(value)
                                 if role.is_none() => {
                                     role = special_use_role(value);
                                 }
@@ -342,13 +462,7 @@ impl ImapSession {
 
     fn uid_store_keyword(&mut self, uid: &str, keyword: &str, add: bool) -> Result<(), String> {
         let keyword = keyword.trim();
-        if keyword.is_empty() {
-            return Err("Label keyword cannot be empty".to_string());
-        }
-
-        if keyword.chars().any(|ch| {
-            ch.is_whitespace() || matches!(ch, '(' | ')' | '{' | '%' | '*' | '"' | '\\' | ']')
-        }) {
+        if !is_imap_keyword(keyword) {
             return Err(format!(
                 "Label \"{keyword}\" contains characters not supported by IMAP keywords"
             ));
@@ -540,6 +654,66 @@ mod threading_header_tests {
     }
 }
 
+pub(crate) fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+    use std::{net::ToSocketAddrs, time::Duration};
+
+    let timeout = Duration::from_secs(15);
+    let addresses = (host, port).to_socket_addrs().map_err(|e| e.to_string())?;
+    let mut last_error = "IMAP host has no addresses".to_string();
+    for addr in addresses {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+                stream.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(last_error)
+}
+
+pub(crate) fn connect_tls(
+    host: &str,
+    port: u16,
+    tls: &TlsConnector,
+    starttls: bool,
+) -> Result<imap::Client<ImapTransport<native_tls::TlsStream<TcpStream>>>, String> {
+    let stream = connect_tcp(host, port)?;
+    if starttls {
+        let mut client = imap::Client::new(stream);
+        client.read_greeting().map_err(|e| e.to_string())?;
+        let mut stream = client.into_inner().map_err(|e| e.to_string())?;
+        stream.write_all(b"guv-starttls STARTTLS\r\n").map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(&mut stream);
+        let mut response = Vec::new();
+        loop {
+            response.clear();
+            let length = reader.by_ref().take(65_536).read_until(b'\n', &mut response)
+                .map_err(|e| e.to_string())?;
+            if length == 0 || !response.ends_with(b"\r\n") {
+                return Err("Incomplete IMAP STARTTLS response".into());
+            }
+            if response.starts_with(b"* ") && !response.starts_with(b"* BYE") {
+                continue;
+            }
+            let mut words = response.split(|byte| byte.is_ascii_whitespace());
+            if words.next() == Some(b"guv-starttls")
+                && words.next().is_some_and(|status| status.eq_ignore_ascii_case(b"OK"))
+            {
+                break;
+            }
+            return Err("IMAP server declined STARTTLS".into());
+        }
+        let mut client = imap::Client::new(ImapTransport::new(tls.connect(host, stream).map_err(|e| e.to_string())?));
+        client.greeting_read = true;
+        return Ok(client);
+    }
+    let mut client = imap::Client::new(ImapTransport::new(tls.connect(host, stream).map_err(|e| e.to_string())?));
+    client.read_greeting().map_err(|e| e.to_string())?;
+    Ok(client)
+}
+
 pub fn connect_and_login(
     state: &Arc<ImapState>,
     account_id: i64,
@@ -549,37 +723,26 @@ pub fn connect_and_login(
     imap_port: u16,
     ssl_mode: &str,
 ) -> Result<(), String> {
-    let mut builder = TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
-    let tls = builder.build().map_err(|e| format!("{e}"))?;
+    let tls = TlsConnector::new().map_err(|e| format!("{e}"))?;
 
     let session = match ssl_mode.to_uppercase().as_str() {
         "SSL" => {
-            let client = imap::connect((imap_host, imap_port), imap_host, &tls)
-                .map_err(|e| format!("{e}"))?;
+            let client = connect_tls(imap_host, imap_port, &tls, false)?;
             let s = client
                 .login(email, password)
                 .map_err(|(e, _)| format!("{e}"))?;
             ImapSession::Tls(s)
         }
         "STARTTLS" => {
-            let client = imap::connect_starttls((imap_host, imap_port), imap_host, &tls)
-                .map_err(|e| format!("{e}"))?;
+            let client = connect_tls(imap_host, imap_port, &tls, true)?;
             let s = client
                 .login(email, password)
                 .map_err(|(e, _)| format!("{e}"))?;
             ImapSession::Tls(s)
         }
         _ => {
-            let tcp = TcpStream::connect((imap_host, imap_port)).map_err(|e| format!("{e}"))?;
-
-            tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .ok();
-            tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))
-                .ok();
-
-            let mut client = imap::Client::new(tcp);
+            let tcp = connect_tcp(imap_host, imap_port)?;
+            let mut client = imap::Client::new(ImapTransport::new(tcp));
             client.read_greeting().map_err(|e| format!("{e}"))?;
             let s = client
                 .login(email, password)
@@ -588,7 +751,7 @@ pub fn connect_and_login(
         }
     };
 
-    state.sessions.lock().unwrap().insert(account_id, session);
+    state.insert_session(account_id, session);
     info!("IMAP session opened for account {account_id}");
     Ok(())
 }
@@ -604,10 +767,7 @@ pub fn connect_and_login_xoauth2(
     imap_port: u16,
     ssl_mode: &str,
 ) -> Result<(), String> {
-    let mut builder = TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
-    let tls = builder.build().map_err(|e| format!("{e}"))?;
+    let tls = TlsConnector::new().map_err(|e| format!("{e}"))?;
 
     let auth = crate::imap_client::XOAuth2 {
         user: email.to_string(),
@@ -616,16 +776,14 @@ pub fn connect_and_login_xoauth2(
 
     let session = match ssl_mode.to_uppercase().as_str() {
         "STARTTLS" => {
-            let client = imap::connect_starttls((imap_host, imap_port), imap_host, &tls)
-                .map_err(|e| format!("{e}"))?;
+            let client = connect_tls(imap_host, imap_port, &tls, true)?;
             let s = client
                 .authenticate("XOAUTH2", &auth)
                 .map_err(|(e, _)| format!("{e}"))?;
             ImapSession::Tls(s)
         }
         _ => {
-            let client = imap::connect((imap_host, imap_port), imap_host, &tls)
-                .map_err(|e| format!("{e}"))?;
+            let client = connect_tls(imap_host, imap_port, &tls, false)?;
             let s = client
                 .authenticate("XOAUTH2", &auth)
                 .map_err(|(e, _)| format!("{e}"))?;
@@ -633,7 +791,7 @@ pub fn connect_and_login_xoauth2(
         }
     };
 
-    state.sessions.lock().unwrap().insert(account_id, session);
+    state.insert_session(account_id, session);
     info!("IMAP XOAUTH2 session opened for account {account_id}");
     Ok(())
 }
@@ -676,9 +834,8 @@ fn special_use_role(attr: &str) -> Option<String> {
 }
 
 pub fn list_mailboxes(state: &Arc<ImapState>, account_id: i64) -> Vec<String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    match sessions.get_mut(&account_id) {
-        Some(s) => s.list_mailboxes(),
+    match state.session(account_id) {
+        Some(session) => session.lock().unwrap().list_mailboxes(),
         None => {
             warn!("No IMAP session for account {account_id}");
             vec![]
@@ -687,9 +844,8 @@ pub fn list_mailboxes(state: &Arc<ImapState>, account_id: i64) -> Vec<String> {
 }
 
 pub fn list_mailboxes_detailed(state: &Arc<ImapState>, account_id: i64) -> Vec<MailboxEntry> {
-    let mut sessions = state.sessions.lock().unwrap();
-    match sessions.get_mut(&account_id) {
-        Some(s) => s.list_mailboxes_detailed(),
+    match state.session(account_id) {
+        Some(session) => session.lock().unwrap().list_mailboxes_detailed(),
         None => {
             warn!("No IMAP session for account {account_id}");
             vec![]
@@ -711,8 +867,8 @@ pub fn fetch_mail_list(
     per_page: usize,
     expected_generation: Option<u32>,
 ) -> Result<MailboxPage, String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&account_id).ok_or("No IMAP session")?;
+    let shared = state.session(account_id).ok_or("No IMAP session")?;
+    let mut session = shared.lock().unwrap();
     let selected = session.select_mailbox_info(mailbox)?;
     let generation = selected.uid_validity.filter(|value| *value > 0)
         .ok_or("Mailbox UIDVALIDITY is unavailable")?;
@@ -789,6 +945,15 @@ fn format_imap_date(date: NaiveDate) -> String {
     format!("{:02}-{month}-{}", date.day(), date.year())
 }
 
+fn imap_search_string(value: &str) -> String {
+    let value = value.replace(['\r', '\n', '\0'], " ");
+    if value.is_ascii() {
+        quote_imap_string(&value)
+    } else {
+        format!("{{{}}}\r\n{value}", value.len())
+    }
+}
+
 pub fn build_imap_advanced_query(req: &AdvancedSearchRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -807,19 +972,19 @@ pub fn build_imap_advanced_query(req: &AdvancedSearchRequest) -> String {
         .filter(|v| !v.is_empty());
 
     if let Some(value) = from {
-        parts.push(format!("FROM {}", quote_imap_string(value)));
+        parts.push(format!("FROM {}", imap_search_string(value)));
     }
     if let Some(value) = to {
-        parts.push(format!("TO {}", quote_imap_string(value)));
+        parts.push(format!("TO {}", imap_search_string(value)));
     }
     if let Some(value) = cc {
-        parts.push(format!("CC {}", quote_imap_string(value)));
+        parts.push(format!("CC {}", imap_search_string(value)));
     }
     if let Some(value) = subject {
-        parts.push(format!("SUBJECT {}", quote_imap_string(value)));
+        parts.push(format!("SUBJECT {}", imap_search_string(value)));
     }
     if let Some(value) = keywords {
-        parts.push(format!("TEXT {}", quote_imap_string(value)));
+        parts.push(format!("TEXT {}", imap_search_string(value)));
     }
 
     if let Some(start) = req
@@ -868,12 +1033,15 @@ pub fn advanced_search(
     account_id: i64,
     req: &AdvancedSearchRequest,
 ) -> Result<Vec<MailSearchPreview>, String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get_mut(&account_id)
+    let shared = state.session(account_id)
         .ok_or_else(|| format!("No IMAP session for account {account_id}"))?;
+    let mut session = shared.lock().unwrap();
 
-    let query = build_imap_advanced_query(req);
+    let mut query = build_imap_advanced_query(req);
+    let unicode = !query.is_ascii();
+    if unicode {
+        query.insert_str(0, "CHARSET UTF-8 ");
+    }
 
     let mut mailboxes: Vec<String> = match req.scope {
         SearchScope::All => session.list_mailboxes(),
@@ -883,7 +1051,7 @@ pub fn advanced_search(
     let mut seen = std::collections::HashSet::new();
     mailboxes.retain(|value| {
         if value.is_empty()
-            || matches!(value.to_ascii_lowercase().as_str(), "folders" | "labels" | "[labels]")
+            || matches!(value.to_ascii_lowercase().as_str(), "folders" | "labels" | "etiketler" | "[labels]")
         {
             return false;
         }
@@ -903,6 +1071,7 @@ pub fn advanced_search(
             Ok(v) => v,
             Err(e) => {
                 warn!("advanced_search UID SEARCH error (mailbox={mailbox}): {e}");
+                if unicode { return Err(e); }
                 continue;
             }
         };
@@ -972,8 +1141,8 @@ pub fn fetch_mail_raw_with_validity(
     uid: &str,
     expected_validity: Option<u32>,
 ) -> Option<(Vec<u8>, Option<u32>)> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&account_id)?;
+    let shared = state.session(account_id)?;
+    let mut session = shared.lock().unwrap();
     let selected = session.select_mailbox_info(mailbox).ok()?;
     if expected_validity.is_some_and(|expected| expected == 0 || selected.uid_validity != Some(expected)) {
         return None;
@@ -987,8 +1156,8 @@ pub fn fetch_new_uids_since(
     mailbox: &str,
     checkpoint: (u32, u32),
 ) -> Result<(u32, u32, Vec<u32>), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&account_id).ok_or("No IMAP session")?;
+    let shared = state.session(account_id).ok_or("No IMAP session")?;
+    let mut session = shared.lock().unwrap();
     let selected = session.select_mailbox_info(mailbox)?;
     let generation = selected.uid_validity.filter(|value| *value > 0)
         .ok_or("Mailbox UIDVALIDITY is unavailable")?;
@@ -1011,11 +1180,10 @@ pub fn fetch_headers_for_uids(
     if uids.is_empty() {
         return vec![];
     }
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = match sessions.get_mut(&account_id) {
-        Some(s) => s,
-        None => return vec![],
+    let Some(shared) = state.session(account_id) else {
+        return vec![];
     };
+    let mut session = shared.lock().unwrap();
 
     let selected = match session.select_mailbox_info(mailbox) {
         Ok(selected) => selected,
@@ -1068,9 +1236,9 @@ pub fn find_attachment_bytes(
 }
 
 pub fn disconnect(state: &Arc<ImapState>, account_id: i64) {
-    let mut sessions = state.sessions.lock().unwrap();
-    if let Some(mut s) = sessions.remove(&account_id) {
-        match &mut s {
+    let removed = state.sessions.lock().unwrap().remove(&account_id);
+    if let Some(session) = removed {
+        match &mut *session.lock().unwrap() {
             ImapSession::Plain(sess) => {
                 let _ = sess.logout();
             }
@@ -1082,28 +1250,34 @@ pub fn disconnect(state: &Arc<ImapState>, account_id: i64) {
     }
 }
 
-pub fn is_connected(state: &Arc<ImapState>, account_id: i64) -> bool {
-    let mut sessions = state.sessions.lock().unwrap();
-    let health = match sessions.get_mut(&account_id) {
-        Some(session) => session.noop(),
-        None => return false,
-    };
+pub fn has_session(state: &Arc<ImapState>, account_id: i64) -> bool {
+    // The map lock only protects membership. Network I/O holds the account's
+    // own session lock so polling and operations on other accounts can proceed.
+    state.sessions.lock().unwrap().contains_key(&account_id)
+}
 
-    if let Err(err) = health {
+pub fn is_connected(state: &Arc<ImapState>, account_id: i64) -> bool {
+    let Some(shared) = state.session(account_id) else {
+        return false;
+    };
+    let mut session = shared.lock().unwrap();
+    if let Err(err) = session.noop() {
         warn!("IMAP session unhealthy for account {account_id}: {err}");
-        sessions.remove(&account_id);
+        let mut sessions = state.sessions.lock().unwrap();
+        if sessions.get(&account_id).is_some_and(|current| Arc::ptr_eq(current, &shared)) {
+            sessions.remove(&account_id);
+        }
         return false;
     }
-
     true
 }
 
-pub enum QueuedMailAction<'a> {
+pub enum QueuedMailAction {
     Seen(bool),
     Answered,
     Forwarded,
-    Label(&'a str, bool),
-    Move(&'a str),
+    Label(String, bool),
+    Move(String),
     Delete,
 }
 
@@ -1129,9 +1303,9 @@ fn with_queued_mailbox<T>(
         message: "Queued message has no UIDVALIDITY. Refresh the folder and repeat the action.".into(),
         retryable: false,
     })?;
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&account_id)
+    let shared = state.session(account_id)
         .ok_or_else(|| format!("No IMAP session for account {account_id}"))?;
+    let mut session = shared.lock().unwrap();
     let selected = session.select_mailbox_info(mailbox)?;
     if selected.uid_validity != Some(expected) {
         return Err(QueuedMailError {
@@ -1139,7 +1313,7 @@ fn with_queued_mailbox<T>(
             retryable: false,
         });
     }
-    action(session)
+    action(&mut session)
 }
 
 pub fn apply_queued_mail_action(
@@ -1148,15 +1322,15 @@ pub fn apply_queued_mail_action(
     mailbox: &str,
     uid: &str,
     expected_validity: Option<u32>,
-    action: QueuedMailAction<'_>,
+    action: QueuedMailAction,
 ) -> Result<(), QueuedMailError> {
     with_queued_mailbox(state, account_id, mailbox, expected_validity, |session| {
         match action {
             QueuedMailAction::Seen(seen) => session.uid_store_flag(uid, "\\Seen", seen)?,
             QueuedMailAction::Answered => session.uid_store_flag(uid, "\\Answered", true)?,
             QueuedMailAction::Forwarded => session.uid_store_keyword(uid, "$Forwarded", true)?,
-            QueuedMailAction::Label(label, add) => set_selected_mailbox_label(session, uid, label, add)?,
-            QueuedMailAction::Move(destination) => session.uid_move_to(uid, destination).map_err(|error| {
+            QueuedMailAction::Label(label, add) => set_selected_mailbox_label(session, mailbox, uid, label.trim(), add)?,
+            QueuedMailAction::Move(destination) => session.uid_move_to(uid, &destination).map_err(|error| {
                 QueuedMailError { message: error.message, retryable: !error.outcome_uncertain }
             })?,
             QueuedMailAction::Delete => session.uid_delete(uid)?,
@@ -1178,36 +1352,81 @@ pub fn fetch_queued_mail_raw(
     })
 }
 
+fn is_imap_keyword(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| {
+        byte.is_ascii_graphic() && !matches!(byte, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')
+    })
+}
+
+fn uid_message_id(session: &mut ImapSession, uid: &str) -> Result<Option<String>, String> {
+    const QUERY: &str = "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])";
+    let fetches = match session {
+        ImapSession::Plain(session) => session.uid_fetch(uid, QUERY),
+        ImapSession::Tls(session) => session.uid_fetch(uid, QUERY),
+    }.map_err(|error| error.to_string())?;
+    let expected_uid = uid.parse::<u32>().ok();
+    let header = fetches.iter().find(|fetch| fetch.uid.is_some() && fetch.uid == expected_uid)
+        .and_then(|fetch| fetch.header());
+    Ok(header.and_then(|header| parse_headers(header).ok())
+        .and_then(|(headers, _)| headers.get_first_value("Message-ID"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
 fn set_selected_mailbox_label(
     session: &mut ImapSession,
+    mailbox: &str,
     uid: &str,
     label: &str,
     add: bool,
-) -> Result<(), String> {
-    session.uid_store_keyword(uid, label, add)?;
+) -> Result<(), QueuedMailError> {
+    let mailboxes = session.list_mailboxes();
+    let folder = ["Labels", "Etiketler", "[Labels]"].into_iter().find_map(|root| {
+        let candidate = format!("{root}/{label}");
+        mailboxes.iter().find(|mailbox| mailbox.eq_ignore_ascii_case(&candidate))
+    });
 
-    if add {
-        let label_folders = ["Labels", "Labels", "[Labels]"];
-        let mut target_folder = None;
-        let mailboxes = session.list_mailboxes();
+    if is_imap_keyword(label) || folder.is_none() {
+        session.uid_store_keyword(uid, label, add)?;
+    }
 
-        for root in label_folders {
-            let candidate = format!("{}/{}", root, label);
-            if mailboxes.iter().any(|m| m.eq_ignore_ascii_case(&candidate)) {
-                target_folder = Some(candidate);
-                break;
+    if let Some(folder) = folder {
+        if add && folder != mailbox {
+            let wire_folder = quote_imap_string(&crate::imap_utf7::encode(folder));
+            match session {
+                ImapSession::Plain(session) => session.uid_copy(uid, &wire_folder),
+                ImapSession::Tls(session) => session.uid_copy(uid, &wire_folder),
+            }.map_err(|error| {
+                let error = MoveError::after_mutation(error);
+                QueuedMailError {
+                    message: format!("Could not copy message to label folder: {}", error.message),
+                    retryable: !error.outcome_uncertain,
+                }
+            })?;
+        } else if !add && folder == mailbox {
+            session.uid_delete(uid)?;
+        } else if !add {
+            let message_id = uid_message_id(session, uid)?
+                .ok_or_else(|| "Cannot identify the copy in the label folder without a Message-ID".to_string())?;
+            session.select_mailbox_info(folder)?;
+            let matches = session.uid_search_query(&format!(
+                "HEADER Message-ID {}", quote_imap_string(&message_id),
+            ))?;
+            let mut exact_uid = None;
+            for candidate in matches {
+                let candidate = candidate.to_string();
+                if uid_message_id(session, &candidate)?.as_deref() == Some(&message_id) {
+                    if exact_uid.is_some() {
+                        return Err("Multiple copies match the label. Remove the intended copy directly from its folder.".to_string().into());
+                    }
+                    exact_uid = Some(candidate);
+                }
+            }
+            if let Some(candidate) = exact_uid {
+                session.uid_delete(&candidate)?;
             }
         }
-
-        if let Some(folder) = target_folder {
-            let folder = crate::imap_utf7::encode(&folder);
-            let _ = match session {
-                ImapSession::Plain(s) => s.uid_copy(uid, &folder),
-                ImapSession::Tls(s) => s.uid_copy(uid, &folder),
-            };
-        }
-    } 
-
+    }
     Ok(())
 }
 
@@ -1216,16 +1435,21 @@ pub fn create_mailbox(
     account_id: i64,
     mailbox: &str,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get_mut(&account_id)
+    let shared = state.session(account_id)
         .ok_or_else(|| format!("No IMAP session for account {account_id}"))?;
+    let mut session = shared.lock().unwrap();
     let mailbox = crate::imap_utf7::encode(mailbox);
-    let result = match session {
+    let result = match &mut *session {
         ImapSession::Plain(s) => s.create(&mailbox),
         ImapSession::Tls(s) => s.create(&mailbox),
     };
     result.map(|_| ()).map_err(|e| format!("{e}"))
+}
+
+#[derive(Debug)]
+pub struct DraftAppendError {
+    pub message: String,
+    pub may_exist: bool,
 }
 
 pub fn append_draft(
@@ -1234,32 +1458,46 @@ pub fn append_draft(
     mailbox: &str,
     raw: &[u8],
     tracking_key: &str,
-) -> Result<(String, u32), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions
-        .get_mut(&account_id)
-        .ok_or_else(|| format!("No IMAP session for account {account_id}"))?;
+    append_new: bool,
+) -> Result<(String, u32), DraftAppendError> {
+    let shared = state.session(account_id).ok_or_else(|| DraftAppendError {
+        message: format!("No IMAP session for account {account_id}"),
+        may_exist: !append_new,
+    })?;
+    let mut session = shared.lock().unwrap();
 
-    let flags = [imap::types::Flag::Draft, imap::types::Flag::Seen];
-    let wire_mailbox = crate::imap_utf7::encode(mailbox);
-    let append_result = match session {
-        ImapSession::Plain(s) => s.append_with_flags(&wire_mailbox, raw, &flags),
-        ImapSession::Tls(s) => s.append_with_flags(&wire_mailbox, raw, &flags),
-    };
-    append_result.map_err(|e| format!("{e}"))?;
-
-    let generation = session.select_mailbox_info(mailbox)?.uid_validity
-        .filter(|value| *value > 0)
-        .ok_or("Draft was appended but the mailbox UIDVALIDITY is unavailable")?;
-    let query = format!(
-        "HEADER X-GUVERCIN-DRAFT-KEY {}",
-        quote_imap_string(tracking_key),
-    );
-    let tracked_uids = session.uid_search_query(&query)?;
-    match tracked_uids.as_slice() {
-        [uid] => Ok((uid.to_string(), generation)),
-        _ => Err("Draft was appended but its UID could not be identified".to_string()),
+    if append_new {
+        let flags = [imap::types::Flag::Draft, imap::types::Flag::Seen];
+        let encoded = crate::imap_utf7::encode(mailbox);
+        let quoted = quote_imap_string(&encoded);
+        let wire_mailbox = &quoted[1..quoted.len() - 1];
+        let appended = match &mut *session {
+            ImapSession::Plain(s) => s.append(wire_mailbox, raw).flags(flags).finish(),
+            ImapSession::Tls(s) => s.append(wire_mailbox, raw).flags(flags).finish(),
+        }.map_err(|error| DraftAppendError {
+            may_exist: !matches!(error, imap::Error::No(_) | imap::Error::Bad(_) | imap::Error::Append),
+            message: error.to_string(),
+        })?;
+        if let (Some(generation), Some([imap_proto::UidSetMember::Uid(uid)])) =
+            (appended.uid_validity, appended.uids.as_deref())
+        {
+            if generation > 0 && *uid > 0 {
+                return Ok((uid.to_string(), generation));
+            }
+        }
     }
+
+    let mut lookup = || {
+        let generation = session.select_mailbox_info(mailbox)?.uid_validity
+            .filter(|value| *value > 0)
+            .ok_or("Mailbox UIDVALIDITY is unavailable")?;
+        let query = format!("HEADER X-GUVERCIN-DRAFT-KEY {}", quote_imap_string(tracking_key));
+        match session.uid_search_query(&query)?.as_slice() {
+            [uid] => Ok((uid.to_string(), generation)),
+            _ => Err("A unique draft UID is not yet available".to_owned()),
+        }
+    };
+    lookup().map_err(|message| DraftAppendError { message, may_exist: true })
 }
 
 fn build_mail_content(uid: String, parsed: &ParsedMail) -> MailContent {
@@ -1643,7 +1881,7 @@ mod tests {
     fn rejected_mailbox_selection_stops_the_header_fetch() {
         let commands = record_imap_commands("UIDPLUS", Some("SELECT"), |session| {
             let state = std::sync::Arc::new(super::ImapState::new());
-            state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+            state.insert_session(1, super::ImapSession::Plain(session));
             assert!(super::fetch_headers_for_uids(&state, 1, "Missing folder", &[42], 7).is_empty());
         });
         assert_eq!(commands, ["SELECT \"Missing folder\""]);
@@ -1665,7 +1903,7 @@ mod tests {
         use super::{apply_queued_mail_action, ImapSession, ImapState, QueuedMailAction};
         let commands = record_imap_commands("UIDPLUS", None, |session| {
             let state = std::sync::Arc::new(ImapState::new());
-            state.sessions.lock().unwrap().insert(1, ImapSession::Plain(session));
+            state.insert_session(1, ImapSession::Plain(session));
             for stale in [None, Some(6)] {
                 let error = apply_queued_mail_action(
                     &state, 1, "INBOX", "42", stale, QueuedMailAction::Delete,
@@ -1688,7 +1926,7 @@ mod tests {
     fn replaced_generation_searches_below_the_old_checkpoint() {
         let commands = record_imap_commands("UIDPLUS", None, |session| {
             let state = std::sync::Arc::new(super::ImapState::new());
-            state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+            state.insert_session(1, super::ImapSession::Plain(session));
             assert_eq!(
                 super::fetch_new_uids_since(&state, 1, "INBOX", (900, 6)).unwrap(),
                 (7, 0, vec![42, 41]),
@@ -1731,7 +1969,7 @@ mod tests {
 
                 let db = Arc::new(db::AppState::initialize(Some(dir.clone())).await.unwrap());
                 let imap = Arc::new(super::ImapState::new());
-                imap.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+                imap.insert_session(1, super::ImapSession::Plain(session));
                 let state = Arc::new(MailAppState {
                     _db: db.clone(),
                     imap,
@@ -1840,15 +2078,83 @@ mod tests {
     }
 
     #[test]
+    fn labels_with_spaces_use_a_quoted_folder_and_report_copy_rejection() {
+        for reject in [None, Some("UID COPY")] {
+            let commands = record_imap_commands("UIDPLUS LABEL-FIXTURE", reject, |session| {
+                let state = std::sync::Arc::new(super::ImapState::new());
+                state.insert_session(1, super::ImapSession::Plain(session));
+                let result = super::apply_queued_mail_action(
+                    &state, 1, "INBOX", "42", Some(7),
+                    super::QueuedMailAction::Label("My Label".to_string(), true),
+                );
+                assert_eq!(result.is_err(), reject.is_some());
+            });
+            assert!(commands.iter().any(|command| command == "UID COPY 42 \"Etiketler/My Label\""));
+            assert!(!commands.iter().any(|command| command.starts_with("UID STORE")));
+        }
+    }
+
+    #[test]
+    fn unicode_search_counts_utf8_literal_bytes() {
+        assert_eq!(super::imap_search_string("güvercin"), "{9}\r\ngüvercin");
+        assert_eq!(super::imap_search_string("first\r\nsecond"), "\"first  second\"");
+    }
+
+    #[test]
+    fn unicode_search_waits_for_each_literal_on_a_strict_imap_server() {
+        let commands = record_imap_commands("", None, |session| {
+            let mut session = super::ImapSession::Plain(session);
+            let subject = super::imap_search_string("güvercin");
+            let text = super::imap_search_string("İstanbul");
+            let uids = session.uid_search_query(&format!("CHARSET UTF-8 SUBJECT {subject} TEXT {text}"))
+                .unwrap();
+            assert_eq!(uids, [41, 42]);
+            assert!(session.noop().is_ok());
+        });
+        assert_eq!(commands, [
+            "UID SEARCH CHARSET UTF-8 SUBJECT {9}",
+            "güvercin TEXT {9}",
+            "İstanbul",
+            "NOOP",
+        ]);
+    }
+
+    #[test]
+    fn rejected_search_literal_does_not_send_text_or_break_the_next_command() {
+        let commands = record_imap_commands("", Some(super::UTF8_UID_SEARCH), |session| {
+            let mut session = super::ImapSession::Plain(session);
+            let subject = super::imap_search_string("güvercin");
+            assert!(session.uid_search_query(&format!("CHARSET UTF-8 SUBJECT {subject}")).is_err());
+            assert!(session.noop().is_ok());
+        });
+        assert_eq!(commands, ["UID SEARCH CHARSET UTF-8 SUBJECT {9}", "NOOP"]);
+    }
+
+    #[test]
+    fn saved_draft_uses_appenduid_and_pending_draft_is_never_appended_twice() {
+        let commands = record_imap_commands("UIDPLUS APPENDUID-FIXTURE", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.insert_session(1, super::ImapSession::Plain(session));
+            let raw = b"Subject: Fixture\r\n\r\nDraft body";
+            let created = super::append_draft(&state, 1, "Drafts", raw, "first", true).unwrap();
+            assert_eq!(created, ("77".into(), 12));
+            let recovered = super::append_draft(&state, 1, "Drafts", raw, "unique", false).unwrap();
+            assert_eq!(recovered, ("42".into(), 7));
+        });
+        assert_eq!(commands.iter().filter(|command| command.starts_with("APPEND ")).count(), 1);
+        assert_eq!(commands.iter().filter(|command| command.starts_with("UID SEARCH HEADER ")).count(), 1);
+    }
+
+    #[test]
     fn appended_draft_requires_one_tracking_match_and_carries_its_generation() {
         let commands = record_imap_commands("UIDPLUS", None, |session| {
             let state = std::sync::Arc::new(super::ImapState::new());
-            state.sessions.lock().unwrap().insert(1, super::ImapSession::Plain(session));
+            state.insert_session(1, super::ImapSession::Plain(session));
             let raw = b"Subject: Fixture\r\n\r\nDraft body";
-            let valid = super::append_draft(&state, 1, "Drafts", raw, "unique").unwrap();
+            let valid = super::append_draft(&state, 1, "Drafts", raw, "unique", true).unwrap();
             assert_eq!(valid, ("42".into(), 7));
             for key in ["missing", "ambiguous"] {
-                assert!(super::append_draft(&state, 1, "Drafts", raw, key).is_err());
+                assert!(super::append_draft(&state, 1, "Drafts", raw, key, true).is_err());
             }
         });
         assert_eq!(commands.iter().filter(|command| command.starts_with("APPEND ")).count(), 3);
@@ -1859,7 +2165,7 @@ mod tests {
     fn record_imap_commands(
         capability: &'static str,
         reject_prefix: Option<&'static str>,
-        action: impl FnOnce(imap::Session<std::net::TcpStream>),
+        action: impl FnOnce(imap::Session<super::ImapTransport<std::net::TcpStream>>),
     ) -> Vec<String> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::{TcpListener, TcpStream};
@@ -1897,6 +2203,23 @@ mod tests {
                             write!(stream, "+ ready\r\n").unwrap();
                             let mut literal = vec![0; size + 2];
                             reader.read_exact(&mut literal).unwrap();
+                            if capability.contains("APPENDUID-FIXTURE") {
+                                write!(stream, "{tag} OK [APPENDUID 12 77] saved\r\n").unwrap();
+                                continue;
+                            }
+                        }
+                        if cmd.starts_with(super::UTF8_UID_SEARCH) {
+                            if reject_prefix.is_some_and(|prefix| cmd.starts_with(prefix)) {
+                                write!(stream, "{tag} NO unsupported charset\r\n").unwrap();
+                                continue;
+                            }
+                            for expected in ["güvercin TEXT {9}\r\n", "İstanbul\r\n"] {
+                                write!(stream, "+ continue\r\n").unwrap();
+                                let mut literal_line = String::new();
+                                reader.read_line(&mut literal_line).unwrap();
+                                assert_eq!(literal_line, expected);
+                                commands.push(literal_line.trim_end().to_string());
+                            }
                         }
                         if cmd.starts_with("UID SEARCH ") {
                             let result = if cmd.ends_with("\"unique\"") {
@@ -1920,6 +2243,9 @@ mod tests {
                         }
                         if cmd.starts_with("LIST ") {
                             write!(stream, "* LIST () \"/\" \"INBOX\"\r\n").unwrap();
+                            if capability.contains("LABEL-FIXTURE") {
+                                write!(stream, "* LIST () \"/\" \"Etiketler/My Label\"\r\n").unwrap();
+                            }
                         }
                         if cmd.starts_with("UID FETCH 42 (UID BODY.PEEK[]") {
                             let raw = "Subject: Replacement\r\nFrom: fixture@example.test\r\n\r\nReplacement body\r\n";
@@ -1937,7 +2263,7 @@ mod tests {
         });
         let stream = TcpStream::connect(address).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut client = imap::Client::new(stream);
+        let mut client = imap::Client::new(super::ImapTransport::new(stream));
         client.read_greeting().unwrap();
         let session = client.login("test", "test").unwrap();
         action(session);

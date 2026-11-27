@@ -110,7 +110,7 @@ pub async fn google_mailboxes_preview(Json(body): Json<GooglePreviewBody>) -> im
     .await
     {
         Ok(mailboxes) => {
-            let (folders, labels) = split_mailboxes(&mailboxes);
+            let (folders, labels) = crate::mail_models::split_mailboxes(&mailboxes);
             (
                 StatusCode::OK,
                 Json(json!({ "mailboxes": mailboxes, "folders": folders, "labels": labels })),
@@ -378,18 +378,4 @@ pub async fn google_reconnect(
         Json(json!({ "status": "success", "granted": true })),
     )
         .into_response()
-}
-
-fn split_mailboxes(mailboxes: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut folders = Vec::new();
-    let mut labels = Vec::new();
-    for mailbox in mailboxes {
-        let lower = mailbox.to_lowercase();
-        if lower.starts_with("labels/") || lower.starts_with("[labels]/") {
-            labels.push(mailbox.clone());
-        } else {
-            folders.push(mailbox.clone());
-        }
-    }
-    (folders, labels)
 }
