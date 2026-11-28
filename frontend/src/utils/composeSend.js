@@ -106,8 +106,9 @@ export async function queueComposeSend({
       throw new Error('Please add at least one recipient.')
     }
 
-    if (forwardCount !== 1) {
-      throw new Error('Forward supports only one message at a time.')
+    if (forwardCount > 1 &&
+        (typeof confirm !== 'function' || !(await confirm(normalized, { type: 'forward_many', count: forwardCount })))) {
+      return false
     }
 
     const forwardOptions = normalized.forwardOptions || { subjectPrefix: 'Fwd:', forwardStyle: 'copy' }
@@ -124,6 +125,15 @@ export async function queueComposeSend({
       attachments: recipientsPayload.attachments,
     }
 
+    if (forwardCount > 1) {
+      await queueAction('forward_many', null, {
+        ...forwardPayload,
+        targets: normalized.forwardTargets.map(({ uid, mailbox, uidValidity }) => ({
+          uid, mailbox, uid_validity: uidValidity,
+        })),
+      })
+      return true
+    }
     const target = normalized.forwardTargets[0]
     await queueAction('forward', target.uid, forwardPayload, target.mailbox, target.uidValidity ?? 0)
     return true

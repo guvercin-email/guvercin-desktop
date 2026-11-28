@@ -603,6 +603,7 @@ async fn open_compose_window(
     WebviewUrl::App(PathBuf::from("index.html")),
   )
   .title("guvercin - Compose")
+  .disable_drag_drop_handler()
   .initialization_script(init_script)
   .visible(true)
   .inner_size(800.0, 650.0)
@@ -1207,10 +1208,13 @@ pub fn run() {
 
         let show_i = MenuItem::with_id(app, "show", "Show guvercin", true, None::<&str>)?;
         let compose_i = MenuItem::with_id(app, "compose", "New Mail", true, None::<&str>)?;
+        let reply_i = MenuItem::with_id(app, "quick-reply", "Quick Reply", true, None::<&str>)?;
+        let calendar_i = MenuItem::with_id(app, "calendar", "Calendar", true, None::<&str>)?;
+        let tasks_i = MenuItem::with_id(app, "tasks", "Tasks", true, None::<&str>)?;
         let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
         let sep = PredefinedMenuItem::separator(app)?;
         let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-        let menu = Menu::with_items(app, &[&show_i, &compose_i, &settings_i, &sep, &quit_i])?;
+        let menu = Menu::with_items(app, &[&show_i, &compose_i, &reply_i, &calendar_i, &tasks_i, &settings_i, &sep, &quit_i])?;
 
         let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
           .tooltip("guvercin")
@@ -1221,6 +1225,18 @@ pub fn run() {
             "compose" => {
               show_main_window(app);
               let _ = app.emit("tray://new-mail", ());
+            }
+            "quick-reply" => {
+              show_main_window(app);
+              let _ = app.emit("tray://quick-reply", ());
+            }
+            "calendar" => {
+              show_main_window(app);
+              let _ = app.emit("tray://workspace", "calendar");
+            }
+            "tasks" => {
+              show_main_window(app);
+              let _ = app.emit("tray://workspace", "todo");
             }
             "settings" => {
               show_main_window(app);

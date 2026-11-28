@@ -1,18 +1,9 @@
-//! Master key storage.
-//!
-//! The 256-bit master key is written to a file in the user's local app data
-//! directory. It is NOT wrapped by the OS keychain and NOT protected by a
-//! passphrase: anything running as this user, and anyone who can read the
-//! user's profile off the disk, can read the key and therefore open every
-//! SQLCipher database. On Unix the file is created with mode 0600, which keeps
-//! *other* local users out — that is the whole of the protection. Full-disk
-//! encryption remains the user's responsibility, and README.md says so.
-//!
-//! Moving this to the platform keychain (Keychain Services / DPAPI / Secret
-//! Service) is open work; the `prompt` argument is the seam it will hook into,
-//! which is why it is threaded through unused.
+//! Master key storage in the OS credential store, with an upgrade path for
+//! installations that previously used an app-data key file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum KeyStoreError {
@@ -20,85 +11,135 @@ pub enum KeyStoreError {
     Other(String),
 }
 
-pub async fn load_master_key(_prompt: &str) -> Result<Vec<u8>, KeyStoreError> {
-    let path = get_key_path();
-    match tokio::fs::read(&path).await {
-        Ok(data) => Ok(data),
-        Err(_) => Err(KeyStoreError::NotFound),
+const MASTER_KEY_LEN: usize = 32;
+
+fn entry() -> Result<keyring::Entry, KeyStoreError> {
+    keyring::Entry::new("com.guvercin.app", "database-master-key").map_err(keyring_error)
+}
+
+fn keyring_error(error: keyring::Error) -> KeyStoreError {
+    match error {
+        keyring::Error::NoEntry => KeyStoreError::NotFound,
+        other => KeyStoreError::Other(other.to_string()),
     }
+}
+
+fn validate_key(key: &[u8]) -> Result<(), KeyStoreError> {
+    if key.len() == MASTER_KEY_LEN {
+        Ok(())
+    } else {
+        Err(KeyStoreError::Other(
+            "Master key has an invalid length.".into(),
+        ))
+    }
+}
+
+fn load_key(path: &Path, entry: &keyring::Entry) -> Result<Vec<u8>, KeyStoreError> {
+    let legacy = match std::fs::read(path) {
+        Ok(bytes) => {
+            let bytes = Zeroizing::new(bytes);
+            validate_key(&bytes)?;
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(KeyStoreError::Other(error.to_string())),
+    };
+
+    let saved = match entry.get_secret() {
+        Ok(bytes) => Zeroizing::new(bytes),
+        Err(keyring::Error::NoEntry) => {
+            let Some(legacy) = &legacy else {
+                return Err(KeyStoreError::NotFound);
+            };
+            entry.set_secret(legacy).map_err(keyring_error)?;
+            Zeroizing::new(entry.get_secret().map_err(keyring_error)?)
+        }
+        Err(error) => return Err(keyring_error(error)),
+    };
+    validate_key(&saved)?;
+    if let Some(legacy) = legacy {
+        if !bool::from(saved.as_slice().ct_eq(legacy.as_slice())) {
+            return Err(KeyStoreError::Other(
+                "The legacy and platform master keys differ. The legacy file was preserved.".into(),
+            ));
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(KeyStoreError::Other(error.to_string()));
+            }
+        }
+    }
+    Ok(saved.to_vec())
+}
+
+pub async fn load_master_key(_prompt: &str) -> Result<Vec<u8>, KeyStoreError> {
+    tokio::task::spawn_blocking(|| load_key(&legacy_key_path(), &entry()?))
+        .await
+        .map_err(|error| KeyStoreError::Other(error.to_string()))?
 }
 
 pub async fn store_master_key(_prompt: &str, key: &[u8]) -> Result<(), KeyStoreError> {
-    let path = get_key_path();
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    write_private(&path, key)
-        .await
-        .map_err(|e| KeyStoreError::Other(e.to_string()))
+    validate_key(key)?;
+    let key = Zeroizing::new(key.to_vec());
+    tokio::task::spawn_blocking(move || {
+        let entry = entry()?;
+        match entry.get_secret() {
+            Ok(existing) => {
+                let existing = Zeroizing::new(existing);
+                if !bool::from(existing.as_slice().ct_eq(key.as_slice())) {
+                    return Err(KeyStoreError::Other(
+                        "A different master key already exists.".into(),
+                    ));
+                }
+            }
+            Err(keyring::Error::NoEntry) => entry.set_secret(&key).map_err(keyring_error)?,
+            Err(error) => return Err(keyring_error(error)),
+        }
+        let verified = Zeroizing::new(entry.get_secret().map_err(keyring_error)?);
+        if !bool::from(verified.as_slice().ct_eq(key.as_slice())) {
+            return Err(KeyStoreError::Other(
+                "Could not verify the stored master key.".into(),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| KeyStoreError::Other(error.to_string()))?
 }
 
-/// Write the key so only the owning user can read it. On Unix the mode is set
-/// in the `open` call itself, so the key is never briefly world-readable.
-#[cfg(unix)]
-async fn write_private(path: &PathBuf, key: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
-    file.write_all(key).await?;
-    file.sync_all().await?;
-
-    // A key file left by an earlier build may still carry loose permissions;
-    // tighten it on every write.
-    let mut perms = tokio::fs::metadata(path).await?.permissions();
-    perms.set_mode(0o600);
-    tokio::fs::set_permissions(path, perms).await
+fn legacy_key_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("com.guvercin.app")
+        .join("master.key")
 }
 
-#[cfg(not(unix))]
-async fn write_private(path: &PathBuf, key: &[u8]) -> std::io::Result<()> {
-    // Windows: the local app data directory is already per-user ACL'd and the
-    // file inherits that. There is no mode to set here.
-    tokio::fs::write(path, key).await
-}
-
-fn get_key_path() -> PathBuf {
-    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("com.guvercin.app");
-    path.push("master.key");
-    path
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
-    #[tokio::test]
-    async fn written_key_is_owner_only() {
-        let dir = std::env::temp_dir().join(format!("guvercin-keystore-{}", std::process::id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+    #[test]
+    fn migrates_legacy_key_and_preserves_the_file_if_keys_disagree() {
+        let dir =
+            std::env::temp_dir().join(format!("guvercin-keystore-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
         let path = dir.join("master.key");
+        let entry =
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        let legacy = [7; MASTER_KEY_LEN];
+        std::fs::write(&path, legacy).unwrap();
 
-        // Pre-create it world-readable to prove the mode gets tightened.
-        tokio::fs::write(&path, b"old").await.unwrap();
-        let mut loose = tokio::fs::metadata(&path).await.unwrap().permissions();
-        loose.set_mode(0o644);
-        tokio::fs::set_permissions(&path, loose).await.unwrap();
+        entry.set_secret(&[8; MASTER_KEY_LEN]).unwrap();
+        assert!(matches!(
+            load_key(&path, &entry),
+            Err(KeyStoreError::Other(_))
+        ));
+        assert!(path.exists());
 
-        write_private(&path, b"0123456789abcdef").await.unwrap();
-
-        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "master key must not be group/world readable");
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"0123456789abcdef");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        entry.delete_credential().unwrap();
+        assert_eq!(load_key(&path, &entry).unwrap(), legacy);
+        assert!(!path.exists());
+        assert_eq!(entry.get_secret().unwrap(), legacy);
+        std::fs::remove_dir(dir).unwrap();
     }
 }

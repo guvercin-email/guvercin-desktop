@@ -28,6 +28,7 @@ async function jsonOrThrow(res) {
 
 export function emptyCard() {
   return {
+    addressBook: null,
     uid: '',
     name: { prefix: '', first: '', middle: '', last: '', suffix: '', nickname: '', fileAs: '' },
     displayName: '',
@@ -94,11 +95,12 @@ export function primaryPhoneOf(card) {
   return p ? p.value.trim() : ''
 }
 
-export async function fetchContacts(accountId, { search = '', favorites = false, list = null } = {}) {
+export async function fetchContacts(accountId, { search = '', favorites = false, list = null, addressBook = null } = {}) {
   const params = new URLSearchParams()
   if (search) params.set('search', search)
   if (favorites) params.set('favorites', 'true')
   if (list != null) params.set('list', String(list))
+  if (addressBook) params.set('addressBook', addressBook)
   const qs = params.toString()
   const res = await fetch(apiUrl(`/api/contacts/${accountId}${qs ? `?${qs}` : ''}`))
   return jsonOrThrow(res)
@@ -157,19 +159,20 @@ export async function deleteContact(accountId, id) {
   return jsonOrThrow(res)
 }
 
-export async function importVcf(accountId, vcfText, { merge = true } = {}) {
+export async function importVcf(accountId, vcfText, { merge = true, addressBook = null } = {}) {
   const res = await fetch(apiUrl(`/api/contacts/${accountId}/import`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ vcf: vcfText, merge }),
+    body: JSON.stringify({ vcf: vcfText, merge, addressBook }),
   })
   return jsonOrThrow(res)
 }
 
 // Returns the raw vCard text for the given ids (or all contacts when ids is empty).
-export async function exportVcf(accountId, ids = []) {
+export async function exportVcf(accountId, ids = [], addressBook = null) {
   const params = new URLSearchParams()
   if (ids.length) params.set('ids', ids.join(','))
+  if (addressBook) params.set('addressBook', addressBook)
   const qs = params.toString()
   const res = await fetch(apiUrl(`/api/contacts/${accountId}/export${qs ? `?${qs}` : ''}`))
   if (!res.ok) throw new Error(`Export failed (${res.status})`)
@@ -273,4 +276,10 @@ export async function carddavSetConfig(accountId, { url, username, password }) {
 export async function carddavSyncContacts(accountId) {
   const res = await fetch(apiUrl(`/api/contacts/${accountId}/carddav-sync`), { method: 'POST' })
   return jsonOrThrow(res)
+}
+
+
+export async function fetchCarddavBooks(accountId) {
+  const response = await fetch(apiUrl(`/api/carddav/${accountId}/address-books`))
+  return jsonOrThrow(response)
 }

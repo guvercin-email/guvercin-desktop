@@ -1,3 +1,6 @@
+import CalendarInvitation from '../components/CalendarInvitation.jsx'
+import OfficeAttachmentPreview from '../components/OfficeAttachmentPreview.jsx'
+import MailReadingControls, { useMailReadingSettings } from '../components/MailReadingControls.jsx'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { apiUrl } from '../utils/api'
@@ -83,6 +86,7 @@ function getDetachedLabelHint() {
 
 export default function DetachedMailWindow({ initialLabel = '' } = {}) {
   const { t } = useTranslation()
+  const readingSettings = useMailReadingSettings()
   const [windowLabel, setWindowLabel] = useState(() => initialLabel || getDetachedLabelHint())
   const [data, setData] = useState(null)
   const [mailContent, setMailContent] = useState(null)
@@ -483,7 +487,20 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
     }
   }
 
-  const openMailto = (params) => {
+  const openMailto = async (params) => {
+    if (data.accountEmail && String(accountId) !== localStorage.getItem('current_account_id')) {
+      try {
+        const source = 'reply'
+        const draft = { ...params, plainBody: params.body || '', from: data.accountEmail }
+        await invoke('open_compose_window', {
+          label: `compose-${crypto.randomUUID()}`,
+          composeDataJson: JSON.stringify({ accountId, accountEmail: data.accountEmail, source, draft }),
+        })
+      } catch (error) {
+        window.alert(error.message || t('Could not open the message.'))
+      }
+      return
+    }
     const search = new URLSearchParams()
     Object.entries(params).forEach(([key, value]) => {
       if (value) search.set(key, value)
@@ -802,7 +819,8 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
               <div className="db-empty-text">{error}</div>
             </div>
           ) : (
-            <div className="db-mail-content">
+            <div className="db-mail-content" style={readingSettings.style}>
+                <MailReadingControls settings={readingSettings} />
               <div className="db-mail-content-header">
                 <div className="db-mail-content-subject">{subject}</div>
               </div>
@@ -843,6 +861,8 @@ export default function DetachedMailWindow({ initialLabel = '' } = {}) {
                           <span className="db-attachments__name">{at.filename}</span>
                           <span className="db-attachments__meta">{at.content_type} · {formatBytes(at.size)}</span>
                         </div>
+                        <OfficeAttachmentPreview name={at.filename} base64={at.data_base64} href={isImported ? undefined : attachmentHref(mailContent.id, at.id)} />
+                        <CalendarInvitation attachment={at} href={isImported ? undefined : attachmentHref(mailContent.id, at.id)} accountId={accountId} email={data?.accountEmail} />
                         {isImported || at.data_base64 ? (
                           <button
                             type="button"

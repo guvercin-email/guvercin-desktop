@@ -65,6 +65,8 @@ export function emptyEvent() {
     location: '',
     description: '',
     allDay: false,
+    timeZone: '',
+    endTimeZone: '',
     start: '',
     end: '',
     color: '',
@@ -123,6 +125,15 @@ export async function updateEvent(accountId, id, card) {
     body: JSON.stringify(card),
   })
   return jsonOrThrow(res)
+}
+
+export async function changeEventOccurrence(accountId, id, original, card = null) {
+  const response = await fetch(apiUrl(`/api/calendar/${accountId}/events/${id}/occurrence`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ original, card }),
+  })
+  return jsonOrThrow(response)
 }
 
 export async function deleteEvent(accountId, id) {
@@ -301,4 +312,14 @@ export async function caldavSetConfig(accountId, { url, username, password }) {
 export async function caldavSyncCalendar(accountId) {
   const res = await fetch(apiUrl(`/api/calendar/${accountId}/caldav-sync`), { method: 'POST' })
   return jsonOrThrow(res)
+}
+
+export async function googleCalendarPermissions(accountId, calendarId, { grant, ruleId, signal } = {}) {
+  const base = `/api/calendar/${accountId}/calendars/${calendarId}/google-access`
+  const response = await fetch(apiUrl(ruleId ? `${base}/${encodeURIComponent(ruleId)}` : base), {
+    method: grant ? 'PUT' : ruleId ? 'DELETE' : 'GET',
+    ...(grant ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(grant) } : {}),
+    signal,
+  })
+  return jsonOrThrow(response)
 }

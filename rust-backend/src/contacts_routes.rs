@@ -103,6 +103,8 @@ pub struct ContactPersonal {
 pub struct ContactCard {
     #[serde(default)]
     pub uid: String,
+    #[serde(default, rename = "addressBook", skip_serializing_if = "Option::is_none")]
+    pub address_book: Option<String>,
     #[serde(default)]
     pub name: ContactName,
     #[serde(default, rename = "displayName")]
@@ -424,6 +426,8 @@ pub struct ListQuery {
     /// Filter to members of a single list.
     #[serde(default)]
     pub list: Option<i64>,
+    #[serde(rename = "addressBook")]
+    pub address_book: Option<String>,
 }
 
 pub async fn list_contacts(
@@ -443,6 +447,9 @@ pub async fn list_contacts(
             "contact_id IN (SELECT contact_id FROM contact_list_members WHERE list_id = {list_id})"
         ));
     }
+    if q.address_book.is_some() {
+        clauses.push("json_extract(card_json, '$.addressBook') = ?".to_string());
+    }
     let search = q.search.as_deref().map(str::trim).unwrap_or("").to_string();
     if !search.is_empty() {
         clauses.push(
@@ -458,6 +465,9 @@ pub async fn list_contacts(
     sql.push_str(" ORDER BY is_favorite DESC, LOWER(COALESCE(display_name, mail_address, '')) ASC");
 
     let mut query = sqlx::query(&sql);
+    if let Some(book) = q.address_book {
+        query = query.bind(book);
+    }
     if !search.is_empty() {
         let pattern = format!("%{}%", search.to_lowercase());
         query = query
@@ -564,6 +574,7 @@ pub async fn create_contact(
     Json(mut card): Json<ContactCard>,
 ) -> Result<Json<ContactRecord>, AppError> {
     let pool = db::get_user_db_pool(&state, account_id).await?;
+    crate::carddav_sync::require_book(&pool, card.address_book.as_deref()).await?;
     if card.uid.trim().is_empty() {
         card.uid = new_uid();
     }
@@ -585,6 +596,7 @@ pub async fn update_contact(
     let existing = fetch_record(&pool, contact_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("Contact not found".into()))?;
+    card.address_book = existing.card.address_book.clone();
     if card.uid.trim().is_empty() {
         card.uid = if existing.card.uid.trim().is_empty() {
             new_uid()
@@ -620,6 +632,8 @@ pub struct ImportBody {
     /// in place instead of inserted as duplicates.
     #[serde(default)]
     pub merge: bool,
+    #[serde(rename = "addressBook")]
+    pub address_book: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -635,6 +649,7 @@ pub async fn import_contacts(
     Json(body): Json<ImportBody>,
 ) -> Result<Json<ImportResult>, AppError> {
     let pool = db::get_user_db_pool(&state, account_id).await?;
+    crate::carddav_sync::require_book(&pool, body.address_book.as_deref()).await?;
     let cards = parse_vcards(&body.vcf);
     if cards.is_empty() {
         return Err(AppError::BadRequest(
@@ -647,6 +662,7 @@ pub async fn import_contacts(
     let mut skipped = 0usize;
 
     for mut card in cards {
+        card.address_book = body.address_book.clone();
         if card.effective_display_name().is_empty() && card.primary_email().is_empty() {
             skipped += 1;
             continue;
@@ -662,6 +678,9 @@ pub async fn import_contacts(
         };
 
         if let Some(id) = existing_id {
+            if card.address_book.is_none() {
+                card.address_book = fetch_record(&pool, id).await?.and_then(|record| record.card.address_book);
+            }
             upsert_card(&pool, Some(id), &card).await?;
             reconcile_membership(&pool, id, &card.categories).await?;
             updated += 1;
@@ -683,8 +702,9 @@ pub async fn import_contacts(
 async fn find_existing_id(pool: &SqlitePool, card: &ContactCard) -> Option<i64> {
     if !card.uid.trim().is_empty() {
         if let Ok(Some(id)) =
-            sqlx::query_scalar::<_, i64>("SELECT contact_id FROM contacts WHERE uid = ? LIMIT 1")
-                .bind(card.uid.trim())
+            sqlx::query_scalar::<_, i64>("SELECT contact_id FROM contacts WHERE uid = ? AND deleted = 0
+                    AND (? IS NULL OR json_extract(card_json, '$.addressBook') = ?) LIMIT 1")
+                .bind(card.uid.trim()).bind(&card.address_book).bind(&card.address_book)
                 .fetch_optional(pool)
                 .await
         {
@@ -694,9 +714,10 @@ async fn find_existing_id(pool: &SqlitePool, card: &ContactCard) -> Option<i64> 
     let email = card.primary_email();
     if !email.is_empty() {
         if let Ok(Some(id)) = sqlx::query_scalar::<_, i64>(
-            "SELECT contact_id FROM contacts WHERE LOWER(mail_address) = LOWER(?) LIMIT 1",
+            "SELECT contact_id FROM contacts WHERE LOWER(mail_address) = LOWER(?) AND deleted = 0
+                AND (? IS NULL OR json_extract(card_json, '$.addressBook') = ?) LIMIT 1",
         )
-        .bind(&email)
+        .bind(&email).bind(&card.address_book).bind(&card.address_book)
         .fetch_optional(pool)
         .await
         {
@@ -711,6 +732,8 @@ pub struct ExportQuery {
     /// Optional comma-separated list of contact ids. When omitted, exports all.
     #[serde(default)]
     pub ids: Option<String>,
+    #[serde(rename = "addressBook")]
+    pub address_book: Option<String>,
 }
 
 pub async fn export_contacts(
@@ -748,6 +771,9 @@ pub async fn export_contacts(
     };
 
     let mut records: Vec<ContactRecord> = rows.iter().map(row_to_record).collect();
+    if let Some(book) = q.address_book {
+        records.retain(|record| record.card.address_book.as_deref() == Some(book.as_str()));
+    }
     attach_categories(&pool, &mut records).await?;
     let mut out = String::new();
     for rec in &records {

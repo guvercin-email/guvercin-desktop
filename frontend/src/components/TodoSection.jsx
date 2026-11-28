@@ -10,7 +10,7 @@ import {
   caldavGetConfig, caldavSetConfig, caldavStatus, caldavSyncTasks, clearCompleted,
   createTask, createTaskList, deleteTask, deleteTaskList, emptyTask, fetchTaskLists,
   fetchTasks, getTasksBackend, googleSyncTasks, googleTasksAccess, normalizeTask,
-  setTasksBackend, updateTask, updateTaskList,
+  reorderTask, setTasksBackend, updateTask, updateTaskList,
 } from '../utils/todoApi.js'
 import { googleReconnect } from '../utils/calendarApi.js'
 import { DavAccountModal, SyncChoiceModal, syncLabel } from './SyncSetup.jsx'
@@ -296,18 +296,35 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
     return tasks
   }, [tasks, view])
 
-  const active = filtered.filter((x) => !x.card.completed)
+  const [manualOrder, setManualOrder] = useState(() => localStorage.getItem('task_order') === 'manual')
+  const draggedTask = useRef(null)
+  const canReorder = manualOrder && view.kind === 'list' && !search
+  const active = useMemo(() => filtered.filter((x) => !x.card.completed), [filtered])
   const completed = filtered.filter((x) => x.card.completed)
 
   const buckets = useMemo(() => {
+    if (canReorder) {
+      const items = [...active].sort((a, b) => a.position - b.position || a.id - b.id)
+      return items.length ? [{ key: 'manual', items }] : []
+    }
     const order = ['overdue', 'today', 'upcoming', 'none']
     const map = { overdue: [], today: [], upcoming: [], none: [] }
     for (const task of active) map[bucketOf(task)]?.push(task)
     return order.map((key) => ({ key, items: map[key] })).filter((b) => b.items.length)
-  }, [active])
+  }, [active, canReorder])
+
+  const moveTaskBefore = async (source, before) => {
+    if (!canReorder || source === before) return
+    try {
+      await reorderTask(accountId, view.listId, source, before)
+      await reload({ silent: true })
+    } catch (error) {
+      pushToast(error.message || t('Could not reorder tasks.'), 'error')
+    }
+  }
 
   const bucketTitle = (key) => ({
-    overdue: t('Overdue'), today: t('Today'), upcoming: t('Upcoming'), none: t('No date'),
+    manual: t('Manual order'), overdue: t('Overdue'), today: t('Today'), upcoming: t('Upcoming'), none: t('No date'),
   }[key] || key)
 
   // ── Task ops ──
@@ -548,6 +565,15 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
         <section className="td-main">
           <div className="td-main-head">
             <h2 className="td-main-title">{headerTitle}{loading && <span className="td-loading">•••</span>}</h2>
+            {view.kind === 'list' && (
+              <label>
+                <input type="checkbox" checked={manualOrder} onChange={(event) => {
+                  setManualOrder(event.target.checked)
+                  localStorage.setItem('task_order', event.target.checked ? 'manual' : 'due')
+                }} />
+                {t('Manual order')}
+              </label>
+            )}
           </div>
 
           <div className="td-scroll">
@@ -561,8 +587,29 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
             {buckets.map((b) => (
               <div key={b.key} className="td-bucket">
                 <div className={`td-bucket-head ${b.key}`}>{bucketTitle(b.key)} <span className="td-bucket-count">{b.items.length}</span></div>
-                {b.items.map((rec) => (
+                {b.items.map((rec, index) => (
                   <TaskRow key={rec.id} rec={rec} locale={locale} t={t} showList={view.kind !== 'list'} lists={lists}
+                    dragProps={canReorder ? {
+                      draggable: true,
+                      onDragStart: (event) => {
+                        draggedTask.current = rec.id
+                        event.dataTransfer.effectAllowed = 'move'
+                        event.dataTransfer.setData('application/x-guvercin-task', String(rec.id))
+                      },
+                      onDragOver: (event) => {
+                        if (draggedTask.current != null && draggedTask.current !== rec.id) event.preventDefault()
+                      },
+                      onDrop: (event) => {
+                        const source = draggedTask.current
+                        if (source == null) return
+                        event.preventDefault()
+                        draggedTask.current = null
+                        void moveTaskBefore(source, rec.id)
+                      },
+                      onDragEnd: () => { draggedTask.current = null },
+                    } : undefined}
+                    onMoveUp={canReorder && index > 0 ? () => moveTaskBefore(rec.id, b.items[index - 1].id) : undefined}
+                    onMoveDown={canReorder && index + 1 < b.items.length ? () => moveTaskBefore(b.items[index + 1].id, rec.id) : undefined}
                     onToggle={() => toggleComplete(rec)} onStar={() => toggleStar(rec)} onOpen={() => openEditor(rec)} />
                 ))}
               </div>
@@ -655,16 +702,20 @@ export default function TodoSection({ accountId, toolbarStyle = 'icon_text_small
 
 // ─────────────────────────── Task row ───────────────────────────
 
-function TaskRow({ rec, locale, t, showList, lists, onToggle, onStar, onOpen }) {
+function TaskRow({ rec, locale, t, showList, lists, onToggle, onStar, onOpen, dragProps, onMoveUp, onMoveDown }) {
   const card = rec.card
   const overdue = !card.completed && bucketOf(rec) === 'overdue'
   const list = lists.find((l) => l.listId === card.listId)
-  const subDone = (card.subtasks || []).filter((s) => s.done).length
-  const subTotal = (card.subtasks || []).length
+  const flatten = (nodes = []) => nodes.flatMap((node) => [node, ...flatten(node.children)])
+  const subtasks = flatten(card.subtasks)
+  const subDone = subtasks.filter((subtask) => subtask.done).length
+  const subTotal = subtasks.length
   const due = dueLabel(rec, locale, t)
 
   return (
-    <div className={`td-task ${card.completed ? 'done' : ''}`}>
+    <div className={`td-task ${card.completed ? 'done' : ''}`} {...dragProps}>
+      {onMoveUp && <button type="button" className="td-icon-btn" aria-label={t('Move task up')} onClick={onMoveUp}>↑</button>}
+      {onMoveDown && <button type="button" className="td-icon-btn" aria-label={t('Move task down')} onClick={onMoveDown}>↓</button>}
       <button className={`td-check ${card.completed ? 'on' : ''}`} onClick={onToggle} title={t('Toggle complete')} aria-label={t('Toggle complete')}>
         {card.completed ? '✓' : ''}
       </button>
@@ -694,6 +745,27 @@ function splitDue(due) {
   }
 }
 
+function SubtaskTree({ entries, onChange, t, depth = 0 }) {
+  const patch = (index, change) => onChange(entries.map((entry, position) =>
+    position === index ? { ...entry, ...change } : entry))
+  return entries.map((entry, index) => (
+    <div key={index} style={{ marginInlineStart: depth ? 16 : 0 }}>
+      <div className="td-subrow">
+        <input type="checkbox" checked={entry.done} aria-label={t('Toggle complete')}
+          onChange={(event) => patch(index, { done: event.target.checked })} />
+        <input className="td-input" value={entry.title} aria-label={t('Subtask title')}
+          onChange={(event) => patch(index, { title: event.target.value })} />
+        {depth < 4 && <button type="button" className="td-icon-btn" aria-label={t('Add a nested subtask')}
+          onClick={() => patch(index, { children: [...(entry.children || []), { title: '', done: false }] })}>＋</button>}
+        <button type="button" className="td-icon-btn" aria-label={t('Delete subtask')}
+          onClick={() => onChange(entries.filter((_, position) => position !== index))}>✕</button>
+      </div>
+      {!!entry.children?.length && <SubtaskTree entries={entry.children} depth={depth + 1} t={t}
+        onChange={(children) => patch(index, { children })} />}
+    </div>
+  ))
+}
+
 function TaskEditor({ t, draft, setDraft, saving, isNew, lists, onCancel, onSave, onDelete, onAddToCalendar }) {
   const set = (patch) => setDraft((d) => ({ ...d, ...patch }))
   const { date, time } = splitDue(draft.due)
@@ -710,7 +782,6 @@ function TaskEditor({ t, draft, setDraft, saving, isNew, lists, onCancel, onSave
     else set({ due: date || draft.due.split('T')[0] || '', hasDueTime: false })
   }
 
-  const setSub = (i, patch) => set({ subtasks: draft.subtasks.map((s, j) => (j === i ? { ...s, ...patch } : s)) })
   const addSub = () => { const v = newSub.trim(); if (!v) return; set({ subtasks: [...draft.subtasks, { title: v, done: false }] }); setNewSub('') }
 
   return (
@@ -776,13 +847,7 @@ function TaskEditor({ t, draft, setDraft, saving, isNew, lists, onCancel, onSave
 
           <div className="td-form-section">
             <div className="td-form-section-title">{t('Subtasks')}</div>
-            {draft.subtasks.map((s, i) => (
-              <div key={i} className="td-subrow">
-                <button className={`td-check td-check--sm ${s.done ? 'on' : ''}`} onClick={() => setSub(i, { done: !s.done })}>{s.done ? '✓' : ''}</button>
-                <input className="td-input" value={s.title} onChange={(e) => setSub(i, { title: e.target.value })} />
-                <button className="td-icon-btn" onClick={() => set({ subtasks: draft.subtasks.filter((_, j) => j !== i) })}>✕</button>
-              </div>
-            ))}
+            <SubtaskTree entries={draft.subtasks} t={t} onChange={(subtasks) => set({ subtasks })} />
             <div className="td-subrow td-subrow--add">
               <span className="td-check td-check--sm td-check--ghost" />
               <input className="td-input" placeholder={t('Add a subtask')} value={newSub} onChange={(e) => setNewSub(e.target.value)}

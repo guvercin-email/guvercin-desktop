@@ -163,6 +163,42 @@ impl<T: Read + Write> Write for ImapTransport<T> {
     }
 }
 
+impl imap::extensions::idle::SetReadTimeout for ImapTransport<TcpStream> {
+    fn set_read_timeout(&mut self, timeout: Option<std::time::Duration>) -> imap::error::Result<()> {
+        TcpStream::set_read_timeout(self.io.get_mut(), timeout.or(Some(std::time::Duration::from_secs(15))))
+            .map_err(imap::Error::Io)
+    }
+}
+
+impl imap::extensions::idle::SetReadTimeout for ImapTransport<native_tls::TlsStream<TcpStream>> {
+    fn set_read_timeout(&mut self, timeout: Option<std::time::Duration>) -> imap::error::Result<()> {
+        self.io.get_mut().get_ref().set_read_timeout(timeout.or(Some(std::time::Duration::from_secs(15))))
+            .map_err(imap::Error::Io)
+    }
+}
+
+pub(crate) fn wait_for_mailbox_change(state: &Arc<ImapState>, account_id: i64, mailbox: &str) -> Result<Option<bool>, String> {
+    use imap::extensions::idle::{SetReadTimeout, WaitOutcome};
+
+    fn wait<T: Read + Write + SetReadTimeout>(session: &mut imap::Session<T>, mailbox: &str) -> Result<Option<bool>, String> {
+        let capabilities = session.capabilities().map_err(|error| error.to_string())?;
+        if !capabilities.has_str("IDLE") {
+            return Ok(None);
+        }
+        session.examine(&crate::imap_utf7::encode(mailbox)).map_err(|error| error.to_string())?;
+        let outcome = session.idle().timeout(std::time::Duration::from_secs(45)).keepalive(false)
+            .wait_while(imap::extensions::idle::stop_on_any).map_err(|error| error.to_string())?;
+        Ok(Some(outcome == WaitOutcome::MailboxChanged))
+    }
+
+    let shared = state.session(account_id).ok_or("No IMAP session")?;
+    let mut session = shared.lock().map_err(|error| error.to_string())?;
+    match &mut *session {
+        ImapSession::Plain(session) => wait(session, mailbox),
+        ImapSession::Tls(session) => wait(session, mailbox),
+    }
+}
+
 enum ImapSession {
     Plain(imap::Session<ImapTransport<TcpStream>>),
     Tls(imap::Session<ImapTransport<native_tls::TlsStream<TcpStream>>>),
@@ -954,6 +990,25 @@ fn imap_search_string(value: &str) -> String {
     }
 }
 
+fn imap_expression(expression: crate::search_expression::SearchExpression) -> String {
+    use crate::search_expression::{Field, SearchExpression::*};
+    match expression {
+        Term(field, text) => {
+            let key = match field {
+                Field::Text | Field::IndexedText => "TEXT",
+                Field::From => "FROM",
+                Field::To => "TO",
+                Field::Cc => "CC",
+                Field::Subject => "SUBJECT",
+            };
+            format!("{key} {}", imap_search_string(&text))
+        }
+        Not(inner) => format!("NOT ({})", imap_expression(*inner)),
+        And(left, right) => format!("({} {})", imap_expression(*left), imap_expression(*right)),
+        Or(left, right) => format!("OR ({}) ({})", imap_expression(*left), imap_expression(*right)),
+    }
+}
+
 pub fn build_imap_advanced_query(req: &AdvancedSearchRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -984,7 +1039,7 @@ pub fn build_imap_advanced_query(req: &AdvancedSearchRequest) -> String {
         parts.push(format!("SUBJECT {}", imap_search_string(value)));
     }
     if let Some(value) = keywords {
-        parts.push(format!("TEXT {}", imap_search_string(value)));
+        parts.push(imap_expression(crate::search_expression::keywords(value)));
     }
 
     if let Some(start) = req
@@ -1274,6 +1329,7 @@ pub fn is_connected(state: &Arc<ImapState>, account_id: i64) -> bool {
 
 pub enum QueuedMailAction {
     Seen(bool),
+    Flagged(bool),
     Answered,
     Forwarded,
     Label(String, bool),
@@ -1327,6 +1383,7 @@ pub fn apply_queued_mail_action(
     with_queued_mailbox(state, account_id, mailbox, expected_validity, |session| {
         match action {
             QueuedMailAction::Seen(seen) => session.uid_store_flag(uid, "\\Seen", seen)?,
+            QueuedMailAction::Flagged(flagged) => session.uid_store_flag(uid, "\\Flagged", flagged)?,
             QueuedMailAction::Answered => session.uid_store_flag(uid, "\\Answered", true)?,
             QueuedMailAction::Forwarded => session.uid_store_keyword(uid, "$Forwarded", true)?,
             QueuedMailAction::Label(label, add) => set_selected_mailbox_label(session, mailbox, uid, label.trim(), add)?,
@@ -1605,12 +1662,17 @@ fn iterate_attachment_parts<F>(part: &ParsedMail, visitor: &mut F) -> bool
 where
     F: FnMut(&ParsedMail, usize) -> bool,
 {
-    fn recurse<F>(part: &ParsedMail, counter: &mut usize, visitor: &mut F) -> bool
+    fn recurse<F>(part: &ParsedMail, counter: &mut usize, visitor: &mut F, implicit_calendar: bool) -> bool
     where
         F: FnMut(&ParsedMail, usize) -> bool,
     {
         if part.subparts.is_empty() {
-            if should_treat_as_attachment(part) {
+            let matches = if implicit_calendar {
+                part.ctype.mimetype.eq_ignore_ascii_case("text/calendar") && !should_treat_as_attachment(part)
+            } else {
+                should_treat_as_attachment(part)
+            };
+            if matches {
                 let idx = *counter;
                 *counter += 1;
                 if visitor(part, idx) {
@@ -1619,7 +1681,7 @@ where
             }
         } else {
             for child in &part.subparts {
-                if recurse(child, counter, visitor) {
+                if recurse(child, counter, visitor, implicit_calendar) {
                     return true;
                 }
             }
@@ -1628,7 +1690,9 @@ where
     }
 
     let mut counter = 0;
-    recurse(part, &mut counter, visitor)
+    // Append implicit invitations so persisted attachment indexes still refer
+    // to the original MIME parts.
+    recurse(part, &mut counter, visitor, false) || recurse(part, &mut counter, visitor, true)
 }
 
 fn should_treat_as_attachment(part: &ParsedMail) -> bool {
@@ -1666,7 +1730,13 @@ fn build_attachment_descriptor(
         .get("filename")
         .cloned()
         .or_else(|| part.ctype.params.get("name").cloned())
-        .unwrap_or_else(|| format!("attachment-{}", index + 1));
+        .unwrap_or_else(|| {
+            if part.ctype.mimetype == "text/calendar" {
+                format!("invitation-{}.ics", index + 1)
+            } else {
+                format!("attachment-{}", index + 1)
+            }
+        });
 
     let body = part.get_body_raw().ok()?;
     let size = body.len();
@@ -1923,6 +1993,21 @@ mod tests {
     }
 
     #[test]
+    fn queued_stars_set_and_clear_the_imap_flag() {
+        let commands = record_imap_commands("UIDPLUS", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.insert_session(1, super::ImapSession::Plain(session));
+            for enabled in [true, false] {
+                assert!(super::apply_queued_mail_action(
+                    &state, 1, "INBOX", "42", Some(7), super::QueuedMailAction::Flagged(enabled),
+                ).is_ok());
+            }
+        });
+        assert!(commands.iter().any(|command| command == "UID STORE 42 +FLAGS (\\Flagged)"));
+        assert!(commands.iter().any(|command| command == "UID STORE 42 -FLAGS (\\Flagged)"));
+    }
+
+    #[test]
     fn replaced_generation_searches_below_the_old_checkpoint() {
         let commands = record_imap_commands("UIDPLUS", None, |session| {
             let state = std::sync::Arc::new(super::ImapState::new());
@@ -1953,7 +2038,7 @@ mod tests {
 
         use crate::{db, mail_routes::{self, MailAppState}, offline_routes};
 
-        let commands = record_imap_commands("UIDPLUS", None, |session| {
+        let commands = record_imap_commands("UIDPLUS SINGLE-UID-FIXTURE", None, |session| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
                 let dir = std::env::temp_dir().join(format!("guvercin-uid-{}-{timestamp}", std::process::id()));
@@ -2054,7 +2139,7 @@ mod tests {
                 let checkpoint: (u32, u32) = sqlx::query_as(
                     "SELECT last_synced_uid, last_uid_validity FROM sync_checkpoints WHERE folder_path = 'INBOX'",
                 ).fetch_one(&pool).await.unwrap();
-                assert_eq!(checkpoint, (40, 7));
+                assert_eq!(checkpoint, (42, 7));
                 let queued: (u32, String) = sqlx::query_as("SELECT uid_validity, status FROM offline_sync_queue")
                     .fetch_one(&pool).await.unwrap();
                 assert_eq!(queued, (6, "dead".into()));
@@ -2062,19 +2147,20 @@ mod tests {
             });
         });
         let commands: Vec<_> = commands.iter().filter(|command| *command != "NOOP").collect();
-        assert_eq!(commands.len(), 11, "{commands:?}");
+        assert_eq!(commands.len(), 13, "{commands:?}");
         assert_eq!(commands[0], "SELECT \"INBOX\"");
-        assert!(commands[1].starts_with("FETCH 1:1 "));
+        assert_eq!(commands[1], "UID SEARCH UID 1:*");
         assert_eq!(commands[2], "SELECT \"INBOX\"");
-        assert_eq!(commands[3], "SELECT \"INBOX\"");
-        assert!(commands[4].starts_with("UID FETCH 42 (UID BODY.PEEK[]"));
+        assert!(commands[3].starts_with("UID FETCH 42 "));
+        assert_eq!(commands[4], "SELECT \"INBOX\"");
         assert_eq!(commands[5], "SELECT \"INBOX\"");
-        assert!(commands[6].starts_with("LIST "));
+        assert!(commands[6].starts_with("UID FETCH 42 (UID BODY.PEEK[]"));
         assert_eq!(commands[7], "SELECT \"INBOX\"");
-        assert_eq!(commands[8], "UID SEARCH UID 41:*");
+        assert!(commands[8].starts_with("LIST "));
         assert_eq!(commands[9], "SELECT \"INBOX\"");
-        assert!(commands[10].starts_with("UID FETCH 41,42 "));
-
+        assert_eq!(commands[10], "UID SEARCH UID 41:*");
+        assert_eq!(commands[11], "SELECT \"INBOX\"");
+        assert!(commands[12].starts_with("UID FETCH 42 "));
     }
 
     #[test]
@@ -2162,6 +2248,39 @@ mod tests {
         assert!(commands.iter().all(|command| command != "UID SEARCH ALL"));
     }
 
+    #[test]
+    fn inbox_idle_delivers_a_change_and_terminates_the_command() {
+        let commands = record_imap_commands("IDLE", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.insert_session(1, super::ImapSession::Plain(session));
+            assert_eq!(super::wait_for_mailbox_change(&state, 1, "INBOX").unwrap(), Some(true));
+            super::disconnect(&state, 1);
+        });
+        assert_eq!(commands, ["EXAMINE \"INBOX\"", "IDLE", "DONE"]);
+    }
+
+    #[test]
+    fn idle_can_watch_a_named_folder_on_its_own_session() {
+        let commands = record_imap_commands("IDLE", None, |session| {
+            let state = std::sync::Arc::new(super::ImapState::new());
+            state.insert_session(9, super::ImapSession::Plain(session));
+            assert_eq!(super::wait_for_mailbox_change(&state, 9, "Projects/İstanbul").unwrap(), Some(true));
+            super::disconnect(&state, 9);
+        });
+        let encoded = crate::imap_utf7::encode("Projects/İstanbul");
+        assert_eq!(commands, [format!("EXAMINE \"{encoded}\""), "IDLE".into(), "DONE".into()]);
+    }
+
+    #[test]
+    fn implicit_calendar_parts_keep_existing_attachment_indexes() {
+        let raw = b"Content-Type: multipart/mixed; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--parts\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=data.bin\r\n\r\ndata\r\n--parts--\r\n";
+        let content = super::parse_mail_content("1".to_owned(), raw);
+        assert_eq!(content.attachments[0].filename, "data.bin");
+        assert_eq!(content.attachments[1].content_type, "text/calendar");
+        assert_eq!(super::find_attachment_bytes(raw, 0).unwrap().1, b"data\r\n");
+        assert!(super::find_attachment_bytes(raw, 1).unwrap().1.starts_with(b"BEGIN:VCALENDAR"));
+    }
+
     fn record_imap_commands(
         capability: &'static str,
         reject_prefix: Option<&'static str>,
@@ -2197,6 +2316,16 @@ mod tests {
                     cmd if cmd.starts_with("LOGIN ") => {}
                     cmd => {
                         commands.push(cmd.to_string());
+                        if cmd == "IDLE" {
+                            write!(stream, "+ idling\r\n* 2 EXISTS\r\n").unwrap();
+                            let mut done = String::new();
+                            reader.read_line(&mut done).unwrap();
+                            assert_eq!(done, "DONE\r\n");
+                            commands.push("DONE".into());
+                        }
+                        if cmd.starts_with("EXAMINE ") {
+                            write!(stream, "* 1 EXISTS\r\n* OK [UIDVALIDITY 7] fixture\r\n").unwrap();
+                        }
                         if cmd.starts_with("APPEND ") {
                             let (_, size) = cmd.rsplit_once('{').unwrap();
                             let size = size.trim_end_matches('}').parse::<usize>().unwrap();
@@ -2222,7 +2351,7 @@ mod tests {
                             }
                         }
                         if cmd.starts_with("UID SEARCH ") {
-                            let result = if cmd.ends_with("\"unique\"") {
+                            let result = if capability.contains("SINGLE-UID-FIXTURE") || cmd.ends_with("\"unique\"") {
                                 " 42"
                             } else if cmd.ends_with("\"missing\"") {
                                 ""
@@ -2251,7 +2380,8 @@ mod tests {
                             let raw = "Subject: Replacement\r\nFrom: fixture@example.test\r\n\r\nReplacement body\r\n";
                             write!(stream, "* 1 FETCH (UID 42 BODY[] {{{}}}\r\n{})\r\n", raw.len(), raw).unwrap();
                         }
-                        if cmd.starts_with("FETCH 1:1 ") || cmd.starts_with("UID FETCH 41,42 ") {
+                        if cmd.starts_with("FETCH 1:1 ") || cmd.starts_with("UID FETCH 41,42 ")
+                            || cmd.starts_with("UID FETCH 42 (BODY.PEEK[HEADER.FIELDS ") {
                             let headers = "Subject: Replacement\r\nFrom: fixture@example.test\r\n\r\n";
                             write!(stream, "* 1 FETCH (UID 42 FLAGS () RFC822.SIZE 100 BODY[HEADER.FIELDS (SUBJECT FROM)] {{{}}}\r\n{})\r\n", headers.len(), headers).unwrap();
                         }
@@ -2313,6 +2443,18 @@ mod tests {
         assert_eq!(
             build_imap_advanced_query(&req),
             "SENTSINCE 01-Mar-2026 SENTBEFORE 10-Mar-2026"
+        );
+    }
+
+    #[test]
+    fn build_imap_advanced_query_combines_boolean_terms() {
+        let request = AdvancedSearchRequest {
+            keywords: Some(r#"from:alice OR subject:"weekly report" AND NOT to:bob"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_imap_advanced_query(&request),
+            r#"OR (FROM "alice") ((SUBJECT "weekly report" NOT (TO "bob")))"#,
         );
     }
 

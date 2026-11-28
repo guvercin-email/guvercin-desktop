@@ -6,7 +6,7 @@ import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
 import {
   carddavGetConfig, carddavSetConfig, carddavStatus, carddavSyncContacts,
   createContact, createList, deleteContact, deleteList, displayNameOf, emptyCard,
-  exportVcf, fetchContacts, fetchLists, fetchSuggestions, getContactsBackend,
+  exportVcf, fetchCarddavBooks, fetchContacts, fetchLists, fetchSuggestions, getContactsBackend,
   googleContactsAccess, googleSyncContacts, importVcf, normalizeCard, primaryEmailOf,
   primaryPhoneOf, renameList, setContactsBackend, updateContact,
 } from '../utils/contactsApi.js'
@@ -74,8 +74,11 @@ function slugifyFilename(name) {
 const icon = (name) => <img src={`/img/icons/${name}.svg`} className="svg-icon-inline" alt="" />
 
 export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_small', searchQuery }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const { networkOnline } = useOfflineSync()
+  const [sortOrder, setSortOrder] = useState(() =>
+    localStorage.getItem('contacts_sort_order') === 'desc' ? 'desc' : 'asc',
+  )
   const [contacts, setContacts] = useState([])
   const [lists, setLists] = useState([])
   const [counts, setCounts] = useState({ total: 0, favorites: 0 })
@@ -83,6 +86,10 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
   // Search is driven entirely by the app navbar (searchQuery prop).
   const search = searchQuery || ''
   const [showFavorites, setShowFavorites] = useState(false)
+  const [addressBooks, setAddressBooks] = useState(null)
+  const [bookSelection, setBookSelection] = useState(null)
+  const books = addressBooks?.accountId === accountId ? addressBooks.items : []
+  const activeBook = bookSelection?.accountId === accountId ? bookSelection.href : null
   const [activeList, setActiveList] = useState(null) // list_id or null
   const [selectedId, setSelectedId] = useState(null)
   const [mode, setMode] = useState('view') // 'view' | 'edit' | 'create'
@@ -122,19 +129,31 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     }
   }, [accountId])
 
+  const reloadBooks = useCallback(async () => {
+    if (!accountId) return
+    try {
+      const items = await fetchCarddavBooks(accountId)
+      setAddressBooks({ accountId, items })
+      setBookSelection((current) => current?.accountId === accountId && !items.some((book) => book.href === current.href)
+        ? null : current)
+    } catch { /* Cached contacts remain available. */ }
+  }, [accountId])
+
+  useEffect(() => { void reloadBooks() }, [reloadBooks])
+
   // `silent` skips the loading spinner — used by the background auto-refresh.
   const reload = useCallback(async ({ silent = false } = {}) => {
     if (!accountId) return
     if (!silent) setLoading(true)
     try {
-      const rows = await fetchContacts(accountId, { search, favorites: showFavorites, list: activeList })
+      const rows = await fetchContacts(accountId, { search, favorites: showFavorites, list: activeList, addressBook: activeBook })
       setContacts(rows.map((r) => ({ ...r, card: normalizeCard(r.card) })))
     } catch (e) {
       if (!silent) pushToast(e.message || 'Failed to load contacts', 'error')
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [accountId, search, showFavorites, activeList, pushToast])
+  }, [accountId, search, showFavorites, activeList, activeBook, pushToast])
 
   useEffect(() => {
     const id = setTimeout(() => reload(), search ? 220 : 0)
@@ -176,8 +195,8 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
   }, [accountId])
 
   const refreshAll = useCallback(async (opts) => {
-    await Promise.all([reload(opts), reloadLists()])
-  }, [reload, reloadLists])
+    await Promise.all([reload(opts), reloadLists(), reloadBooks()])
+  }, [reload, reloadLists, reloadBooks])
 
   // Keep the list fresh with no manual "refresh": re-fetch quietly every 5s.
   const refreshAllRef = useRef(refreshAll)
@@ -195,7 +214,13 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
 
   const grouped = useMemo(() => {
     const groups = new Map()
-    for (const c of contacts) {
+    const collator = new Intl.Collator(i18n.language, { sensitivity: 'base' })
+    const compareNames = (a, b) => sortOrder === 'desc' ? collator.compare(b, a) : collator.compare(a, b)
+    const sorted = [...contacts].sort((a, b) =>
+      Number(Boolean(b.card.isFavorite)) - Number(Boolean(a.card.isFavorite)) ||
+      compareNames(displayNameOf(a.card), displayNameOf(b.card)),
+    )
+    for (const c of sorted) {
       const name = displayNameOf(c.card)
       const letter = (name[0] || '#').toUpperCase()
       const key = /[A-Z]/.test(letter) ? letter : '#'
@@ -205,12 +230,13 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     return Array.from(groups.entries()).sort(([a], [b]) => {
       if (a === '#') return 1
       if (b === '#') return -1
-      return a.localeCompare(b)
+      return compareNames(a, b)
     })
-  }, [contacts])
+  }, [contacts, i18n.language, sortOrder])
 
   const startCreate = useCallback((prefill) => {
     const card = prefill ? normalizeCard(prefill) : emptyCard()
+    if (activeBook) card.addressBook = activeBook
     // New contacts inherit the currently-viewed list.
     if (activeList != null) {
       const l = lists.find((x) => x.list_id === activeList)
@@ -218,7 +244,7 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     }
     setDraft(card)
     setMode('create')
-  }, [activeList, lists])
+  }, [activeBook, activeList, lists])
 
   const startEdit = useCallback(() => {
     if (!selected) return
@@ -287,7 +313,7 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
         pushToast(t('This file is not a vCard. Choose a .vcf file exported from your phone or another contacts app.'), 'error')
         return
       }
-      const result = await importVcf(accountId, text, { merge: true })
+      const result = await importVcf(accountId, text, { merge: true, addressBook: activeBook })
       await refreshAll()
       syncSoonRef.current()
       const parts = []
@@ -298,15 +324,15 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     } catch (e) {
       pushToast(e.message || 'Import failed', 'error')
     }
-  }, [accountId, refreshAll, pushToast, t])
+  }, [accountId, activeBook, refreshAll, pushToast, t])
 
   const handleExportAll = useCallback(async () => {
     try {
-      downloadText('contacts.vcf', await exportVcf(accountId, []))
+      downloadText('contacts.vcf', await exportVcf(accountId, [], activeBook))
     } catch (e) {
       pushToast(e.message || 'Export failed', 'error')
     }
-  }, [accountId, pushToast])
+  }, [accountId, activeBook, pushToast])
 
   // Two-way sync. Reassigned every render so the auto-sync timer always calls the
   // latest closure; a ref guard prevents overlapping runs. Only the single chosen
@@ -457,9 +483,15 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
     }
   }, [accountId, activeList, refreshAll, pushToast, t])
 
-  const selectAll = () => { setShowFavorites(false); setActiveList(null) }
-  const selectFavorites = () => { setShowFavorites(true); setActiveList(null) }
-  const selectList = (id) => { setShowFavorites(false); setActiveList(id) }
+  const selectAll = () => { setShowFavorites(false); setActiveList(null); setBookSelection(null) }
+  const selectFavorites = () => { setShowFavorites(true); setActiveList(null); setBookSelection(null) }
+  const selectList = (id) => { setShowFavorites(false); setActiveList(id); setBookSelection(null) }
+  const selectBook = (href) => {
+    setBookSelection({ accountId, href })
+    setShowFavorites(false)
+    setActiveList(null)
+    setSelectedId(null)
+  }
 
   if (!accountId) {
     return <div className="cs-root cs-empty-account"><p>{t('Select an account to manage contacts.')}</p></div>
@@ -511,7 +543,7 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
             <button className="cs-icon-plus" title={t('New list')} onClick={() => setCreatingList(true)}>＋</button>
           </div>
 
-          <button className={`cs-nav-item ${!showFavorites && activeList == null ? 'active' : ''}`} onClick={selectAll}>
+          <button className={`cs-nav-item ${!showFavorites && activeList == null && !activeBook ? 'active' : ''}`} onClick={selectAll}>
             <span className="cs-nav-ic">{icon('all-mails')}</span>
             <span className="cs-nav-label">{t('All contacts')}</span>
             <span className="cs-nav-count">{counts.total}</span>
@@ -523,6 +555,18 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
           </button>
 
           <div className="cs-nav-divider" />
+
+          {books.length > 0 && <>
+            <div className="cs-lists-head"><span>{t('CardDAV address books')}</span></div>
+            {books.map(({ href, name }) => (
+              <button key={href} className={`cs-nav-item ${activeBook === href ? 'active' : ''}`}
+                onClick={() => selectBook(href)}>
+                <span className="cs-nav-ic">{icon('folder')}</span>
+                <span className="cs-nav-label">{name}</span>
+              </button>
+            ))}
+            <div className="cs-nav-divider" />
+          </>}
 
           {creatingList && (
             <ListNameInput
@@ -563,6 +607,18 @@ export default function ContactsSection({ accountId, toolbarStyle = 'icon_text_s
         {/* ── Contact list ── */}
         <aside className="cs-list-pane">
           <div className="cs-count">{loading ? t('Loading…') : t('{{n}} contacts', { n: contacts.length })}</div>
+
+          <label className="cs-count">
+            {t('Sort contacts')}
+            {' '}
+            <select value={sortOrder} onChange={(e) => {
+              localStorage.setItem('contacts_sort_order', e.target.value)
+              setSortOrder(e.target.value)
+            }}>
+              <option value="asc">{t('Name (A–Z)')}</option>
+              <option value="desc">{t('Name (Z–A)')}</option>
+            </select>
+          </label>
 
           <div className="cs-list">
             {!loading && contacts.length === 0 && (

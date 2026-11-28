@@ -50,6 +50,7 @@ test('normalizeComposeDraft coerces numeric uids for forward/bulk reply', () => 
 
   assert.deepEqual(draft.forwardTargets, [
     { uid: '101', mailbox: 'INBOX', from: '', subject: '', date: '' },
+    { uid: '102', mailbox: 'INBOX', from: '', subject: '', date: '' },
   ])
   assert.equal(draft.bulkReplyTargets[0].uid, '201')
   assert.equal(draft.replyContext.uid, '301')
@@ -218,7 +219,7 @@ test('queueComposeSend parses reply_all recipient strings for bulk replies', asy
   assert.deepEqual(payload.cc, ['cc@example.com', 'cc2@example.com'])
 })
 
-test('normalizeComposeDraft truncates multi-forward targets to one', () => {
+test('normalizeComposeDraft preserves multiple forward targets', () => {
   const draft = normalizeComposeDraft({
     forwardTargets: [
       { uid: '1', mailbox: 'INBOX' },
@@ -226,7 +227,7 @@ test('normalizeComposeDraft truncates multi-forward targets to one', () => {
     ],
   })
 
-  assert.equal(draft.forwardTargets.length, 1)
+  assert.equal(draft.forwardTargets.length, 2)
   assert.equal(draft.forwardTargets[0].uid, '1')
   assert.equal(draft.forwardTargets[0].mailbox, 'INBOX')
 })

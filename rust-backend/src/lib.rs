@@ -23,7 +23,9 @@ mod oauth_routes;
 mod offline_routes;
 mod routes;
 mod security_routes;
+mod search_expression;
 pub mod smtp_send;
+mod spam_filter;
 mod sync_reconcile;
 mod todo_routes;
 
@@ -235,6 +237,14 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
                 .delete(calendar_routes::delete_event),
         )
         .route(
+            "/api/calendar/:account_id/events/:event_id/move-occurrence",
+            post(calendar_routes::move_occurrence),
+        )
+        .route(
+            "/api/calendar/:account_id/events/:event_id/occurrence",
+            post(calendar_routes::change_occurrence),
+        )
+        .route(
             "/api/calendar/:account_id/calendars",
             get(calendar_routes::get_calendars).post(calendar_routes::create_calendar),
         )
@@ -242,6 +252,14 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
             "/api/calendar/:account_id/calendars/:calendar_id",
             axum::routing::put(calendar_routes::update_calendar)
                 .delete(calendar_routes::delete_calendar),
+        )
+        .route(
+            "/api/calendar/:account_id/calendars/:calendar_id/google-access",
+            get(google_sync::list_calendar_access).put(google_sync::grant_calendar_access),
+        )
+        .route(
+            "/api/calendar/:account_id/calendars/:calendar_id/google-access/:rule_id",
+            delete(google_sync::revoke_calendar_access),
         )
         .route(
             "/api/calendar/:account_id/import",
@@ -289,6 +307,7 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
             "/api/carddav/:account_id/config",
             get(carddav_sync::carddav_get_config).put(carddav_sync::carddav_put_config),
         )
+        .route("/api/carddav/:account_id/address-books", get(carddav_sync::address_books))
         .route(
             "/api/carddav/:account_id/status",
             get(carddav_sync::carddav_status),
@@ -304,6 +323,10 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
         .route(
             "/api/tasks/:account_id/lists/:list_id",
             axum::routing::put(todo_routes::update_list).delete(todo_routes::delete_list),
+        )
+        .route(
+            "/api/tasks/:account_id/lists/:list_id/reorder",
+            post(todo_routes::reorder_task),
         )
         .route(
             "/api/tasks/:account_id/clear-completed",
@@ -418,6 +441,14 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
                 .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
+            "/api/offline/:account_id/outbox",
+            get(offline_routes::get_outbox),
+        )
+        .route(
+            "/api/offline/:account_id/outbox/:outbox_id/cancel",
+            post(offline_routes::cancel_scheduled_send),
+        )
+        .route(
             "/api/offline/:account_id/retry-actions",
             post(offline_routes::retry_offline_actions),
         )
@@ -462,6 +493,11 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
             get(offline_routes::get_inline_asset),
         )
         .route(
+            "/api/offline/:account_id/spam-settings",
+            get(spam_filter::settings).put(spam_filter::update_settings),
+        )
+        .route("/api/offline/:account_id/spam-feedback", post(spam_filter::save_feedback))
+        .route(
             "/api/offline/:account_id/blocked-senders",
             get(offline_routes::get_blocked_senders).post(offline_routes::add_blocked_sender),
         )
@@ -470,7 +506,7 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
             delete(offline_routes::delete_blocked_sender)
                 .patch(offline_routes::update_blocked_sender),
         )
-        .with_state(mail_state);
+        .with_state(mail_state.clone());
 
     let app = auth_router
         .merge(mail_router)
@@ -488,6 +524,7 @@ pub async fn run(db_dir: Option<PathBuf>, token: String, port: u16) -> Result<u1
     tracing::info!("Starting Axum server on {}", bound_port);
 
     let port = bound_port.port();
+    tokio::spawn(offline_routes::run_mail_workers(mail_state));
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {

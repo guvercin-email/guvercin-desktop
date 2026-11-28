@@ -9,6 +9,7 @@ import {
     isComposeDraftDirty,
     isComposeDraftModified,
     normalizeComposeDraft,
+    closeLinkedDraftEditors,
 } from '../utils/compose.js'
 import { queueComposeSend } from '../utils/composeSend.js'
 import { getComposeSettings } from '../utils/composeSettings.js'
@@ -84,7 +85,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow')
                 const appWindow = getCurrentWebviewWindow()
                 unlistenPromise = appWindow.onCloseRequested((event) => {
-                    if (allowCloseRef.current || sentRef.current) return
+                    if (allowCloseRef.current || sentRef.current || dataRef.current?.linkedEditor) return
                     
                     // Always prevent default to take control of the close process
                     event.preventDefault()
@@ -214,7 +215,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     // Persist locally before the server draft queue runs; attachment payloads
     // are included so a crash can restore the complete composition.
     useEffect(() => {
-        if (!data || !windowLabel || sent || !isComposeDraftDirty(draft)) return undefined
+        if (!data || data.linkedEditor || !windowLabel || sent || !isComposeDraftDirty(draft)) return undefined
         const timer = window.setTimeout(() => {
             try { localStorage.setItem(recoveryKey, JSON.stringify({ savedAt: Date.now(), draft })) }
             catch (error) { console.warn('Could not persist compose recovery copy:', error) }
@@ -223,7 +224,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }, [data, draft, recoveryKey, sent, windowLabel])
 
     useEffect(() => {
-        if (!data || !windowLabel) return
+        if (!data || data.linkedEditor || !windowLabel) return
         try {
             const stored = safeParse(localStorage.getItem(recoveryKey) || '')
             if (!stored?.draft || Date.now() - Number(stored.savedAt || 0) > 7 * 86400000) return
@@ -281,6 +282,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }, [accountId])
 
     const handleSendNow = useCallback(async (composed) => {
+        if (dataRef.current?.linkedEditor) return false
         if (!accountId || sendInFlightRef.current || sentRef.current) return false
         sendInFlightRef.current = true
         window.clearTimeout(sendTimeoutRef.current)
@@ -306,6 +308,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                 },
             })
             if (!ok) return false
+            closeLinkedDraftEditors(accountId, composed.syncId)
 
             sentRef.current = true
             setSent(true)
@@ -337,6 +340,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
     }, [])
 
     const startDelayedSend = useCallback((composed) => {
+        if (dataRef.current?.linkedEditor) return false
         if (sendTimeoutRef.current || sendInFlightRef.current || sentRef.current) return false
         try {
             const normalized = normalizeComposeDraft(composed)
@@ -350,7 +354,7 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
             }
 
             clearPendingSend()
-            const durationMs = getComposeSettings(data?.accountId).undoSendSeconds * 1000
+            const durationMs = normalized.scheduledSendAt ? 0 : getComposeSettings(data?.accountId).undoSendSeconds * 1000
             if (durationMs <= 0) {
                 void handleSendNow(normalized)
                 return true
@@ -481,7 +485,8 @@ export default function DetachedComposeWindow({ initialLabel = '' } = {}) {
                         draft={draft}
                         onDraftChange={setDraft}
                         onSend={handleSend}
-                        onDiscard={handleDiscard}
+                        onDiscard={data?.linkedEditor ? closeWindow : handleDiscard}
+                        linkedEditor={data?.linkedEditor}
                     showTopDiscard={true}
                     accountEmail={accountEmail}
                         accountId={accountId}

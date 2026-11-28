@@ -4,8 +4,8 @@ use lettre::{
     transport::smtp::authentication::{Credentials, Mechanism, DEFAULT_MECHANISMS},
     transport::smtp::{
         client::{AsyncSmtpConnection, TlsParameters},
-        commands::{Data, Mail, Rcpt},
-        extension::{ClientId, Extension, MailBodyParameter, MailParameter},
+        commands::{Data, Ehlo, Mail, Rcpt},
+        extension::{ClientId, Extension, MailBodyParameter, MailParameter, RcptParameter},
     },
     Message,
 };
@@ -263,6 +263,7 @@ pub fn build_rfc822_message(msg: OutgoingMessage<'_>) -> Result<Vec<u8>, String>
 pub struct SmtpSendError {
     pub message: String,
     pub delivery_uncertain: bool,
+    pub connection_unavailable: bool,
 }
 
 impl From<String> for SmtpSendError {
@@ -270,6 +271,7 @@ impl From<String> for SmtpSendError {
         Self {
             message,
             delivery_uncertain: false,
+            connection_unavailable: false,
         }
     }
 }
@@ -284,6 +286,14 @@ impl From<&str> for SmtpSendError {
 /// `XOAUTH2` mechanism is used and `server.password` is an access token
 /// (Gmail); otherwise plain credentials are used.
 pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Result<(), SmtpSendError> {
+    send_mail_with_delivery_receipt(server, msg, false).await
+}
+
+pub async fn send_mail_with_delivery_receipt(
+    server: SmtpServer<'_>,
+    msg: OutgoingMessage<'_>,
+    request_delivery_receipt: bool,
+) -> Result<(), SmtpSendError> {
     let SmtpServer {
         host: smtp_host,
         port: smtp_port,
@@ -348,12 +358,32 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
         connection.auth(mechanisms, &credentials).await?;
         Ok::<_, lettre::transport::smtp::Error>(connection)
     }).await
-        .map_err(|_| "SMTP connection or authentication timed out".to_string())?
-        .map_err(|error| format!("SMTP connection or authentication failed: {error}"))?;
+        .map_err(|_| SmtpSendError {
+            message: "SMTP connection or authentication timed out".into(),
+            delivery_uncertain: false,
+            connection_unavailable: true,
+        })?
+        .map_err(|error| SmtpSendError {
+            message: format!("SMTP connection or authentication failed: {error}"),
+            delivery_uncertain: false,
+            connection_unavailable: error.is_timeout() || (error.status().is_none() && !error.is_client() && !error.is_tls()),
+        })?;
 
     let formatted = email_message.formatted();
     let envelope = email_message.envelope();
     let mut mail_options = Vec::new();
+    if request_delivery_receipt {
+        let response = tokio::time::timeout(timeout, connection.command(Ehlo::new(hello)))
+            .await
+            .map_err(|_| "SMTP capability check timed out".to_string())?
+            .map_err(|error| format!("SMTP capability check failed: {error}"))?;
+        if !response.message().any(|line| line.split_ascii_whitespace().next()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("DSN")))
+        {
+            return Err("SMTP server does not support delivery receipts (DSN)".into());
+        }
+        mail_options.push(MailParameter::Other { keyword: "RET".into(), value: Some("HDRS".into()) });
+    }
     if envelope.from().into_iter().chain(envelope.to()).any(|address| !AsRef::<str>::as_ref(address).is_ascii()) {
         if !connection.server_info().supports_feature(Extension::SmtpUtfEight) {
             return Err("SMTP server does not support SMTPUTF8".into());
@@ -370,7 +400,14 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
     let data_ready = tokio::time::timeout(timeout, async {
         connection.command(Mail::new(envelope.from().cloned(), mail_options)).await?;
         for recipient in envelope.to() {
-            connection.command(Rcpt::new(recipient.clone(), Vec::new())).await?;
+            let options = if request_delivery_receipt {
+                vec![RcptParameter::Other {
+                    keyword: "NOTIFY".into(), value: Some("SUCCESS,FAILURE,DELAY".into()),
+                }]
+            } else {
+                Vec::new()
+            };
+            connection.command(Rcpt::new(recipient.clone(), options)).await?;
         }
         connection.command(Data).await
     }).await
@@ -395,11 +432,13 @@ pub async fn send_mail(server: SmtpServer<'_>, msg: OutgoingMessage<'_>) -> Resu
                     format!("SMTP send failed: {error}")
                 },
                 delivery_uncertain,
+                connection_unavailable: false,
             })
         }
         Err(_) => Err(SmtpSendError {
             message: "SMTP delivery could not be confirmed before the timeout".into(),
             delivery_uncertain: true,
+            connection_unavailable: false,
         }),
     }
 
@@ -424,12 +463,12 @@ mod tests {
             AfterData(Option<&'static str>),
         }
 
-        for (outcome, expected_uncertainty, expected_messages) in [
-            (SmtpOutcome::RejectAuthentication, false, 0),
-            (SmtpOutcome::DropBeforeData, false, 0),
-            (SmtpOutcome::AfterData(Some("451 try again later\r\n")), false, 1),
-            (SmtpOutcome::AfterData(Some("550 message rejected\r\n")), false, 1),
-            (SmtpOutcome::AfterData(None), true, 1),
+        for (outcome, expected_uncertainty, expected_messages, request_receipt) in [
+            (SmtpOutcome::RejectAuthentication, false, 0, false),
+            (SmtpOutcome::DropBeforeData, false, 0, false),
+            (SmtpOutcome::AfterData(Some("451 try again later\r\n")), false, 1, false),
+            (SmtpOutcome::AfterData(Some("550 message rejected\r\n")), false, 1, true),
+            (SmtpOutcome::AfterData(None), true, 1, false),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -440,7 +479,7 @@ mod tests {
                 writer.write_all(b"220 localhost SMTP\r\n").await.unwrap();
                 while let Some(line) = lines.next_line().await.unwrap() {
                     let response = if line.starts_with("EHLO ") {
-                        "250-localhost\r\n250 AUTH PLAIN\r\n"
+                        "250-localhost\r\n250-DSN\r\n250 AUTH PLAIN\r\n"
                     } else if line.starts_with("AUTH PLAIN ") {
                         if matches!(outcome, SmtpOutcome::RejectAuthentication) {
                             writer.write_all(b"535 invalid credentials\r\n").await.unwrap();
@@ -448,6 +487,10 @@ mod tests {
                         }
                         "235 authenticated\r\n"
                     } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                        if request_receipt {
+                            let expected = if line.starts_with("MAIL FROM:") { "RET=HDRS" } else { "NOTIFY=SUCCESS,FAILURE,DELAY" };
+                            assert!(line.ends_with(expected), "{line}");
+                        }
                         if matches!(outcome, SmtpOutcome::DropBeforeData) {
                             return 0;
                         }
@@ -473,7 +516,7 @@ mod tests {
             });
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                super::send_mail(
+                super::send_mail_with_delivery_receipt(
                     super::SmtpServer {
                         host: "127.0.0.1", port, ssl_mode: "NONE",
                         email: "sender@example.test", password: "fixture", xoauth2: false,
@@ -483,6 +526,7 @@ mod tests {
                         cc: vec![], bcc: vec![], subject: "Fixture", format: OutgoingMailFormat::Plain,
                         html_body: "", plain_body: "Fixture body", attachments: &[], raw_headers: &[],
                     },
+                    request_receipt,
                 ),
             )
             .await

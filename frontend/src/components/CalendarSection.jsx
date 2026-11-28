@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import CalendarSharing from './CalendarSharing.jsx'
 import { requestNewCompose } from '../utils/mailtoInbox.js'
 import { requestNewTask, subscribeNewEvent } from '../utils/crossLinks.js'
 import { useOfflineSync } from '../context/OfflineSyncContext.jsx'
@@ -7,14 +8,18 @@ import { notifyReminder } from '../utils/notifications.js'
 import { getNotificationSettings, isWithinQuietHours } from '../utils/notificationSettings.js'
 import {
   caldavGetConfig, caldavSetConfig, caldavStatus, caldavSyncCalendar,
-  createCalendar, createEvent, deleteCalendar, deleteEvent, emptyEvent, exportIcs,
+  changeEventOccurrence, createCalendar, createEvent, deleteCalendar, deleteEvent, emptyEvent, exportIcs,
   fetchCalendars, fetchEvents, formatIsoLocalDate, formatIsoLocalDateTime, getEvent,
   getCalendarBackend, googleCalendarAccess, googleReconnect, googleSyncCalendar, setCalendarBackend,
   importIcs, naiveMsLocal, normalizeEvent, parseIsoLocal, updateCalendar, updateEvent,
 } from '../utils/calendarApi.js'
+import { instantForWallTime, projectCalendarInstance, supportedTimeZone, timeZoneObservances, wallTimeAt } from '../utils/calendarTimeZone.js'
 import './CalendarSection.css'
 
-const WEEK_START = 1 // Monday
+const LOCAL_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+const CALENDAR_ZONES = [...new Set([LOCAL_ZONE, 'UTC', ...(Intl.supportedValuesOf?.('timeZone') || [])])]
+
+
 const HOUR_PX = 46
 const CALENDAR_COLORS = [
   '#246bce', '#2e7d32', '#c2185b', '#6a1b9a', '#00838f',
@@ -29,9 +34,9 @@ const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); r
 const addMonths = (d, n) => { const x = new Date(d); x.setMonth(x.getMonth() + n); return x }
 const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
 const isToday = (d) => sameDay(d, new Date())
-function startOfWeek(d) {
+function startOfWeek(d, weekStart) {
   const x = startOfDay(d)
-  const diff = (x.getDay() - WEEK_START + 7) % 7
+  const diff = (x.getDay() - weekStart + 7) % 7
   return addDays(x, -diff)
 }
 function clampColor(c, fallback = '#246bce') {
@@ -50,6 +55,15 @@ function downloadText(filename, text, mime = 'text/calendar;charset=utf-8') {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+function withTimeZoneObservances(card) {
+  const zones = [...new Set([card.timeZone, card.endTimeZone].filter(Boolean))]
+  const year = Number(card.start.slice(0, 4))
+  const zoneObservances = card.allDay ? {} : Object.fromEntries(zones
+    .map((zone) => [zone, timeZoneObservances(zone, year)])
+    .filter(([, entries]) => entries.length))
+  return { ...card, zoneObservances }
+}
+
 export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_small', searchQuery }) {
   const { t, i18n } = useTranslation()
   const locale = i18n.language || 'en'
@@ -59,10 +73,12 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(false)
   const [view, setView] = useState(() => localStorage.getItem('calendar_view') || 'month')
+  const [weekStart, setWeekStart] = useState(() => localStorage.getItem('calendar_week_start') === '0' ? 0 : 1)
   const [cursor, setCursor] = useState(() => startOfDay(new Date()))
   // Search is driven entirely by the app navbar (searchQuery prop).
   const search = searchQuery || ''
   const [selected, setSelected] = useState(null) // event instance being viewed
+  const [calendarToShare, setCalendarToShare] = useState(null)
   const [draft, setDraft] = useState(null) // event card being edited
   const [draftMode, setDraftMode] = useState('create') // 'create' | 'edit'
   const [saving, setSaving] = useState(false)
@@ -108,11 +124,11 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
   const range = useMemo(() => {
     if (view === 'month') {
       const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1)
-      const gridStart = startOfWeek(first)
+      const gridStart = startOfWeek(first, weekStart)
       return { start: gridStart, end: addDays(gridStart, 42) }
     }
     if (view === 'week') {
-      const s = startOfWeek(cursor)
+      const s = startOfWeek(cursor, weekStart)
       return { start: s, end: addDays(s, 7) }
     }
     if (view === 'day') {
@@ -122,7 +138,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     // agenda: 45 days from cursor
     const s = startOfDay(cursor)
     return { start: s, end: addDays(s, 45) }
-  }, [view, cursor])
+  }, [view, cursor, weekStart])
 
   const reloadCalendars = useCallback(async () => {
     if (!accountId) return
@@ -139,13 +155,18 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     if (!accountId) return
     if (!silent) setLoading(true)
     try {
+      const from = naiveMsLocal(range.start)
+      const to = naiveMsLocal(range.end)
+      const zonePadding = 3 * 86_400_000
       const rows = await fetchEvents(accountId, {
-        from: naiveMsLocal(range.start),
-        to: naiveMsLocal(range.end),
+        from: from - zonePadding,
+        to: to + zonePadding,
         search,
         calendars: visibleCalIds,
       })
-      setEvents((rows || []).map((r) => ({ ...r, card: normalizeEvent(r.card) })))
+      setEvents((rows || []).map((r) => projectCalendarInstance({ ...r, card: normalizeEvent(r.card) }, LOCAL_ZONE))
+        .filter((event) => event.startMs < to && event.endMs > from)
+        .sort((left, right) => left.startMs - right.startMs))
     } catch (e) {
       if (!silent) pushToast(e.message || 'Failed to load events', 'error')
     } finally {
@@ -219,7 +240,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     for (const ev of events) {
       const startDate = parseIsoLocal(ev.card.start)
       if (!startDate) continue
-      const startMs = startDate.getTime()
+      const startMs = ev.realStart ?? startDate.getTime()
       for (const mins of ev.card.reminders || []) {
         const fireAt = startMs - mins * 60000
         const key = `${ev.instanceKey}:${mins}`
@@ -259,7 +280,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     if (view === 'month') return cursor.toLocaleDateString(locale, { month: 'long', year: 'numeric' })
     if (view === 'day') return cursor.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
     if (view === 'week') {
-      const s = startOfWeek(cursor); const e = addDays(s, 6)
+      const s = startOfWeek(cursor, weekStart); const e = addDays(s, 6)
       const sameMonth = s.getMonth() === e.getMonth()
       const left = s.toLocaleDateString(locale, { day: 'numeric', month: 'short' })
       const right = e.toLocaleDateString(locale, sameMonth ? { day: 'numeric', month: 'short', year: 'numeric' } : { day: 'numeric', month: 'short', year: 'numeric' })
@@ -267,7 +288,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     }
     const s = startOfDay(cursor); const e = addDays(s, 44)
     return `${s.toLocaleDateString(locale, { day: 'numeric', month: 'short' })} – ${e.toLocaleDateString(locale, { day: 'numeric', month: 'short', year: 'numeric' })}`
-  }, [view, cursor, locale])
+  }, [view, cursor, locale, weekStart])
 
   // ── Editor lifecycle ──
   const defaultCalendarId = useMemo(() => {
@@ -279,6 +300,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     const card = emptyEvent()
     card.calendarId = defaultCalendarId
     if (prefill) Object.assign(card, prefill)
+    if (!card.allDay && !card.timeZone) card.timeZone = LOCAL_ZONE
     if (!card.start) {
       const base = new Date()
       base.setMinutes(0, 0, 0)
@@ -295,6 +317,7 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     const card = emptyEvent()
     card.calendarId = defaultCalendarId
     card.allDay = allDay
+    card.timeZone = allDay ? '' : LOCAL_ZONE
     if (allDay) {
       card.start = formatIsoLocalDate(date)
       card.end = formatIsoLocalDate(date)
@@ -328,34 +351,53 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     })
   }, [t])
 
-  const startEdit = useCallback(async (inst) => {
+  const startEdit = useCallback(async (inst, occurrenceOnly = false) => {
     // Recurring instances only carry the occurrence's times; load the master so
     // edits apply to the real series start.
-    let card = normalizeEvent(inst.card)
-    if (inst.isRecurring) {
+    let card = normalizeEvent(inst.originalCard || inst.card)
+    if (inst.isRecurring && !occurrenceOnly) {
       try {
         const master = await getEvent(accountId, inst.id)
         card = normalizeEvent(master.card)
-      } catch { /* fall back to the instance card */ }
+      } catch (error) {
+        pushToast(error.message || t('Could not load the event series.'), 'error')
+        return
+      }
     }
     setDraft(card)
-    setDraftMode('edit')
+    setDraftMode(occurrenceOnly ? 'occurrence' : 'edit')
     setSelected(inst)
-  }, [accountId])
+  }, [accountId, pushToast, t])
 
   const cancelEdit = useCallback(() => setDraft(null), [])
 
   const handleSave = useCallback(async () => {
     if (!draft) return
     if (!draft.start) { pushToast(t('Please pick a start date.'), 'error'); return }
+    if (!draft.allDay && draft.timeZone && !supportedTimeZone(draft.timeZone)) {
+      pushToast(t('Choose a valid time zone.'), 'error')
+      return
+    }
+    if (!draft.allDay && draft.timeZone && draft.end) {
+      const startsAt = instantForWallTime(draft.start, draft.timeZone)
+      const endsAt = instantForWallTime(draft.end, draft.endTimeZone || draft.timeZone)
+      if (startsAt === null || endsAt === null || endsAt <= startsAt) {
+        pushToast(t('The event must end after it starts.'), 'error')
+        return
+      }
+    }
     setSaving(true)
     try {
+      const card = withTimeZoneObservances(draft)
       let rec
       if (draftMode === 'create') {
-        rec = await createEvent(accountId, draft)
+        rec = await createEvent(accountId, card)
         pushToast(t('Event added'))
+      } else if (draftMode === 'occurrence') {
+        await changeEventOccurrence(accountId, selected.id, Number(selected.instanceKey.split('@').at(-1)), card)
+        pushToast(t('Event saved'))
       } else {
-        rec = await updateEvent(accountId, selected.id, draft)
+        rec = await updateEvent(accountId, selected.id, card)
         pushToast(t('Event saved'))
       }
       await refreshAll()
@@ -370,19 +412,55 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
     }
   }, [accountId, draft, draftMode, selected, refreshAll, pushToast, t])
 
-  const handleDelete = useCallback(async (inst) => {
+  const moveEventToDate = useCallback(async (event, target, exactTime = false) => {
+    const start = eventStart(event)
+    if (exactTime ? +start === +target : sameDay(start, target)) return
+    const dayNumber = (date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000
+    const shift = dayNumber(target) - dayNumber(start)
+    const format = event.card.allDay ? formatIsoLocalDate : formatIsoLocalDateTime
+    const end = eventEnd(event)
+    const nextStart = exactTime ? target : addDays(start, shift)
+    const duration = event.realEnd != null ? event.realEnd - event.realStart : +end - +start
+    const nextEnd = exactTime ? new Date(+target + duration) : addDays(end, shift)
+    const eventCard = event.originalCard || event.card
+    const targetCard = withTimeZoneObservances({
+      ...eventCard,
+      start: event.originalCard ? wallTimeAt(nextStart, eventCard.timeZone) : format(nextStart),
+      end: event.originalCard ? wallTimeAt(nextEnd, eventCard.endTimeZone || eventCard.timeZone) : format(nextEnd),
+    })
+    try {
+      if (event.isRecurring) {
+        const original = Number(event.instanceKey.split('@').at(-1))
+        await changeEventOccurrence(accountId, event.id, original, targetCard)
+      } else {
+        await updateEvent(accountId, event.id, targetCard)
+      }
+      syncSoonRef.current()
+      setSelected(null)
+      await refreshAll()
+      pushToast(t('Event saved'))
+    } catch (error) {
+      pushToast(error.message || t('Could not move event.'), 'error')
+    }
+  }, [accountId, refreshAll, pushToast, t])
+
+  const handleDelete = useCallback(async (inst, occurrenceOnly = false) => {
     const target = inst || selected
     if (!target) return
-    const msg = target.isRecurring
+    const msg = occurrenceOnly ? t('Delete only this occurrence?') : target.isRecurring
       ? t('Delete the whole repeating series “{{title}}”?', { title: target.card.title || t('(untitled event)') })
       : t('Delete this event?')
     if (!window.confirm(msg)) return
     try {
-      await deleteEvent(accountId, target.id)
+      if (occurrenceOnly) {
+        await changeEventOccurrence(accountId, target.id, Number(target.instanceKey.split('@').at(-1)))
+      } else {
+        await deleteEvent(accountId, target.id)
+      }
+      syncSoonRef.current()
       setSelected(null)
       setDraft(null)
       await refreshAll()
-      syncSoonRef.current()
       pushToast(t('Event deleted'))
     } catch (e) {
       pushToast(e.message || 'Delete failed', 'error')
@@ -425,6 +503,27 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
       pushToast(e.message || 'Export failed', 'error')
     }
   }, [accountId, pushToast])
+
+  const shareCalendar = useCallback(async (calendar) => {
+    try {
+      const ics = await exportIcs(accountId, { calendars: [calendar.calendarId] })
+      const bytes = new TextEncoder().encode(ics)
+      if (bytes.length > 20 * 1024 * 1024) throw new Error(t('The calendar is too large to attach.'))
+      const chunks = []
+      for (let offset = 0; offset < bytes.length; offset += 8192) {
+        chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)))
+      }
+      requestNewCompose({
+        subject: t('Calendar: {{name}}', { name: calendar.name }),
+        attachments: [{
+          id: crypto.randomUUID(), name: 'calendar.ics', mimeType: 'text/calendar',
+          size: bytes.length, base64: btoa(chunks.join('')), disposition: 'attachment',
+        }],
+      })
+    } catch (error) {
+      pushToast(error.message || t('Could not share the calendar.'), 'error')
+    }
+  }, [accountId, pushToast, t])
 
   // Two-way sync. Reassigned every render so the auto-sync timer always calls the
   // latest closure; a ref guard prevents overlapping runs. Only the single chosen
@@ -630,7 +729,18 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
       <div className="cal-body">
         {/* ── Sidebar: mini-month + calendars ── */}
         <aside className="cal-sidebar">
-          <MiniMonth cursor={cursor} locale={locale} onPick={(d) => setCursor(startOfDay(d))} />
+          <label className="cal-labeled">
+            <span>{t('Week starts on')}</span>
+            <select className="cal-select" value={weekStart} onChange={(e) => {
+              const value = Number(e.target.value)
+              localStorage.setItem('calendar_week_start', String(value))
+              setWeekStart(value)
+            }}>
+              <option value={1}>{t('Monday')}</option>
+              <option value={0}>{t('Sunday')}</option>
+            </select>
+          </label>
+          <MiniMonth weekStart={weekStart} cursor={cursor} locale={locale} onPick={(d) => setCursor(startOfDay(d))} />
 
           <div className="cal-cals-head">
             <span>{t('Calendars')}</span>
@@ -654,6 +764,8 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
                     <span className="cal-cal-count">{c.count}</span>
                   </label>
                   <span className="cal-cal-actions">
+                    <button type="button" aria-label={t('Share calendar')} title={t('Share calendar')}
+                      onClick={() => setCalendarToShare(c)}>{icon('mail')}</button>
                     <button title={t('Rename')} onClick={() => setRenamingCal(c.calendarId)}>✎</button>
                     {!c.isDefault && <button title={t('Delete calendar')} onClick={() => handleDeleteCal(c)}>✕</button>}
                   </span>
@@ -666,14 +778,14 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
         {/* ── Main view ── */}
         <section className="cal-main">
           {view === 'month' && (
-            <MonthView cursor={cursor} events={events} locale={locale} t={t}
+            <MonthView weekStart={weekStart} cursor={cursor} events={events} locale={locale} t={t}
               onDayClick={(d) => startCreateAt(d, { allDay: false })}
-              onEventClick={openEvent} onMoreClick={(d) => { setCursor(startOfDay(d)); setView('day') }} />
+              onEventClick={openEvent} onEventMove={moveEventToDate} onMoreClick={(d) => { setCursor(startOfDay(d)); setView('day') }} />
           )}
           {(view === 'week' || view === 'day') && (
-            <TimeGridView days={view === 'week' ? 7 : 1} cursor={cursor} events={events} locale={locale} t={t}
+            <TimeGridView weekStart={weekStart} days={view === 'week' ? 7 : 1} cursor={cursor} events={events} locale={locale} t={t}
               onSlotClick={(d) => startCreateAt(d)} onAllDayClick={(d) => startCreateAt(d, { allDay: true })}
-              onEventClick={openEvent} />
+              onEventClick={openEvent} onEventMove={moveEventToDate} />
           )}
           {view === 'agenda' && (
             <AgendaView events={events} locale={locale} t={t}
@@ -686,15 +798,23 @@ export default function CalendarSection({ accountId, toolbarStyle = 'icon_text_s
       {selected && !draft && (
         <EventDetail inst={selected} locale={locale} t={t} calColorMap={calColorMap}
           onClose={() => setSelected(null)} onEdit={() => startEdit(selected)}
+          onEditOccurrence={selected.isRecurring ? () => startEdit(selected, true) : null}
+          onDeleteOccurrence={selected.isRecurring ? () => handleDelete(selected, true) : null}
           onDelete={() => handleDelete(selected)} onEmail={() => emailAttendees(selected)}
           onNewTask={() => { makeTaskFromEvent(selected); setSelected(null) }} />
       )}
 
       {/* ── Editor modal ── */}
+      {calendarToShare && <CalendarSharing accountId={accountId} calendar={calendarToShare}
+        onClose={() => setCalendarToShare(null)} onSendCopy={() => {
+          void shareCalendar(calendarToShare)
+          setCalendarToShare(null)
+        }} />}
+
       {draft && (
-        <EventEditor t={t} locale={locale} draft={draft} setDraft={setDraft} saving={saving}
-          isNew={draftMode === 'create'} calendars={calendars} onCancel={cancelEdit} onSave={handleSave}
-          onDelete={draftMode === 'edit' && selected ? () => handleDelete(selected) : null} />
+        <EventEditor weekStart={weekStart} t={t} locale={locale} draft={draft} setDraft={setDraft} saving={saving}
+          isNew={draftMode === 'create'} occurrenceOnly={draftMode === 'occurrence'} calendars={calendars} onCancel={cancelEdit} onSave={handleSave}
+          onDelete={draftMode !== 'create' && selected ? () => handleDelete(selected, draftMode === 'occurrence') : null} />
       )}
 
       {/* ── Cloud-choice modal (first-run onboarding + settings) ── */}
@@ -912,11 +1032,11 @@ function CalDavSettings({ t, accountId, onClose, onChanged, pushToast }) {
 
 // ─────────────────────────── Mini month ───────────────────────────
 
-function MiniMonth({ cursor, locale, onPick }) {
+function MiniMonth({ weekStart, cursor, locale, onPick }) {
   const [month, setMonth] = useState(() => new Date(cursor.getFullYear(), cursor.getMonth(), 1))
   useEffect(() => { setMonth(new Date(cursor.getFullYear(), cursor.getMonth(), 1)) }, [cursor])
 
-  const gridStart = startOfWeek(new Date(month.getFullYear(), month.getMonth(), 1))
+  const gridStart = startOfWeek(new Date(month.getFullYear(), month.getMonth(), 1), weekStart)
   const cells = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i))
   const dow = Array.from({ length: 7 }, (_, i) => addDays(gridStart, i).toLocaleDateString(locale, { weekday: 'narrow' }))
 
@@ -944,12 +1064,19 @@ function MiniMonth({ cursor, locale, onPick }) {
 
 // ─────────────────────────── Month view ───────────────────────────
 
+function colorInputValue(color) {
+  const hex = clampColor(color)
+  return hex.length === 4 ? '#' + [...hex.slice(1)].map((digit) => digit.repeat(2)).join('') : hex
+}
+
+function eventColor(ev) { return clampColor(ev.card.color, clampColor(ev.calendarColor)) }
 function eventStart(ev) { return parseIsoLocal(ev.card.start) || new Date(ev.startMs) }
 function eventEnd(ev) { return parseIsoLocal(ev.card.end) || new Date(ev.endMs) }
 
-function MonthView({ cursor, events, locale, t, onDayClick, onEventClick, onMoreClick }) {
+function MonthView({ weekStart, cursor, events, locale, t, onDayClick, onEventClick, onEventMove, onMoreClick }) {
+  const draggedEvent = useRef(null)
   const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1)
-  const gridStart = startOfWeek(first)
+  const gridStart = startOfWeek(first, weekStart)
   const cells = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i))
   const weekdayNames = Array.from({ length: 7 }, (_, i) => addDays(gridStart, i).toLocaleDateString(locale, { weekday: 'short' }))
 
@@ -985,6 +1112,19 @@ function MonthView({ cursor, events, locale, t, onDayClick, onEventClick, onMore
           const extra = dayEvents.length - shown.length
           return (
             <div key={i} className={`cal-month-cell ${dim ? 'dim' : ''} ${isToday(d) ? 'today' : ''} ${[0, 6].includes(d.getDay()) ? 'weekend' : ''}`}
+              onDragOver={(e) => {
+                if (draggedEvent.current) {
+                  e.preventDefault()
+                  e.dataTransfer.dropEffect = 'move'
+                }
+              }}
+              onDrop={(e) => {
+                const event = draggedEvent.current
+                if (!event) return
+                e.preventDefault()
+                draggedEvent.current = null
+                onEventMove(event, d)
+              }}
               onClick={() => onDayClick(d)}>
               <div className="cal-month-cell-head">
                 <span className={`cal-month-daynum ${isToday(d) ? 'today' : ''}`}>{d.getDate()}</span>
@@ -992,9 +1132,16 @@ function MonthView({ cursor, events, locale, t, onDayClick, onEventClick, onMore
               <div className="cal-month-events">
                 {shown.map((ev) => (
                   <button key={ev.instanceKey} className={`cal-chip ${ev.card.allDay ? 'allday' : ''}`}
-                    style={ev.card.allDay ? { background: ev.calendarColor, color: '#fff' } : undefined}
+                    draggable
+                    onDragStart={(e) => {
+                      draggedEvent.current = ev
+                      e.dataTransfer.effectAllowed = 'move'
+                      e.dataTransfer.setData('application/x-guvercin-calendar-event', String(ev.id))
+                    }}
+                    onDragEnd={() => { draggedEvent.current = null }}
+                    style={ev.card.allDay ? { background: eventColor(ev), color: '#fff' } : undefined}
                     onClick={(e) => { e.stopPropagation(); onEventClick(ev) }} title={ev.card.title}>
-                    {!ev.card.allDay && <span className="cal-chip-dot" style={{ background: ev.calendarColor }} />}
+                    {!ev.card.allDay && <span className="cal-chip-dot" style={{ background: eventColor(ev) }} />}
                     {!ev.card.allDay && <span className="cal-chip-time">{eventStart(ev).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}</span>}
                     <span className="cal-chip-title">{ev.card.title || t('(untitled event)')}</span>
                     {ev.isRecurring && <span className="cal-chip-recur">⟳</span>}
@@ -1016,9 +1163,10 @@ function MonthView({ cursor, events, locale, t, onDayClick, onEventClick, onMore
 
 // ─────────────────────────── Week / Day (time grid) ───────────────────────────
 
-function TimeGridView({ days, cursor, events, locale, t, onSlotClick, onAllDayClick, onEventClick }) {
+function TimeGridView({ weekStart, days, cursor, events, locale, t, onSlotClick, onAllDayClick, onEventClick, onEventMove }) {
+  const dragged = useRef(null)
   const scrollRef = useRef(null)
-  const startDay = days === 7 ? startOfWeek(cursor) : startOfDay(cursor)
+  const startDay = days === 7 ? startOfWeek(cursor, weekStart) : startOfDay(cursor)
   const cols = Array.from({ length: days }, (_, i) => addDays(startDay, i))
   const hours = Array.from({ length: 24 }, (_, i) => i)
 
@@ -1038,6 +1186,32 @@ function TimeGridView({ days, cursor, events, locale, t, onSlotClick, onAllDayCl
   const allDayByCol = cols.map((d) => events.filter((ev) => ev.card.allDay && startOfDay(eventStart(ev)) <= startOfDay(d) && startOfDay(eventEnd(ev)) >= startOfDay(d)))
   const timedByCol = cols.map((d) => events.filter((ev) => !ev.card.allDay && sameDay(eventStart(ev), d)))
   const hasAllDay = allDayByCol.some((list) => list.length)
+  const dragProps = (event) => ({
+    draggable: true,
+    onDragStart: (drag) => {
+      dragged.current = event
+      drag.dataTransfer.effectAllowed = 'move'
+      drag.dataTransfer.setData('application/x-guvercin-calendar-event', String(event.id))
+    },
+    onDragEnd: () => { dragged.current = null },
+  })
+  const dropProps = (isAllDay, dateForDrop) => ({
+    onDragOver: (drag) => {
+      if (dragged.current?.card.allDay === isAllDay) {
+        drag.preventDefault()
+        drag.dataTransfer.dropEffect = 'move'
+      }
+    },
+    onDrop: (drag) => {
+      const event = dragged.current
+      if (!event || event.card.allDay !== isAllDay) return
+      drag.preventDefault()
+      drag.stopPropagation()
+      dragged.current = null
+      onEventMove(event, dateForDrop(drag), !isAllDay)
+    },
+  })
+
 
   return (
     <div className="cal-timegrid">
@@ -1055,9 +1229,9 @@ function TimeGridView({ days, cursor, events, locale, t, onSlotClick, onAllDayCl
         <div className="cal-tg-allday">
           <div className="cal-tg-gutter cal-tg-allday-label">{t('All day')}</div>
           {cols.map((d, i) => (
-            <div key={i} className="cal-tg-allday-col" onClick={() => onAllDayClick(d)}>
+            <div key={i} className="cal-tg-allday-col" {...dropProps(true, () => d)} onClick={() => onAllDayClick(d)}>
               {allDayByCol[i].map((ev) => (
-                <button key={ev.instanceKey} className="cal-chip allday" style={{ background: ev.calendarColor, color: '#fff' }}
+                <button key={ev.instanceKey} className="cal-chip allday" {...dragProps(ev)} style={{ background: eventColor(ev), color: '#fff' }}
                   onClick={(e) => { e.stopPropagation(); onEventClick(ev) }} title={ev.card.title}>
                   <span className="cal-chip-title">{ev.card.title || t('(untitled event)')}</span>
                 </button>
@@ -1077,7 +1251,14 @@ function TimeGridView({ days, cursor, events, locale, t, onSlotClick, onAllDayCl
             ))}
           </div>
           {cols.map((d, ci) => (
-            <div key={ci} className={`cal-tg-col ${isToday(d) ? 'today' : ''}`}>
+            <div key={ci} className={`cal-tg-col ${isToday(d) ? 'today' : ''}`}
+              {...dropProps(false, (drag) => {
+                const y = drag.clientY - drag.currentTarget.getBoundingClientRect().top
+                const minute = Math.max(0, Math.min(1425, Math.floor(y / HOUR_PX * 4) * 15))
+                const target = new Date(d)
+                target.setMinutes(minute)
+                return target
+              })}>
               {hours.map((h) => (
                 <div key={h} className="cal-tg-slot" style={{ height: HOUR_PX }}
                   onClick={() => { const dt = new Date(d); dt.setHours(h, 0, 0, 0); onSlotClick(dt) }} />
@@ -1088,8 +1269,8 @@ function TimeGridView({ days, cursor, events, locale, t, onSlotClick, onAllDayCl
                 const endH = e.getHours() + e.getMinutes() / 60
                 const height = Math.max(0.5, (sameDay(s, e) ? endH : 24) - (s.getHours() + s.getMinutes() / 60)) * HOUR_PX
                 return (
-                  <button key={ev.instanceKey} className="cal-event"
-                    style={{ top, height: Math.max(height, 18), left: `${left}%`, width: `calc(${width}% - 3px)`, background: ev.calendarColor }}
+                  <button key={ev.instanceKey} className="cal-event" {...dragProps(ev)}
+                    style={{ top, height: Math.max(height, 18), left: `${left}%`, width: `calc(${width}% - 3px)`, background: eventColor(ev) }}
                     onClick={(e2) => { e2.stopPropagation(); onEventClick(ev) }} title={ev.card.title}>
                     <span className="cal-event-time">{s.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}</span>
                     <span className="cal-event-title">{ev.card.title || t('(untitled event)')} {ev.isRecurring ? '⟳' : ''}</span>
@@ -1168,7 +1349,7 @@ function AgendaView({ events, locale, t, onEventClick, onEmptyNew }) {
             <div className="cal-agenda-list">
               {list.map((ev) => (
                 <button key={ev.instanceKey} className="cal-agenda-item" onClick={() => onEventClick(ev)}>
-                  <span className="cal-agenda-bar" style={{ background: ev.calendarColor }} />
+                  <span className="cal-agenda-bar" style={{ background: eventColor(ev) }} />
                   <span className="cal-agenda-time">
                     {ev.card.allDay ? t('All day') : eventStart(ev).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}
                   </span>
@@ -1186,7 +1367,7 @@ function AgendaView({ events, locale, t, onEventClick, onEmptyNew }) {
 
 // ─────────────────────────── Event detail popover ───────────────────────────
 
-function EventDetail({ inst, locale, t, onClose, onEdit, onDelete, onEmail, onNewTask }) {
+function EventDetail({ inst, locale, t, onClose, onEdit, onDelete, onEmail, onNewTask, onEditOccurrence, onDeleteOccurrence }) {
   const card = inst.card
   const s = eventStart(inst); const e = eventEnd(inst)
   const dateText = card.allDay
@@ -1198,8 +1379,8 @@ function EventDetail({ inst, locale, t, onClose, onEdit, onDelete, onEmail, onNe
   return (
     <div className="cal-modal-overlay" onClick={onClose}>
       <div className="cal-detail" onClick={(ev) => ev.stopPropagation()}>
-        <div className="cal-detail-head" style={{ borderColor: inst.calendarColor }}>
-          <span className="cal-detail-dot" style={{ background: inst.calendarColor }} />
+        <div className="cal-detail-head" style={{ borderColor: eventColor(inst) }}>
+          <span className="cal-detail-dot" style={{ background: eventColor(inst) }} />
           <h3>{card.title || t('(untitled event)')}</h3>
           <button className="cal-detail-close" onClick={onClose} title={t('Close')}><img src="/img/icons/close.svg" className="svg-icon-inline" /></button>
         </div>
@@ -1223,6 +1404,8 @@ function EventDetail({ inst, locale, t, onClose, onEdit, onDelete, onEmail, onNe
           )}
         </div>
         <div className="cal-detail-actions">
+          {onEditOccurrence && <button className="cal-btn" onClick={onEditOccurrence}>{t('Edit this occurrence')}</button>}
+          {onDeleteOccurrence && <button className="cal-btn" onClick={onDeleteOccurrence}>{t('Delete this occurrence')}</button>}
           <button className="cal-btn cal-btn--primary" onClick={onEdit}>{t('Edit')}</button>
           {attendees.some((a) => a.email) && <button className="cal-btn" onClick={onEmail}>{t('Email attendees')}</button>}
           <button className="cal-btn" onClick={onNewTask}>{t('New task')}</button>
@@ -1236,14 +1419,11 @@ function EventDetail({ inst, locale, t, onClose, onEdit, onDelete, onEmail, onNe
 // ─────────────────────────── Event editor ───────────────────────────
 
 function splitDateTime(iso, allDay) {
-  const d = parseIsoLocal(iso)
-  if (!d) return { date: '', time: '09:00' }
-  const date = formatIsoLocalDate(d)
-  const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  return { date, time: allDay ? '00:00' : time }
+  const match = String(iso || '').match(/^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?/)
+  return { date: match?.[1] || '', time: allDay ? '00:00' : (match?.[2] || '09:00') }
 }
 
-function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onCancel, onSave, onDelete }) {
+function EventEditor({ weekStart, t, locale, draft, setDraft, saving, isNew, occurrenceOnly, calendars, onCancel, onSave, onDelete }) {
   const set = (patch) => setDraft((d) => ({ ...d, ...patch }))
   const setRec = (patch) => setDraft((d) => ({ ...d, recurrence: { ...d.recurrence, ...patch } }))
 
@@ -1255,9 +1435,11 @@ function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onC
       set({ start: date, end: draft.end && parseIsoLocal(draft.end) >= parseIsoLocal(date) ? draft.end : date })
     } else {
       const startIso = `${date}T${time}`
-      const sd = parseIsoLocal(startIso)
+      const endsAt = Date.parse(`${startIso}:00Z`)
       let endIso = draft.end
-      if (!parseIsoLocal(endIso) || parseIsoLocal(endIso) <= sd) endIso = formatIsoLocalDateTime(new Date(sd.getTime() + 3600000))
+      if (Number.isFinite(endsAt) && (!endIso || endIso <= startIso)) {
+        endIso = new Date(endsAt + 3600000).toISOString().slice(0, 16)
+      }
       set({ start: startIso, end: endIso })
     }
   }
@@ -1278,7 +1460,7 @@ function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onC
   }
 
   const weekdays = Array.from({ length: 7 }, (_, i) => {
-    const wd = (WEEK_START + i) % 7
+    const wd = (weekStart + i) % 7
     const d = new Date(2021, 7, 1 + ((wd - new Date(2021, 7, 1).getDay() + 7) % 7))
     return { wd, label: d.toLocaleDateString(locale, { weekday: 'narrow' }) }
   })
@@ -1309,7 +1491,7 @@ function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onC
           <div className="cal-form-row2">
             <label className="cal-labeled">
               <span>{t('Calendar')}</span>
-              <select className="cal-select" value={draft.calendarId ?? ''} onChange={(e) => set({ calendarId: e.target.value ? Number(e.target.value) : null })}>
+              <select className="cal-select" disabled={occurrenceOnly} value={draft.calendarId ?? ''} onChange={(e) => set({ calendarId: e.target.value ? Number(e.target.value) : null })}>
                 {calendars.map((c) => <option key={c.calendarId} value={c.calendarId}>{c.name}</option>)}
               </select>
             </label>
@@ -1321,6 +1503,20 @@ function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onC
                 <option value="cancelled">{t('Cancelled')}</option>
               </select>
             </label>
+          </div>
+
+          <div className="cal-form-row2">
+            <label className="cal-labeled">
+              <span>{t('Event color')}</span>
+              <input type="color"
+                value={colorInputValue(draft.color || calendars.find((c) => c.calendarId === draft.calendarId)?.color)}
+                onChange={(e) => set({ color: e.target.value })} />
+            </label>
+            {draft.color && (
+              <button type="button" className="cal-btn" onClick={() => set({ color: '' })}>
+                {t('Use calendar color')}
+              </button>
+            )}
           </div>
 
           <label className="cal-check">
@@ -1345,73 +1541,87 @@ function EventEditor({ t, locale, draft, setDraft, saving, isNew, calendars, onC
             </label>
           </div>
 
+          {!draft.allDay && (
+            <label className="cal-labeled">
+              <span>{t('Time zone')}</span>
+              <select className="cal-select" value={draft.timeZone}
+                onChange={(event) => set({ timeZone: event.target.value, endTimeZone: '' })}>
+                <option value="">{t('Floating local time')}</option>
+                {draft.timeZone && !CALENDAR_ZONES.includes(draft.timeZone) && <option value={draft.timeZone}>{draft.timeZone}</option>}
+                {CALENDAR_ZONES.map((zone) => <option key={zone} value={zone}>{zone}</option>)}
+              </select>
+            </label>
+          )}
+
           <label className="cal-labeled">
             <span>{t('Location')}</span>
             <input className="cal-input" placeholder={t('Add a location')} value={draft.location} onChange={(e) => set({ location: e.target.value })} />
           </label>
 
           {/* Recurrence */}
-          <div className="cal-form-section">
-            <div className="cal-form-section-title">{t('Repeat')}</div>
-            <div className="cal-form-row2">
-              <label className="cal-labeled">
-                <span>{t('Frequency')}</span>
-                <select className="cal-select" value={draft.recurrence.freq} onChange={(e) => setRec({ freq: e.target.value })}>
-                  <option value="none">{t('Does not repeat')}</option>
-                  <option value="daily">{t('Daily')}</option>
-                  <option value="weekly">{t('Weekly')}</option>
-                  <option value="monthly">{t('Monthly')}</option>
-                  <option value="yearly">{t('Yearly')}</option>
-                </select>
-              </label>
-              {draft.recurrence.freq !== 'none' && (
-                <label className="cal-labeled">
-                  <span>{t('Every')}</span>
-                  <input className="cal-input" type="number" min="1" value={draft.recurrence.interval}
-                    onChange={(e) => setRec({ interval: Math.max(1, Number(e.target.value) || 1) })} />
-                </label>
-              )}
-            </div>
-
-            {draft.recurrence.freq === 'weekly' && (
-              <div className="cal-weekday-row">
-                {weekdays.map(({ wd, label }) => (
-                  <button key={wd} type="button" className={`cal-weekday ${draft.recurrence.byWeekday?.includes(wd) ? 'on' : ''}`} onClick={() => toggleWeekday(wd)}>{label}</button>
-                ))}
-              </div>
-            )}
-
-            {draft.recurrence.freq !== 'none' && (
+          {!occurrenceOnly && (
+            <div className="cal-form-section">
+              <div className="cal-form-section-title">{t('Repeat')}</div>
               <div className="cal-form-row2">
                 <label className="cal-labeled">
-                  <span>{t('Ends')}</span>
-                  <select className="cal-select" value={endMode}
-                    onChange={(e) => {
-                      const m = e.target.value
-                      if (m === 'never') setRec({ until: '', count: 0 })
-                      else if (m === 'until') setRec({ count: 0, until: formatIsoLocalDate(addMonths(parseIsoLocal(draft.start) || new Date(), 3)) })
-                      else setRec({ until: '', count: 10 })
-                    }}>
-                    <option value="never">{t('Never')}</option>
-                    <option value="until">{t('On date')}</option>
-                    <option value="count">{t('After N times')}</option>
+                  <span>{t('Frequency')}</span>
+                  <select className="cal-select" value={draft.recurrence.freq} onChange={(e) => setRec({ freq: e.target.value })}>
+                    <option value="none">{t('Does not repeat')}</option>
+                    <option value="daily">{t('Daily')}</option>
+                    <option value="weekly">{t('Weekly')}</option>
+                    <option value="monthly">{t('Monthly')}</option>
+                    <option value="yearly">{t('Yearly')}</option>
                   </select>
                 </label>
-                {endMode === 'until' && (
+                {draft.recurrence.freq !== 'none' && (
                   <label className="cal-labeled">
-                    <span>{t('Until')}</span>
-                    <input className="cal-input" type="date" value={draft.recurrence.until} onChange={(e) => setRec({ until: e.target.value })} />
-                  </label>
-                )}
-                {endMode === 'count' && (
-                  <label className="cal-labeled">
-                    <span>{t('Occurrences')}</span>
-                    <input className="cal-input" type="number" min="1" value={draft.recurrence.count} onChange={(e) => setRec({ count: Math.max(1, Number(e.target.value) || 1) })} />
+                    <span>{t('Every')}</span>
+                    <input className="cal-input" type="number" min="1" value={draft.recurrence.interval}
+                      onChange={(e) => setRec({ interval: Math.max(1, Number(e.target.value) || 1) })} />
                   </label>
                 )}
               </div>
-            )}
-          </div>
+
+              {draft.recurrence.freq === 'weekly' && (
+                <div className="cal-weekday-row">
+                  {weekdays.map(({ wd, label }) => (
+                    <button key={wd} type="button" className={`cal-weekday ${draft.recurrence.byWeekday?.includes(wd) ? 'on' : ''}`} onClick={() => toggleWeekday(wd)}>{label}</button>
+                  ))}
+                </div>
+              )}
+
+              {draft.recurrence.freq !== 'none' && (
+                <div className="cal-form-row2">
+                  <label className="cal-labeled">
+                    <span>{t('Ends')}</span>
+                    <select className="cal-select" value={endMode}
+                      onChange={(e) => {
+                        const m = e.target.value
+                        if (m === 'never') setRec({ until: '', count: 0 })
+                        else if (m === 'until') setRec({ count: 0, until: formatIsoLocalDate(addMonths(parseIsoLocal(draft.start) || new Date(), 3)) })
+                        else setRec({ until: '', count: 10 })
+                      }}>
+                      <option value="never">{t('Never')}</option>
+                      <option value="until">{t('On date')}</option>
+                      <option value="count">{t('After N times')}</option>
+                    </select>
+                  </label>
+                  {endMode === 'until' && (
+                    <label className="cal-labeled">
+                      <span>{t('Until')}</span>
+                      <input className="cal-input" type="date" value={draft.recurrence.until} onChange={(e) => setRec({ until: e.target.value })} />
+                    </label>
+                  )}
+                  {endMode === 'count' && (
+                    <label className="cal-labeled">
+                      <span>{t('Occurrences')}</span>
+                      <input className="cal-input" type="number" min="1" value={draft.recurrence.count} onChange={(e) => setRec({ count: Math.max(1, Number(e.target.value) || 1) })} />
+                    </label>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Reminders */}
           <label className="cal-labeled">

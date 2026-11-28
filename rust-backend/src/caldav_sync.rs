@@ -232,8 +232,8 @@ async fn fetch_events(
         r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="{start}" end="{end}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#
     );
     let resp = dav::dav_request(http, cfg, dav::report(), collection.as_str(), Some("1"), Some(dav::XML_CT), &[], Some(body)).await?;
-    if !dav::is_dav_success(resp.status) {
-        return Ok(Vec::new());
+    if !dav::is_dav_success(resp.status) || !dav::has_elem(&resp.body, "multistatus") {
+        return Err(AppError::BadRequest(format!("CalDAV could not list calendar events (HTTP {})", resp.status.as_u16())));
     }
     let mut out = Vec::new();
     for r in dav::responses(&resp.body) {
@@ -283,13 +283,32 @@ fn parse_state(row: &sqlx::sqlite::SqliteRow) -> LocalState {
     }
 }
 
-/// Build a single-VEVENT iCalendar body for `card`, guaranteeing a stable UID.
-fn card_to_ics(card: &cal::EventCard) -> String {
-    let mut c = card.clone();
-    if c.uid.trim().is_empty() {
-        c.uid = cal::new_uid();
+async fn push_series(
+    http: &reqwest::Client, cfg: &DavConfig, pool: &SqlitePool,
+    id: i64, href: &str, card: &cal::EventCard,
+    changes: &[cal::OccurrenceChange], etag: Option<&str>, original: Option<&str>,
+) -> Result<(), AppError> {
+    let payload = if let Some(original) = original {
+        cal::patch_ics_occurrences(original, card, changes)
+            .ok_or_else(|| AppError::BadRequest("Could not locate the event series in the CalDAV resource".into()))?
+    } else {
+        cal::build_ics_series(card, changes)
+    };
+    let new_etag = if original.is_some() {
+        let response = dav::dav_request(http, cfg, reqwest::Method::PUT, href, None, Some(dav::ICAL_CT),
+            &[("If-Match", etag.unwrap_or("*"))], Some(payload)).await?;
+        if !dav::is_dav_success(response.status) {
+            return Err(AppError::BadRequest(format!("CalDAV rejected the occurrence update (HTTP {})", response.status.as_u16())));
+        }
+        response.etag
+    } else {
+        put_event(http, cfg, href, &payload, etag).await?
+    };
+    cal::sync_mark_pushed(pool, "events", "event_id", id, href, new_etag.as_deref(), 0).await?;
+    for change in changes.iter().filter(|change| change.revision != 0) {
+        cal::mark_occurrence_pushed(pool, id, change).await?;
     }
-    cal::build_ics(std::slice::from_ref(&c))
+    Ok(())
 }
 
 // ─────────────────────────── sync ───────────────────────────
@@ -298,6 +317,8 @@ pub async fn sync_caldav(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "calendar").await;
+    let _guard = lock.lock().await;
     let Some(cfg) = load_config(&state, account_id).await? else {
         return Err(AppError::BadRequest(
             "CalDAV is not configured for this account.".into(),
@@ -351,13 +372,12 @@ pub async fn sync_caldav(
         .collect();
 
     let mut by_remote: HashMap<String, usize> = HashMap::new();
-    let mut by_uid: HashMap<String, usize> = HashMap::new();
+    let mut by_uid: HashMap<(i64, &str), usize> = HashMap::new();
     for (i, l) in locals.iter().enumerate() {
         if let Some(rid) = l.remote_id.as_deref().filter(|s| !s.is_empty()) {
             by_remote.insert(rid.to_string(), i);
-        }
-        if !l.uid.is_empty() {
-            by_uid.entry(l.uid.clone()).or_insert(i);
+        } else if !l.uid.is_empty() {
+            by_uid.entry((l.calendar_id, &l.uid)).or_insert(i);
         }
     }
 
@@ -369,17 +389,20 @@ pub async fn sync_caldav(
     // 3. Reconcile each remote event against local (ETag drives change detection).
     for (local_cal, ev) in &remote {
         let cards = cal::parse_ics(&ev.ics);
-        let Some(mut card) = cards.into_iter().find(|c| !c.start.trim().is_empty()) else { continue };
+        let Some(mut card) = cards.iter().find(|c| c.recurrence_id.is_none() && !c.start.trim().is_empty()).cloned()
+            else { continue };
         card.calendar_id = Some(*local_cal);
         let remote_etag = ev.etag.as_deref();
+        let remote_changes = cal::ics_occurrences(&card, &cards);
 
         let idx = by_remote
             .get(&ev.href)
-            .or_else(|| if card.uid.is_empty() { None } else { by_uid.get(&card.uid) })
+            .or_else(|| by_uid.get(&(*local_cal, card.uid.as_str())))
             .copied();
         match idx {
             None => {
-                cal::sync_write_event(&pool, None, &card, &ev.href, remote_etag, 0).await?;
+                let id = cal::sync_write_event(&pool, None, &card, &ev.href, remote_etag, 0).await?;
+                cal::receive_occurrences(&pool, id, &remote_changes, true).await?;
                 pulled += 1;
             }
             Some(i) => {
@@ -389,19 +412,32 @@ pub async fn sync_caldav(
                     dav::delete_resource(&http, &cfg, &ev.href, local.etag.as_deref()).await?;
                     cal::sync_hard_delete(&pool, "events", "event_id", local.id).await?;
                     deleted_remote += 1;
-                } else if local.state.dirty {
-                    // Local wins; overwrite the remote using the freshly-fetched
-                    // ETag (mirrors the contacts path in `google_sync`). Using the
-                    // stored ETag here would 412 on a genuine conflict and wedge
-                    // every later sync.
-                    if let Ok(lcard) = serde_json::from_str::<cal::EventCard>(&local.card_json) {
-                        let new_etag = put_event(&http, &cfg, &ev.href, &card_to_ics(&lcard), remote_etag).await?;
-                        cal::sync_mark_pushed(&pool, "events", "event_id", local.id, &ev.href, new_etag.as_deref(), 0).await?;
+                } else {
+                    let master = if local.state.dirty {
+                        serde_json::from_str::<cal::EventCard>(&local.card_json).unwrap_or_else(|_| card.clone())
+                    } else {
+                        card.clone()
+                    };
+                    let edits = cal::occurrence_changes(&pool, local.id, &master).await?;
+                    if local.state.dirty || edits.iter().any(|change| change.revision != 0) {
+                        let mut merged: std::collections::BTreeMap<_, _> = remote_changes.into_iter()
+                            .map(|change| (change.occurrence_start, change)).collect();
+                        for change in edits.into_iter().filter(|change| change.revision != 0) {
+                            merged.insert(change.occurrence_start, change);
+                        }
+                        let changes: Vec<_> = merged.into_values().collect();
+                        if !local.state.dirty && local.etag.as_deref() != remote_etag {
+                            cal::sync_write_event(&pool, Some(local.id), &card, &ev.href, remote_etag, 0).await?;
+                        }
+                        cal::receive_occurrences(&pool, local.id, &changes, true).await?;
+                        push_series(&http, &cfg, &pool, local.id, &ev.href, &master, &changes, remote_etag,
+                            (!local.state.dirty).then_some(ev.ics.as_str())).await?;
                         pushed += 1;
+                    } else if local.etag.as_deref() != remote_etag || local.etag.is_none() {
+                        cal::sync_write_event(&pool, Some(local.id), &card, &ev.href, remote_etag, 0).await?;
+                        cal::receive_occurrences(&pool, local.id, &remote_changes, true).await?;
+                        pulled += 1;
                     }
-                } else if local.etag.as_deref() != remote_etag {
-                    cal::sync_write_event(&pool, Some(local.id), &card, &ev.href, remote_etag, 0).await?;
-                    pulled += 1;
                 }
             }
         }
@@ -441,12 +477,15 @@ pub async fn sync_caldav(
                         .cloned()
                         .or_else(|| collections.first().map(|c| c.url.clone()))
                     else { continue };
-                    let ics = card_to_ics(&lcard);
-                    let uid = if lcard.uid.trim().is_empty() { cal::new_uid() } else { lcard.uid.clone() };
-                    let name = dav::sanitize_name(&uid, "event");
+                    let mut lcard = lcard;
+                    if lcard.uid.trim().is_empty() {
+                        lcard.uid = cal::new_uid();
+                    }
+                    let uid = &lcard.uid;
+                    let name = dav::sanitize_name(uid, "event");
                     let Ok(href) = collection.join(&format!("{name}.ics")) else { continue };
-                    let new_etag = put_event(&http, &cfg, href.as_str(), &ics, None).await?;
-                    cal::sync_mark_pushed(&pool, "events", "event_id", local.id, href.as_str(), new_etag.as_deref(), 0).await?;
+                    let edits = cal::occurrence_changes(&pool, local.id, &lcard).await?;
+                    push_series(&http, &cfg, &pool, local.id, href.as_str(), &lcard, &edits, None, None).await?;
                     pushed += 1;
                 }
             }

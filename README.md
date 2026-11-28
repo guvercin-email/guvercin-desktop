@@ -227,7 +227,7 @@ default. set `GUVERCIN_API_PORT` and the matching `VITE_API_URL` to override it.
 | | |
 | --- | --- |
 | databases | `~/.guvercin/databases/` — `general.db` plus one `<account_id>.db` per account |
-| master key | `<local app data>/com.guvercin.app/master.key` |
+| master key | OS credential store, item `com.guvercin.app / database-master-key` |
 
 every sqlite file is opened through sqlcipher with a key derived per database from
 a 256-bit master key held in zeroizing memory. attachments, inline assets and
@@ -237,21 +237,19 @@ tokens are exchanged by the backend and never pass through the interface.
 
 per-account databases mean deleting an account is deleting one file. set
 `DATABASE_DIR` to move all of it somewhere else, an external volume included.
-deleting `master.key` makes every database permanently unreadable — there is no
-recovery path.
+deleting the credential makes the encrypted databases unreadable. keep the
+credential available when restoring the data.
 
 ### what the encryption actually protects
 
-the master key is stored as a **plain file in your user profile**. it is not
-wrapped by the os keychain and not protected by a passphrase. on unix it is written
-with mode 0600, so other local users cannot read it; on windows it inherits the
-per-user acl of the local app data directory.
+the key is stored in Keychain on macOS, Credential Manager on Windows, or a
+running Secret Service on Linux. an earlier `master.key` file is migrated and
+removed after the credential has been written and verified. the database files
+retain their existing keys.
 
-so: sqlcipher protects your mail from another account on the same machine, and from
-anyone who reads the disk without that key. it does **not** protect you from
-anything running as you — including malware in your own session — because that can
-simply read the key. full-disk encryption is still your job. moving the key into
-the platform keychain is open work.
+the OS credential store controls access to the key. access by software running
+inside the user's unlocked session depends on the operating system and its
+credential policy.
 
 one more thing worth knowing: **the shipped google oauth client secret is
 public.** it is compiled into the binary because an installed desktop app has

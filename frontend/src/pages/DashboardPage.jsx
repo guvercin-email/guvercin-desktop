@@ -1,3 +1,8 @@
+import CalendarInvitation from '../components/CalendarInvitation.jsx'
+import OfficeAttachmentPreview from '../components/OfficeAttachmentPreview.jsx'
+import { buildSpamModel, isLikelySpam, MAX_SPAM_EXAMPLES, spamFeatures } from '../utils/spamModel.js'
+import UnifiedInbox from '../components/UnifiedInbox.jsx'
+import MailReadingControls, { useMailReadingSettings } from '../components/MailReadingControls.jsx'
 import React, { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -26,6 +31,7 @@ import {
     normalizeComposeDraft,
     parseComposeBody,
     parseComposeRecipients,
+    closeLinkedDraftEditors,
 } from '../utils/compose.js'
 import { queueComposeSend } from '../utils/composeSend.js'
 import { getActiveComboMap, matchShortcut } from '../utils/keyboardShortcuts.js'
@@ -59,9 +65,9 @@ import { clearAccountSession } from '../utils/accountStorage.js'
 import { subscribeMailto, requestNewCompose } from '../utils/mailtoInbox.js'
 import { subscribeNavigate, requestNewEvent, requestNewTask } from '../utils/crossLinks.js'
 import { subscribeEml } from '../utils/emlInbox.js'
-import { notifyNewMail, setUnreadBadge, subscribeNotificationOpen, dismissNotificationForMail } from '../utils/notifications.js'
+import { notifyNewMail, notifyReminder, setUnreadBadge, subscribeNotificationOpen, dismissNotificationForMail } from '../utils/notifications.js'
 import { dedupeMailboxes, mailboxIdentity, mailKey, mailQuery, sameMail, queueMailActions } from '../utils/mailIdentity.js'
-import { getNotificationSettings, shouldNotifyForMail } from '../utils/notificationSettings.js'
+import { getNotificationSettings, isWithinQuietHours, shouldNotifyForMail } from '../utils/notificationSettings.js'
 import {
     isDefaultMailClient,
     setAsDefaultMailClient,
@@ -445,6 +451,7 @@ function CollapsedTab({ label, title, onClick }) {
 const MAIL_FILTER_OPTIONS = [
     { key: 'all', label: 'All', icon: <img src="/img/icons/all-mails.svg" alt="All" className="svg-icon-inline" /> },
     { key: 'unread', label: 'Unread', icon: <img src="/img/icons/unreaed.svg" alt="Unread" className="svg-icon-inline" /> },
+    { key: 'suspectedSpam', label: 'Suspected spam', icon: <img src="/img/icons/spambox.svg" alt="" className="svg-icon-inline" /> },
     { key: 'toMe', label: 'To me', icon: <img src="/img/icons/arrow-no-tail.svg" alt="To me" className="svg-icon-inline" /> },
 ]
 
@@ -1286,6 +1293,7 @@ const DashboardPage = () => {
                             : t('Messages are up to date.')
 
     const [activeSection, setActiveSection] = useState('mail')
+    const [quickReplyRequested, setQuickReplyRequested] = useState(false)
     // Shared search box for the non-mail workspaces (Contacts / Calendar / Todo).
     // The main navbar search drives this so it searches whatever page you're on.
     const [sectionSearch, setSectionSearch] = useState('')
@@ -1297,6 +1305,11 @@ const DashboardPage = () => {
     })
     const [accountId, setAccountId] = useState(null)
     const [accountForm, setAccountForm] = useState({})
+    const [outboxOpen, setOutboxOpen] = useState(false)
+    const [outboxResult, setOutboxResult] = useState(null)
+    const outboxEntries = outboxResult?.accountId === accountId ? outboxResult.entries : null
+    const [outboxError, setOutboxError] = useState(false)
+    const outboxDialogRef = useRef(null)
     const [email, setEmail] = useState('')
 
     const [connected, setConnected] = useState(false)
@@ -1323,6 +1336,20 @@ const DashboardPage = () => {
     const [perPage, setPerPage] = useState(50)
     const [inlineComposeSession, setInlineComposeSession] = useState(null)
     const [tabs, setTabs] = useState([])
+    useEffect(() => {
+        if (!accountId || typeof BroadcastChannel !== 'function') return
+        const channel = new BroadcastChannel(`guvercin-compose-${accountId}`)
+        channel.onmessage = ({ data }) => {
+            if (data?.type !== 'draft' || !data.fromLinkedEditor || !data.draft?.syncId) return
+            const apply = (session) => session?.draft?.syncId === data.draft.syncId
+                ? { ...session, draft: normalizeComposeDraft({ ...data.draft, composeSurface: session.draft.composeSurface }) }
+                : session
+            setInlineComposeSession(apply)
+            setTabs((previous) => previous.map((tab) => tab.kind === 'compose' ? apply(tab) : tab))
+        }
+        return () => channel.close()
+    }, [accountId])
+
     const [activeTabId, setActiveTabId] = useState(null)
     const [tabContents, setTabContents] = useState({})
 
@@ -1353,7 +1380,6 @@ const DashboardPage = () => {
     const selectedFolderRef = useRef(selectedFolder)
     const listModeRef = useRef(listMode)
     const backendReachableRef = useRef(false)
-    const remoteMailAvailableRef = useRef(false)
     const mailsRef = useRef(mails)
     const mailLoadRequestIdRef = useRef(0)
     const cacheListRequestIdRef = useRef(0)
@@ -1381,10 +1407,6 @@ const DashboardPage = () => {
     useEffect(() => {
         backendReachableRef.current = backendReachable
     }, [backendReachable])
-
-    useEffect(() => {
-        remoteMailAvailableRef.current = remoteMailAvailable
-    }, [remoteMailAvailable])
 
     useEffect(() => {
         mailsRef.current = mails
@@ -1823,6 +1845,20 @@ const DashboardPage = () => {
         }
     }, [accountId, backendReachable, remoteMailAvailable, ensureImapConnected, networkOnline, fetchMailboxCounts])
 
+    const cancelScheduledSend = async (entryId) => {
+        if (!window.confirm(t('Cancel this scheduled message?'))) return
+        try {
+            const response = await fetch(apiUrl(`/api/offline/${accountId}/outbox/${entryId}/cancel`), { method: 'POST' })
+            if (!response.ok) throw new Error(t('Could not cancel the scheduled message.'))
+            setOutboxResult((current) => current?.accountId === accountId
+                ? { ...current, entries: current.entries.filter((entry) => entry.id !== entryId) }
+                : current)
+            await refreshStatus(accountId)
+        } catch (error) {
+            window.alert(error.message)
+        }
+    }
+
     const retryOfflineActions = async () => {
         try {
             const response = await fetch(apiUrl(`/api/offline/${accountId}/retry-actions`), { method: 'POST' })
@@ -1833,6 +1869,36 @@ const DashboardPage = () => {
             window.alert(error.message)
         }
     }
+
+    useEffect(() => {
+        const dialog = outboxDialogRef.current
+        if (!outboxOpen || !accountId || !dialog) return
+        dialog.showModal()
+        const controller = new AbortController()
+        const refresh = async () => {
+            try {
+                const response = await fetch(apiUrl(`/api/offline/${accountId}/outbox`), {
+                    cache: 'no-store',
+                    signal: controller.signal,
+                })
+                if (!response.ok) throw new Error()
+                const entries = await response.json()
+                if (!controller.signal.aborted) {
+                    setOutboxResult({ accountId, entries })
+                    setOutboxError(false)
+                }
+            } catch {
+                if (!controller.signal.aborted) setOutboxError(true)
+            }
+        }
+        void refresh()
+        const timer = window.setInterval(refresh, 5000)
+        return () => {
+            controller.abort()
+            window.clearInterval(timer)
+            dialog.close()
+        }
+    }, [accountId, outboxOpen])
 
     const handleReconnectImap = useCallback(async () => {
         if (!accountId || !backendReachable || !networkOnline || connecting) return
@@ -1908,7 +1974,7 @@ const DashboardPage = () => {
         if (!accountId || !remoteMailAvailable || !folder || listMode === 'search') return false
         try {
             const params = new URLSearchParams({ mailbox: folder, page: String(page), per_page: String(per) })
-            if (forceAll) params.set('force_all', '1')
+            if (forceAll) params.set('force_all', 'true')
             const res = await fetch(apiUrl(`/api/offline/${accountId}/sync-mailbox?${params.toString()}`), { method: 'POST' })
             return res.ok
         } catch (err) {
@@ -2099,16 +2165,6 @@ const DashboardPage = () => {
             if (!backendReachableRef.current) return
             notifPollInFlightRef.current = true
             try {
-                // Best-effort remote sync so new server-side mail lands in the
-                // local cache even when INBOX isn't the active folder.
-                if (remoteMailAvailableRef.current) {
-                    try {
-                        await fetch(
-                            apiUrl(`/api/offline/${accountId}/sync-mailbox?mailbox=INBOX&page=1&per_page=50`),
-                            { method: 'POST' },
-                        )
-                    } catch { /* offline; fall back to whatever is cached */ }
-                }
                 if (cancelled) return
 
                 const res = await fetch(
@@ -2160,7 +2216,7 @@ const DashboardPage = () => {
             cancelled = true
             window.clearInterval(timer)
         }
-    }, [accountId])
+    }, [accountId, backendReachable])
 
     // Keep the OS unread badge (macOS dock / Linux launcher) and tray tooltip in
     // sync with the INBOX unread count.
@@ -2238,6 +2294,8 @@ const DashboardPage = () => {
         let active = true
         let unlistenNewMail = () => {}
         let unlistenSettings = () => {}
+        let unlistenWorkspace = () => {}
+        let unlistenQuickReply = () => {}
 
         ;(async () => {
             try {
@@ -2249,11 +2307,21 @@ const DashboardPage = () => {
                 const u2 = await listen('tray://settings', () => {
                     navigate('/settings')
                 })
+                const u3 = await listen('tray://workspace', ({ payload }) => {
+                    if (payload === 'calendar' || payload === 'todo') setActiveSection(payload)
+                })
+                const u4 = await listen('tray://quick-reply', () => {
+                    setActiveSection('mail')
+                    setSettingsPageOpen(false)
+                    setQuickReplyRequested(true)
+                })
                 if (active) {
+                    unlistenQuickReply = u4
+                    unlistenWorkspace = u3
                     unlistenNewMail = u1
                     unlistenSettings = u2
                 } else {
-                    u1(); u2()
+                    u1(); u2(); u3(); u4()
                 }
             } catch {
                 // Not running inside Tauri; tray events are unavailable.
@@ -2266,6 +2334,7 @@ const DashboardPage = () => {
             const kind = event.kind || 'mail'
             if (kind === 'calendar') { setActiveSection('calendar'); return }
             if (kind === 'todo') { setActiveSection('todo'); return }
+            if (kind === 'snooze') { setActiveSection('mail'); return }
             const mail = event.kind ? event.payload : event
             if (!mail) return
             setActiveSection('mail')
@@ -2277,6 +2346,8 @@ const DashboardPage = () => {
             active = false
             unlistenNewMail()
             unlistenSettings()
+            unlistenWorkspace()
+            unlistenQuickReply()
             unsubscribeOpen()
         }
     }, [handleSelectFolder, navigate])
@@ -2333,6 +2404,10 @@ const DashboardPage = () => {
                 cache: 'no-store',
                 signal,
             })
+            const indexedResults = source === 'remote' && /(?:^|\s)text:/i.test(payload.keywords || '')
+                ? search(`/api/offline/${accountId}/search-advanced`)
+                    .then((response) => response.ok ? response.json() : null).catch(() => null)
+                : null
             let res = await search(endpoint)
             if (!res.ok && source === 'remote' && !signal.aborted) {
                 source = 'offline'
@@ -2346,7 +2421,19 @@ const DashboardPage = () => {
 
             const data = await res.json()
             if (signal.aborted) return
+            const cached = source === 'remote' && indexedResults ? await indexedResults : null
+            if (signal.aborted) return
             const items = Array.isArray(data?.mails) ? data.mails : []
+            if (Array.isArray(cached?.mails) && cached.mails.length) {
+                const keys = new Set(items.map((mail) => mailKey(mail, selectedFolder)))
+                for (const mail of cached.mails) {
+                    const key = mailKey(mail, selectedFolder)
+                    if (keys.has(key)) continue
+                    keys.add(key)
+                    items.push(mail)
+                }
+                source = 'hybrid'
+            }
             const normalized = items
                 .map((mail) => (
                     mail && typeof mail === 'object'
@@ -2358,7 +2445,7 @@ const DashboardPage = () => {
             setMails(normalized)
             setActiveSearch({
                 criteria,
-                totalCount: typeof data?.total_count === 'number' ? data.total_count : normalized.length,
+                totalCount: source !== 'hybrid' && typeof data?.total_count === 'number' ? data.total_count : normalized.length,
                 source,
                 startedAt,
             })
@@ -2587,6 +2674,22 @@ const DashboardPage = () => {
         if (failed.length > 0) window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
     }, [accountId, queueAction, selectedFolder, setSelectedMail, t])
 
+    const setMailStar = useCallback(async (mail, flagged) => {
+        const key = mailKey(mail, selectedFolder)
+        const failed = await queueMailActions([key], queueAction, flagged ? 'star' : 'unstar')
+        if (accountIdRef.current !== accountId) return
+        if (failed.length) {
+            window.alert(t('Could not queue {{count}} message actions.', { count: failed.length }))
+            return
+        }
+        const update = (candidate) => mailKey(candidate, selectedFolder) === key
+            ? { ...candidate, flagged }
+            : candidate
+        setMails((previous) => previous.map(update))
+        setSelectedMail(update)
+        setTabs((previous) => previous.map((tab) => tab.kind === 'mail' ? { ...tab, mail: update(tab.mail) } : tab))
+    }, [accountId, queueAction, selectedFolder, setSelectedMail, t])
+
     const readingTab = activeTabId ? tabs.find((tab) => tab.id === activeTabId) : null
     const readingMail = activeTabId ? readingTab?.mail : selectedMail
     const readingKey = mailKey(readingMail, selectedFolder)
@@ -2672,6 +2775,7 @@ const DashboardPage = () => {
                     return window.confirm(`Send ${count} separate replies?\n\n${preview}${suffix}`)
                 },
             })
+            if (ok) closeLinkedDraftEditors(accountId, composed.syncId)
             return ok
         } catch (error) {
             console.error('Failed to queue send action:', error)
@@ -2694,6 +2798,24 @@ const DashboardPage = () => {
         } : null
     }, [accountEmailLabel, email, loadFolders, loadMailsFromCache, mailboxRoles, perPage, queueAction, selectedFolder])
 
+    const openUnifiedMessage = async (mail) => {
+        try {
+            nextMailWindowId.current += 1
+            await invoke('open_mail_window', {
+                label: `mail-${nextMailWindowId.current}`,
+                mailDataJson: JSON.stringify({
+                    mail,
+                    accountId: mail.accountId,
+                    accountEmail: mail.accountEmail,
+                    mailbox: 'INBOX',
+                    preferOffline: true,
+                }),
+            })
+        } catch (error) {
+            window.alert(error.message || t('Could not open the message.'))
+        }
+    }
+
     const detachMailToWindow = async () => {
         if (!selectedMail) return
         try {
@@ -2704,6 +2826,7 @@ const DashboardPage = () => {
                 mail: selectedMail,
                 mailContent: mailContent,
                 accountId: accountId,
+                accountEmail: accountEmailLabel || email,
                 mailbox: mailbox,
                 preferOffline: !canUseRemoteMail,
             }
@@ -2732,6 +2855,7 @@ const DashboardPage = () => {
                 mail: mail,
                 mailContent: content,
                 accountId: accountId,
+                accountEmail: accountEmailLabel || email,
                 mailbox: mailbox,
                 preferOffline: !canUseRemoteMail,
             }
@@ -3045,6 +3169,11 @@ const DashboardPage = () => {
                                         {t('Retry mail actions')}
                                     </button>
                                 )}
+                                <button type="button" className="db-sync-popover__action" onClick={() => {
+                                    setOutboxResult(null)
+                                    setOutboxError(false)
+                                    setOutboxOpen(true)
+                                }}>{t('Outbox')}</button>
                                 {lastError && <div className="db-sync-popover__error">Error: {lastError}</div>}
                             </div>
                         </div>
@@ -3223,6 +3352,7 @@ const DashboardPage = () => {
                 <div className={`db-sidebar${appMenuVisible ? '' : ' db-sidebar--hidden'}`}>
                     {[
                         { key: 'mail', icon: <img src="/img/icons/mail.svg" alt="Mail" className="svg-icon-inline" />, label: t('Mail') },
+                        { key: 'unified', icon: <img src="/img/icons/all-mails.svg" alt="" className="svg-icon-inline" />, label: t('Unified inbox') },
                         { key: 'calendar', icon: <img src="/img/icons/calendar.svg" alt="Calendar" className="svg-icon-inline" />, label: t('Calendar') },
                         { key: 'contacts', icon: <img src="/img/icons/contacts.svg" alt="Contacts" className="svg-icon-inline" />, label: t('Contacts') },
                         { key: 'todo', icon: <img src="/img/icons/todo.svg" alt="Todo" className="svg-icon-inline" />, label: t('Todo') }
@@ -3241,6 +3371,8 @@ const DashboardPage = () => {
 
     const dashboardContent = activeSection === 'mail' ? (
                             <MailSection
+                                quickReplyRequested={quickReplyRequested}
+                                setQuickReplyRequested={setQuickReplyRequested}
                                 injectedMainBar={mainBarNode}
                                 injectedAppsBar={appsBarNode}
                                 appLayout={appLayout}
@@ -3294,6 +3426,7 @@ const DashboardPage = () => {
                                 deleteMailsOptimistic={deleteMailsOptimistic}
                                 moveMailsOptimistic={moveMailsOptimistic}
                                 setMailsSeenState={setMailsSeenState}
+                                setMailStar={setMailStar}
                                 markAsReadDelaySeconds={markAsReadDelaySeconds}
                                 queueAction={queueAction}
                                 createMailbox={createMailbox}
@@ -3325,6 +3458,7 @@ const DashboardPage = () => {
                     <div className="db-content-area">
                         <div className="db-section-area">
                             <Suspense fallback={null}>
+                                {activeSection === 'unified' && <UnifiedInbox onOpen={openUnifiedMessage} online={networkOnline && backendReachable} />}
                                 {activeSection === 'calendar' && <CalendarSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
                                 {activeSection === 'contacts' && <ContactsSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
                                 {activeSection === 'todo' && <TodoSection accountId={accountId} toolbarStyle={toolbarStyle} searchQuery={sectionSearch} />}
@@ -3345,6 +3479,45 @@ const DashboardPage = () => {
                 onSelect={onExternalLinkPromptSelect}
             />
             {dashboardContent}
+            {outboxOpen && (
+                <dialog ref={outboxDialogRef} className="db-compose-exit-panel" aria-label={t('Outbox')}
+                    onCancel={(event) => { event.preventDefault(); setOutboxOpen(false) }}>
+                    <div className="db-compose-exit-panel__header">
+                        <div className="db-compose-exit-panel__title">{t('Outbox')}</div>
+                    </div>
+                    <div className="db-compose-exit-panel__body">
+                        {outboxError && <p role="alert">{t('Could not load the outbox.')}</p>}
+                        {!outboxError && !outboxEntries && <p role="status">{t('Loading…')}</p>}
+                        {!outboxError && outboxEntries?.length === 0 && <p>{t('The outbox is empty.')}</p>}
+                        {!!outboxEntries?.length && (
+                            <ul style={{ maxHeight: '50vh', overflow: 'auto' }}>
+                                {outboxEntries.map((entry) => (
+                                    <li key={entry.id}>
+                                        <strong>{entry.subject || t('(no subject)')}</strong>
+                                        {entry.recipients && <div>{entry.recipients}</div>}
+                                        <div>{t(entry.status)} · {t('Attempts')}: {entry.attempt_count}</div>
+                                        {entry.scheduled_at && <div>{t('Scheduled time')}: {new Date(entry.scheduled_at).toLocaleString()}</div>}
+                                        {entry.next_retry_at && (!entry.scheduled_at || entry.last_error) &&
+                                            <div>{t('Next retry')}: {entry.next_retry_at} UTC</div>}
+                                        {entry.can_cancel && <button type="button" className="db-advanced-search-btn"
+                                            onClick={() => cancelScheduledSend(entry.id)}>{t('Cancel scheduled send')}</button>}
+                                        {entry.last_error && <div>{entry.last_error}</div>}
+                                    </li>
+                                ))}
+                            </ul>
+                        )}
+                    </div>
+                    <div className="db-compose-exit-panel__actions">
+                        {outboxEntries?.some((entry) => entry.retryable) && (
+                            <button type="button" className="db-advanced-search-btn" onClick={retryOfflineActions}
+                                disabled={!networkOnline || !backendReachable}>{t('Retry mail actions')}</button>
+                        )}
+                        <button type="button" className="db-advanced-search-btn" onClick={() => setOutboxOpen(false)}>
+                            {t('Close')}
+                        </button>
+                    </div>
+                </dialog>
+            )}
             {actionNotices.length > 0 && (
                 <div className="db-action-notices" aria-live="polite">
                     {actionNotices.map((notice) => (
@@ -3533,6 +3706,8 @@ const DashboardPage = () => {
                                 <input
                                     className="db-advanced-search-input"
                                     type="text"
+                                    aria-label={t('Keywords')}
+                                    placeholder='from:alice AND text:"weekly report"'
                                     value={advancedSearchDraft.keywords}
                                     onChange={(e) => setAdvancedSearchDraft((prev) => ({ ...prev, keywords: e.target.value }))}
                                 />
@@ -3615,6 +3790,7 @@ const DashboardPage = () => {
 }
 
 function MailSection({
+    quickReplyRequested, setQuickReplyRequested,
     injectedMainBar,
     injectedAppsBar,
     appLayout,
@@ -3636,7 +3812,7 @@ function MailSection({
 	    openMail, detachMailToWindow, detachMailToWindowFromList, iframeRef, getShortTime,
     currentPage, setCurrentPage, maxPage: _maxPage, perPage, setPerPage,
     isMailFullscreen, toggleMailFullscreen,
-    deleteMailsOptimistic, moveMailsOptimistic, setMailsSeenState, queueAction, createMailbox,
+    deleteMailsOptimistic, moveMailsOptimistic, setMailsSeenState, setMailStar, queueAction, createMailbox,
     canUseRemoteMail, remoteMailAvailable, inlineComposeSession, setInlineComposeSession, sendComposedMail, saveComposeDraft, enqueueUndoableAction,
     tabs, setTabs, activeTabId, setActiveTabId, tabContents, setTabContents, nextTabId,
     accountForm,
@@ -3649,6 +3825,7 @@ function MailSection({
     markAsReadDelaySeconds,
 }) {
     const { t } = useTranslation()
+    const readingSettings = useMailReadingSettings()
     const hasFolderAccess = folders.length > 0
     const hasMailSource = canUseRemoteMail || hasFolderAccess
     const safeToolbarStyle = normalizeToolbarStyle(toolbarStyle)
@@ -3791,6 +3968,144 @@ function MailSection({
     const isMailboxesRight = layoutRegions.mailboxes === 'right'
     const isMaillistRight = layoutRegions.maillist === 'right'
 
+    const snoozeKey = `snoozed_mail_${accountId}`
+    const [snoozeState, setSnoozeState] = useState(null)
+    const snoozedMessages = useMemo(() => {
+        if (snoozeState?.key === snoozeKey) return snoozeState.entries
+        try {
+            const entries = JSON.parse(localStorage.getItem(snoozeKey) || '[]')
+            return Array.isArray(entries) ? entries : []
+        } catch {
+            return []
+        }
+    }, [snoozeKey, snoozeState])
+    const [snoozeClock, setSnoozeClock] = useState(Date.now)
+    const activeSnoozes = useMemo(() => snoozedMessages.filter(({ until }) => until > snoozeClock),
+        [snoozedMessages, snoozeClock])
+    useEffect(() => {
+        if (!activeSnoozes.length) return
+        const next = Math.min(...activeSnoozes.map(({ until }) => until))
+        const timer = window.setTimeout(() => {
+            const now = Date.now()
+            const prefs = getNotificationSettings(accountId)
+            if (prefs.enabled && !isWithinQuietHours(prefs)) {
+                for (const entry of activeSnoozes.filter(({ until }) => until <= now)) {
+                    void notifyReminder({
+                        kind: 'snooze',
+                        title: t('Snoozed message returned'),
+                        body: prefs.showPreview ? entry.subject : '',
+                        sound: prefs.soundMode !== 'none',
+                    })
+                }
+            }
+            setSnoozeClock(now)
+        }, Math.min(2_147_483_647, Math.max(1, next - Date.now())))
+        return () => window.clearTimeout(timer)
+    }, [accountId, activeSnoozes, t])
+    const saveSnoozes = (entries) => {
+        try {
+            localStorage.setItem(snoozeKey, JSON.stringify(entries))
+            setSnoozeState({ key: snoozeKey, entries })
+            setSnoozeClock(Date.now())
+            return true
+        } catch {
+            window.alert(t('Could not save the snooze.'))
+            return false
+        }
+    }
+    const [snoozeDraft, setSnoozeDraft] = useState(null)
+    const snoozeDialog = useRef(null)
+    useEffect(() => {
+        const dialog = snoozeDialog.current
+        if (!dialog || !snoozeDraft) return
+        if (!dialog.open) dialog.showModal()
+    }, [snoozeDraft])
+    const saveSnooze = (event) => {
+        event.preventDefault()
+        if (snoozeDraft.accountId !== accountId) {
+            setSnoozeDraft(null)
+            return
+        }
+        const until = new Date(snoozeDraft.date).getTime()
+        if (!(until > Date.now())) {
+            window.alert(t('Choose a future snooze time.'))
+            return
+        }
+        if (!saveSnoozes([...activeSnoozes.filter((entry) => entry.key !== snoozeDraft.key),
+            { key: snoozeDraft.key, subject: snoozeDraft.subject, until }])) return
+        if (mailKey(selectedMail, selectedFolder) === snoozeDraft.key) {
+            setSelectedMail(null)
+            setMailContent(null)
+        }
+        setSnoozeDraft(null)
+    }
+
+    const spamStorageKey = `spam_feedback_${accountId}`
+    const [spamFeedback, setSpamFeedback] = useState(null)
+    const spamExamples = useMemo(() => {
+        if (spamFeedback?.key === spamStorageKey) return spamFeedback.examples
+        try {
+            const values = JSON.parse(localStorage.getItem(spamStorageKey) || '[]')
+            return Array.isArray(values) ? values.filter((value) => value && typeof value.key === 'string') : []
+        } catch {
+            return []
+        }
+    }, [spamFeedback, spamStorageKey])
+    const spamLabels = useMemo(() => new Map(spamExamples.map((entry) => [entry.key, entry])), [spamExamples])
+    const spamModel = useMemo(() => buildSpamModel(spamExamples), [spamExamples])
+    const [spamAuto, setSpamAuto] = useState(null)
+    const [spamError, setSpamError] = useState(null)
+    useEffect(() => {
+        if (!accountId) return
+        const controller = new AbortController()
+        fetch(apiUrl(`/api/offline/${accountId}/spam-settings`), { signal: controller.signal })
+            .then((response) => { if (!response.ok) throw new Error(); return response.json() })
+            .then((data) => setSpamAuto({ accountId, enabled: data.enabled }))
+            .catch(() => { /* Training still works when the preference is unavailable. */ })
+        return () => controller.abort()
+    }, [accountId])
+    const autoMoveSpam = spamAuto?.accountId === accountId && spamAuto.enabled
+    const changeAutoSpam = async () => {
+        setSpamError(null)
+        try {
+            const response = await fetch(apiUrl(`/api/offline/${accountId}/spam-settings`), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: !autoMoveSpam }),
+            })
+            if (!response.ok) throw new Error()
+            const { enabled } = await response.json()
+            setSpamAuto({ accountId, enabled })
+        } catch {
+            setSpamError(accountId)
+        }
+    }
+    const trainSpamFilter = async (mail, label) => {
+        const key = mailKey(mail, selectedFolder)
+        const mailbox = mail.mailbox || selectedFolder || 'INBOX'
+        const content = await fetchMessageContent(accountId, mail, mailbox, canUseRemoteMail).catch(() => null)
+        const body = content?.plain_body?.trim() || (content?.html_body
+            ? new DOMParser().parseFromString(content.html_body, 'text/html').body.textContent
+            : '')
+        const features = spamFeatures(mail, body || '')
+        try {
+            const response = await fetch(apiUrl(`/api/offline/${accountId}/spam-feedback`), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key, spam: label === 'spam', features }),
+            })
+            if (!response.ok) throw new Error()
+            // The existing suspected-spam view also uses the feedback locally.
+            const examples = JSON.parse(localStorage.getItem(spamStorageKey) || '[]')
+            const next = [...(Array.isArray(examples) ? examples.filter((entry) => entry?.key !== key) : []),
+                { key, label, features: features.filter((feature) => !feature.startsWith('body:')) }].slice(-MAX_SPAM_EXAMPLES)
+            localStorage.setItem(spamStorageKey, JSON.stringify(next))
+            setSpamFeedback({ key: spamStorageKey, examples: next })
+        } catch {
+            window.alert(t('Could not save spam feedback.'))
+        }
+    }
+
     const visibleMails = useMemo(() => {
         const copy = Array.isArray(mails) ? mails.slice() : []
         const accountEmailNormalized = normalizeMailText(accountEmail)
@@ -3805,7 +4120,10 @@ function MailSection({
         const cmpText = (left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })
         const applyDirection = (value) => (sortDirection === 'asc' ? value : -value)
 
+        const snoozedKeys = new Set(activeSnoozes.map(({ key }) => key))
         const filtered = copy.filter((mail) => {
+            if (listMode !== 'search' && snoozedKeys.has(mailKey(mail, selectedFolder))) return false
+            if (activeFilter === 'suspectedSpam') return isLikelySpam(mail, mailKey(mail, selectedFolder), spamLabels, spamModel)
             if (activeFilter === 'unread') return mail.seen !== true
             if (activeFilter === 'toMe') {
                 if (!accountEmailNormalized) return false
@@ -3842,7 +4160,7 @@ function MailSection({
             return uidNum(b) - uidNum(a)
         })
         return filtered
-    }, [accountEmail, activeFilter, mails, sortBy, sortDirection])
+    }, [accountEmail, activeFilter, activeSnoozes, listMode, mails, selectedFolder, sortBy, sortDirection, spamLabels, spamModel])
 
     const threadedEnabled = threadViewEnabled && listMode !== 'search'
     useEffect(() => {
@@ -3990,8 +4308,7 @@ function MailSection({
     }, [mails, selectMode, selectedFolder, selectedMailIds, selectedMail])
     const actionableMailIds = actionableMails.map((mail) => mailKey(mail, selectedFolder))
     const hasAnyActionMail = actionableMails.length > 0
-    const hasMultipleActionMails = actionableMails.length > 1
-    const canForwardActionMail = actionableMails.length === 1
+    const canForwardActionMail = hasAnyActionMail
     const canOpenActionMail = actionableMails.length === 1
     const allActionMailsSeen = hasAnyActionMail && actionableMails.every((mail) => mail.seen === true)
     const homeReplyLabel = 'Reply'
@@ -4022,7 +4339,7 @@ function MailSection({
         [labels],
     )
     const selectionRequiredTitle = hasAnyActionMail ? undefined : 'Select a mail first'
-    const forwardSelectionTitle = canForwardActionMail ? undefined : (hasAnyActionMail ? 'Select a single mail to forward' : selectionRequiredTitle)
+    const forwardSelectionTitle = canForwardActionMail ? undefined : selectionRequiredTitle
     const openActionTitle = canOpenActionMail ? undefined : (hasAnyActionMail ? 'Select a single mail to open' : selectionRequiredTitle)
 
     // Memoised: six of the callbacks below list it as a dependency, so a fresh
@@ -4214,14 +4531,43 @@ function MailSection({
         }
     }, [accountId, createEmptyComposeDraft, inlineComposeSession, nextTabId, setActiveTabId, setInlineComposeSession, setMailContent, setSelectedMail, setTabs, t])
 
-    const openComposeWindow = useCallback(async (sessionOrDraft, fallbackSource = 'new') => {
+    const openLinkedComposeTab = useCallback(() => {
+        if (!inlineComposeSession) return
+        const draft = inlineComposeSession.draft
+        const syncId = draft.syncId || crypto.randomUUID()
+        const existing = tabs.find((tab) => tab.linkedPanel && tab.draft.syncId === syncId)
+        if (existing) {
+            setActiveTabId(existing.id)
+            return
+        }
+        nextTabId.current += 1
+        const tabId = `tab-${nextTabId.current}`
+        setInlineComposeSession((current) => current?.id === inlineComposeSession.id
+            ? { ...current, draft: { ...current.draft, syncId } } : current)
+        setTabs((previous) => [...previous, {
+            id: tabId, kind: 'compose', linkedPanel: true, source: inlineComposeSession.source,
+            draft: { ...draft, syncId, composeSurface: 'tab' },
+        }])
+        setActiveTabId(tabId)
+    }, [inlineComposeSession, nextTabId, setActiveTabId, setInlineComposeSession, setTabs, tabs])
+
+    const openComposeWindow = useCallback(async (sessionOrDraft, fallbackSource = 'new', linkedEditor = false) => {
         if (!accountId) return false
         try {
             nextComposeWindowId.current += 1
             const label = `compose-${nextComposeWindowId.current}`
             const source = sessionOrDraft?.source || fallbackSource
             const normalizedDraft = createEmptyComposeDraft(sessionOrDraft?.draft || sessionOrDraft)
-            const draft = { ...normalizedDraft, composeSurface: 'window' }
+            const syncId = linkedEditor ? normalizedDraft.syncId || crypto.randomUUID() : normalizedDraft.syncId
+            const draft = { ...normalizedDraft, syncId, composeSurface: 'window' }
+            if (linkedEditor) {
+                if (sessionOrDraft.id === inlineComposeSession?.id) {
+                    setInlineComposeSession((current) => current?.id === sessionOrDraft.id
+                        ? { ...current, draft: { ...current.draft, syncId } } : current)
+                } else {
+                    updateComposeTabDraft(sessionOrDraft.id, (current) => ({ ...current, syncId }))
+                }
+            }
 
             const composeDataObj = {
                 accountId,
@@ -4229,6 +4575,7 @@ function MailSection({
                 source,
                 draft,
                 baselineDraft: sessionOrDraft?.baselineDraft || normalizedDraft,
+                linkedEditor,
             }
             const composeDataJson = JSON.stringify(composeDataObj)
 
@@ -4243,6 +4590,7 @@ function MailSection({
                 composeDataJson,
             })
 
+            if (linkedEditor) return true
             if (sessionOrDraft?.id && inlineComposeSession?.id === sessionOrDraft.id) {
                 setInlineComposeSession(null)
             } else if (sessionOrDraft?.id) {
@@ -4259,7 +4607,7 @@ function MailSection({
             console.error('Failed to open compose window:', error)
             return false
         }
-    }, [accountEmail, accountId, closeComposeTab, createEmptyComposeDraft, inlineComposeSession, setInlineComposeSession, setMailContent, setSelectedMail, tabs])
+    }, [accountEmail, accountId, closeComposeTab, createEmptyComposeDraft, inlineComposeSession, setInlineComposeSession, setMailContent, setSelectedMail, tabs, updateComposeTabDraft])
 
     const openInlineCompose = useCallback(({ source = 'new', draft = {} }, options = {}) => {
         const preserveExisting = options?.preserveExisting !== false
@@ -4351,11 +4699,12 @@ function MailSection({
                     cc: ccList.join(', '),
                     bcc: mailtoDraft.bcc || '',
                     subject: mailtoDraft.subject || '',
+                    attachments: mailtoDraft.attachments,
                     plainBody,
                     showCc: ccList.length > 0,
                     showBcc: Boolean(mailtoDraft.bcc),
                 },
-            }, { preserveExisting: false })
+            }, { preserveExisting: Boolean(mailtoDraft.attachments?.length) })
         })
         return unsubscribe
     }, [accountId, accountEmail, openInlineCompose])
@@ -4426,7 +4775,7 @@ function MailSection({
             window.alert('Please add at least one recipient.')
             return false
         }
-        const undoSeconds = getComposeSettings(accountId).undoSendSeconds
+        const undoSeconds = draft.scheduledSendAt ? 0 : getComposeSettings(accountId).undoSendSeconds
 
         // Undo window disabled: close the surface and send right away.
         if (undoSeconds <= 0) {
@@ -5162,6 +5511,7 @@ function MailSection({
                 mail,
                 mailContent: content,
                 accountId,
+                accountEmail,
                 mailbox,
                 preferOffline: !canUseRemoteMail,
             }
@@ -5173,7 +5523,7 @@ function MailSection({
         } catch (error) {
             console.error('Failed to open imported mail window:', error)
         }
-    }, [accountId, canUseRemoteMail, selectedFolder])
+    }, [accountEmail, accountId, canUseRemoteMail, selectedFolder])
 
     const syncPopoverPosition = useCallback((
         menuRef,
@@ -5438,6 +5788,10 @@ function MailSection({
         e.stopPropagation()
         pendingTabLoadsRef.current.delete(tabId)
         const tab = tabs.find((item) => item.id === tabId)
+        if (tab?.linkedPanel) {
+            closeComposeTab(tabId)
+            return
+        }
         if (tab?.kind === 'compose') {
             requestComposeExit({
                 target: { type: 'tab', id: tabId, source: tab.source },
@@ -5871,8 +6225,90 @@ function MailSection({
     // Treat non-selectable containers (e.g. Gmail's "[Gmail]") as namespace
     // roots so their children are lifted to the top level instead of being
     // buried under an unusable parent, matching how native clients present them.
-    const folderTree = buildTree(folderMailboxes, ['Folders', ...noselectMailboxes])
+    const mailboxDisplayKey = `mailbox_display_${accountId}`
+    const [mailboxDisplay, setMailboxDisplay] = useState(null)
+    const displayPreferences = useMemo(() => {
+        if (mailboxDisplay?.key === mailboxDisplayKey) return mailboxDisplay.value
+        try {
+            return JSON.parse(localStorage.getItem(mailboxDisplayKey) || '{}') || {}
+        } catch {
+            return {}
+        }
+    }, [mailboxDisplay, mailboxDisplayKey])
+    const hiddenFolders = Array.isArray(displayPreferences.hidden) ? displayPreferences.hidden : []
+    const labelColors = displayPreferences.colors || {}
+    const updateDisplayPreferences = (patch) => {
+        const value = { ...displayPreferences, ...patch }
+        try {
+            localStorage.setItem(mailboxDisplayKey, JSON.stringify(value))
+            setMailboxDisplay({ key: mailboxDisplayKey, value })
+        } catch {
+            window.alert(t('Could not save mailbox preferences.'))
+        }
+    }
+    const folderIsInside = (path, parent) => path === parent || path.startsWith(`${parent}/`)
+    const folderTree = buildTree(
+        folderMailboxes.filter((folder) => !hiddenFolders.some((parent) => folderIsInside(folder, parent))),
+        ['Folders', ...noselectMailboxes],
+    )
     const labelTree = buildTree(labels, LABEL_NAMESPACE_ROOTS)
+    const getLabelColor = (label) => {
+        const color = labelColors[stripLabelMailboxNamespace(label).toLowerCase()]
+        return typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color) ? color : undefined
+    }
+    const renderMailboxDisplaySettings = () => (
+        <details className="db-mailbox-display">
+            <summary>{t('Folder visibility and label colors')}</summary>
+            {folderMailboxes.filter((folder) => folder.toUpperCase() !== 'INBOX' && mailboxRoles[folder] !== 'inbox').map((folder) => (
+                <label key={folder}>
+                    <input type="checkbox" checked={!hiddenFolders.includes(folder)} onChange={(event) => {
+                        const visible = event.target.checked
+                        updateDisplayPreferences({
+                            hidden: visible ? hiddenFolders.filter((path) => path !== folder) : [...hiddenFolders, folder],
+                        })
+                        if (!visible && folderIsInside(selectedFolder, folder)) {
+                            if (onSelectFolder) onSelectFolder('INBOX')
+                            else setSelectedFolder('INBOX')
+                        }
+                    }} />
+                    {folder}
+                </label>
+            ))}
+            {!!activeSnoozes.length && (
+                <div className="db-snoozed-messages">
+                    <strong>{t('Snoozed messages')}</strong>
+                    {activeSnoozes.map((entry) => (
+                        <div key={entry.key}>
+                            <span>{entry.subject || t('(no subject)')} · {new Date(entry.until).toLocaleString()}</span>
+                            <button type="button" onClick={() => saveSnoozes(activeSnoozes.filter(({ key }) => key !== entry.key))}>
+                                {t('End snooze')}
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            )}
+            {labels.map((mailbox) => {
+                const label = stripLabelMailboxNamespace(mailbox)
+                const key = label.toLowerCase()
+                const color = getLabelColor(label)
+                return (
+                    <div className="db-mailbox-display__color" key={mailbox}>
+                        <label>
+                            <input type="color" value={color || '#5f72a3'} onChange={(event) => {
+                                updateDisplayPreferences({ colors: { ...labelColors, [key]: event.target.value } })
+                            }} />
+                            {label}
+                        </label>
+                        {color && <button type="button" onClick={() => {
+                            const colors = { ...labelColors }
+                            delete colors[key]
+                            updateDisplayPreferences({ colors })
+                        }}>{t('Reset')}</button>}
+                    </div>
+                )
+            })}
+        </details>
+    )
 
     const renderFolderCountBadges = (fullPath) => {
         if (!mailboxCountDisplayMode || mailboxCountDisplayMode === 'none') return null
@@ -5973,6 +6409,9 @@ function MailSection({
                                 <span className="db-folder-chevron-placeholder" />
                             )}
                             <span className="db-folder-icon">{info.icon}</span>
+                            {labelKey && getLabelColor(labelKey) && (
+                                <span className="db-label-color-dot" style={{ backgroundColor: getLabelColor(labelKey) }} />
+                            )}
                             <span className="db-folder-text">{info.label}</span>
                         </div>
                         {renderFolderCountBadges(node.fullPath)}
@@ -6230,23 +6669,16 @@ function MailSection({
     const composeForwardDraft = async (mailList) => {
         const forwardMails = Array.from(new Set((mailList || []).filter(Boolean)))
         if (forwardMails.length === 0) return
-        if (forwardMails.length > 1) return
         const sourceFolder = selectedFolder || 'INBOX'
-        const mail = forwardMails[0]
-        const uid = mail?.id
-        const mailbox = mail?.mailbox || sourceFolder
-        if (!uid || !mailbox) return
-        const from = mail?.name
-            ? `${mail.name} <${mail.address || ''}>`.trim()
-            : `${mail?.address || ''}`.trim()
-        const forwardTargets = [{
-            uid,
+        const forwardTargets = forwardMails.filter((mail) => mail.id).map((mail) => ({
+            uid: mail.id,
             uidValidity: mail.uid_validity,
-            mailbox,
-            from,
-            subject: mail?.subject || '',
-            date: mail?.date || '',
-        }]
+            mailbox: mail.mailbox || sourceFolder,
+            from: mail.name ? `${mail.name} <${mail.address || ''}>`.trim() : (mail.address || '').trim(),
+            subject: mail.subject || '',
+            date: mail.date || '',
+        }))
+        if (forwardTargets.length === 0) return
         const defaultOptions = { subjectPrefix: 'Fwd:', forwardStyle: 'copy' }
         const prefs = getComposeSettings(accountId)
         const ccSelf = autoCcRecipients(prefs, accountEmail)
@@ -6272,8 +6704,21 @@ function MailSection({
     }
 
 
+    const quickReplyRef = useRef(null)
+    quickReplyRef.current = () => {
+        const target = selectedMail || mails.find((mail) => !mail.seen && (mail.mailbox || selectedFolder).toUpperCase() === 'INBOX')
+        if (target) void composeReplyDraft([target], 'reply')
+        else window.alert(t('Select a message to reply to.'))
+    }
+    useEffect(() => {
+        if (!quickReplyRequested) return
+        setQuickReplyRequested(false)
+        quickReplyRef.current?.()
+    }, [quickReplyRequested, setQuickReplyRequested])
+
+
     const handleForwardAction = async () => {
-        if (!hasAnyActionMail || hasMultipleActionMails) return
+        if (!hasAnyActionMail) return
         await composeForwardDraft(actionableMails)
     }
 
@@ -6362,10 +6807,20 @@ function MailSection({
     const activeTabMail = activeTab?.kind === 'mail'
         ? (mails.find((mail) => sameMail(mail, activeTab.mail, selectedFolder)) || activeTab.mail)
         : null
-    const activeComposeTab = activeTab?.kind === 'compose' ? activeTab : null
+    const activeComposeTab = activeTab?.kind === 'compose' && !activeTab.linkedPanel ? activeTab : null
+    const linkedComposeTab = activeTab?.linkedPanel && inlineComposeSession?.draft.syncId === activeTab.draft.syncId
+        ? activeTab : null
+    const panelSyncId = inlineComposeSession?.draft.syncId
+    useEffect(() => {
+        const abandoned = tabs.filter((tab) => tab.linkedPanel && tab.draft.syncId !== panelSyncId)
+        if (!abandoned.length) return
+        const ids = new Set(abandoned.map((tab) => tab.id))
+        setTabs((current) => current.filter((tab) => !ids.has(tab.id)))
+        if (ids.has(activeTabId)) setActiveTabId(null)
+    }, [activeTabId, panelSyncId, setActiveTabId, setTabs, tabs])
     // Rich-text formatting toolbar visibility: shown for compose tabs directly,
     // and for inline compose only when the "Format" ribbon tab is selected.
-    const isComposingInline = !activeTabId && !!inlineComposeSession
+    const isComposingInline = (!activeTabId || Boolean(linkedComposeTab)) && !!inlineComposeSession
     const showComposeFormatTools = !!activeComposeTab || (isComposingInline && activeRibbonTab === 'format')
     const activeTabReadLabel = activeTabMail?.seen === true ? 'Unread' : 'Read'
     const fileActionsDisabled = !selectedMail || loadingContent || fileActionLoading !== ''
@@ -6377,10 +6832,10 @@ function MailSection({
     const getTabTitle = useCallback((tab) => {
         if (!tab) return ''
         if (tab.kind === 'compose') {
-            return getComposeTitle(tab.draft)
+            return getComposeTitle(tab.linkedPanel && inlineComposeSession ? inlineComposeSession.draft : tab.draft)
         }
         return tab.mail?.subject || '(No Subject)'
-    }, [])
+    }, [inlineComposeSession])
 
     const closeTabsForMailIds = (mailIds) => {
         const ids = new Set(mailIds)
@@ -7121,13 +7576,27 @@ function MailSection({
         </div>
     )
 
-    const centerPlaneTabNode = activeTabId ? (
+    const centerPlaneTabNode = linkedComposeTab ? (
+        <div className="mail-tab-content">
+            <ComposeMailContent
+                draft={{ ...inlineComposeSession.draft, composeSurface: 'tab' }}
+                onDraftChange={(draft) => updateInlineComposeDraft({ ...draft, composeSurface: 'inline' })}
+                onDiscard={() => closeComposeTab(linkedComposeTab.id)}
+                accountEmail={accountEmail}
+                accountId={accountId}
+                linkedEditor
+                workspaceDraft
+                showTopDiscard={false}
+            />
+        </div>
+    ) : activeTabId ? (
                 <div className="mail-tab-content">
                     {activeTab?.kind === 'mail' && !Object.hasOwn(tabContents, activeTabId) ? (
                         <div className="db-loading" style={{ paddingTop: 60 }}><div className="db-spinner" />Loading...</div>
                     ) : activeComposeTab ? (
                         <ComposeMailContent
                             draft={activeComposeTab.draft}
+                            workspaceDraft
                             onDraftChange={(nextDraft) => updateComposeTabDraft(activeComposeTab.id, nextDraft)}
                             onSend={(draft) => enqueueDelayedSend({
                                 draft,
@@ -7140,12 +7609,14 @@ function MailSection({
                                 intent: 'discard',
                             })}
                             onOpenInWindow={() => openComposeWindow(activeComposeTab, activeComposeTab.source)}
+                            onOpenLinkedWindow={() => openComposeWindow(activeComposeTab, activeComposeTab.source, true)}
                             accountEmail={accountEmail}
                             accountId={accountId}
                             showTopDiscard={false}
                         />
                     ) : activeTab ? (
-                        <div className="db-mail-content">
+                        <div className="db-mail-content" style={readingSettings.style}>
+                            <MailReadingControls settings={readingSettings} />
                             <div className="db-mail-content-header">
                                 <div className="db-mail-content-subject">{activeTabContent?.subject || activeTabMail?.subject || '(No Subject)'}</div>
                                 <div className="db-mail-content-actions">
@@ -7194,6 +7665,8 @@ function MailSection({
                                                     <span className="db-attachments__name">{at.filename}</span>
                                                     <span className="db-attachments__meta">{at.content_type}</span>
                                                 </div>
+                                                <OfficeAttachmentPreview name={at.filename} base64={at.data_base64} href={attachmentUrl(accountId, activeTabContent.id, at.id, activeTab.mailbox, canUseRemoteMail, activeTab.mail?.uid_validity)} />
+                                                <CalendarInvitation attachment={at} href={attachmentUrl(accountId, activeTabContent.id, at.id, activeTab.mailbox, canUseRemoteMail, activeTab.mail?.uid_validity)} accountId={accountId} email={accountEmail} />
                                                 {at.data_base64 || activeTabMail?.isImported ? (
                                                     <button
                                                         type="button"
@@ -7303,6 +7776,7 @@ function MailSection({
                                                     </div>
                                                 </li>
                                             )}
+                                            {renderMailboxDisplaySettings()}
                                             {folderTree.length > 0 && renderFolderSection(t('Folders'), folderTree)}
                                             {labelTree.length > 0 && renderFolderSection(t('Labels'), labelTree, folderTree.length > 0)}
                                         </ul>
@@ -7353,7 +7827,8 @@ function MailSection({
                                                 </div>
                                             </li>
                                         )}
-                                        {folderTree.length > 0 && renderFolderSection(t('Folders'), folderTree, false)}
+                                        {renderMailboxDisplaySettings()}
+                                            {folderTree.length > 0 && renderFolderSection(t('Folders'), folderTree, false)}
                                         {labelTree.length > 0 && renderFolderSection(t('Labels'), labelTree, folderTree.length > 0)}
                                     </ul>
                                 </div>
@@ -7501,9 +7976,15 @@ function MailSection({
                                                     >
                                                         <span className="db-toolbar-popover__check">{activeFilter === option.key ? <img src="/img/icons/choice-choosen.svg" className="svg-icon-inline" /> : ''}</span>
                                                         <span className="db-toolbar-popover__icon">{option.icon}</span>
-                                                        <span>{option.label}</span>
+                                                        <span>{t(option.label)}</span>
                                                     </button>
                                                 ))}
+                                                <button type="button" role="menuitemcheckbox" aria-checked={autoMoveSpam}
+                                                    disabled={spamAuto?.accountId !== accountId}
+                                                    className="db-toolbar-popover__item" onClick={() => void changeAutoSpam()}>
+                                                    {t('Automatically move suspected spam')}
+                                                </button>
+                                                {spamError === accountId && <span role="alert">{t('Could not update spam settings.')}</span>}
                                             </div>
                                         )}
                                     </div>
@@ -7833,7 +8314,7 @@ function MailSection({
 	                                                                    {mailLabels.length > 0 && (
 	                                                                        <div className="db-mail-labels" title={mailLabels.join(', ')}>
 	                                                                            {visibleMailLabels.map((label) => (
-	                                                                                <span key={`${thread.id}-${label}`} className="db-mail-label-chip">
+	                                                                                <span key={`${thread.id}-${label}`} className="db-mail-label-chip" style={{ borderInlineStart: getLabelColor(label) ? `3px solid ${getLabelColor(label)}` : undefined }}>
 	                                                                                    {label}
 	                                                                                </span>
 	                                                                            ))}
@@ -7898,7 +8379,7 @@ function MailSection({
 	                                                                                <span className="db-mail-sender">{mail.name || mail.address || 'Unknown'}</span>
 	                                                                                <span className="db-mail-time">{getShortTime(mail.date)}</span>
 	                                                                            </div>
-	                                                                            <span className="db-mail-subject">{mail.subject || '(No Subject)'}</span>
+	                                                                            <span className="db-mail-subject">{mail.flagged && <span title={t('Starred')}>★ </span>}{mail.subject || '(No Subject)'}</span>
 	                                                                        </div>
 	                                                                        <div className="db-mail-hover-actions">
 	                                                                            <button
@@ -7960,11 +8441,11 @@ function MailSection({
 	                                                                    <span className="db-mail-sender">{mail.name || mail.address || 'Unknown'}</span>
 	                                                                    <span className="db-mail-time">{getShortTime(mail.date)}</span>
 	                                                                </div>
-	                                                                <span className="db-mail-subject">{mail.subject || '(No Subject)'}</span>
+	                                                                <span className="db-mail-subject">{mail.flagged && <span title={t('Starred')}>★ </span>}{mail.subject || '(No Subject)'}</span>
 	                                                                {mailLabels.length > 0 && (
 	                                                                    <div className="db-mail-labels" title={mailLabels.join(', ')}>
 	                                                                        {visibleMailLabels.map((label) => (
-	                                                                            <span key={`${mail.id}-${label}`} className="db-mail-label-chip">
+	                                                                            <span key={`${mail.id}-${label}`} className="db-mail-label-chip" style={{ borderInlineStart: getLabelColor(label) ? `3px solid ${getLabelColor(label)}` : undefined }}>
 	                                                                                {label}
 	                                                                            </span>
 	                                                                        ))}
@@ -8067,8 +8548,34 @@ function MailSection({
                                                         <span><img src="/img/icons/label.svg" className="svg-icon-inline" /> Labels</span>
                                                         <span className="db-mail-item-menu__chevron">›</span>
                                                     </button>
+                                                    <button type="button" className="db-submenu-popover__item" onClick={() => {
+                                                        trainSpamFilter(mailItemMenuMail, 'spam')
+                                                        closeMailItemMenu()
+                                                    }}>{t('Train filter: spam')}</button>
+                                                    <button type="button" className="db-submenu-popover__item" onClick={() => {
+                                                        trainSpamFilter(mailItemMenuMail, 'clean')
+                                                        closeMailItemMenu()
+                                                    }}>{t('Train filter: not spam')}</button>
                                                     <button type="button" className="db-submenu-popover__item" onClick={handleMailItemMenuReadToggle}>
                                                         <img src="/img/icons/read.svg" className="svg-icon-inline" /> {mailItemReadLabel}
+                                                    </button>
+                                                    <button type="button" className="db-submenu-popover__item" onClick={() => {
+                                                        setSnoozeDraft({
+                                                            accountId,
+                                                            key: mailKey(mailItemMenuMail, selectedFolder),
+                                                            subject: mailItemMenuMail.subject || '',
+                                                            date: '',
+                                                        })
+                                                        closeMailItemMenu()
+                                                    }}>
+                                                        {t('Snooze message')}
+                                                    </button>
+                                                    <button type="button" className="db-submenu-popover__item" onClick={() => {
+                                                        void setMailStar(mailItemMenuMail, !mailItemMenuMail.flagged)
+                                                        closeMailItemMenu()
+                                                    }}>
+                                                        <span aria-hidden="true">{mailItemMenuMail.flagged ? '☆' : '★'}</span>
+                                                        {t(mailItemMenuMail.flagged ? 'Remove star' : 'Star message')}
                                                     </button>
                                                     <button 
                                                         type="button" 
@@ -8160,17 +8667,21 @@ function MailSection({
                                 ) : inlineComposeSession ? (
                                     <ComposeMailContent
                                         draft={inlineComposeSession.draft}
+                                        workspaceDraft
                                         onDraftChange={updateInlineComposeDraft}
                                         onSend={handleInlineComposeSend}
                                         onDiscard={handleInlineComposeDiscard}
                                         onOpenInTab={() => openComposeInTab(inlineComposeSession, inlineComposeSession.source)}
+                                        onOpenLinkedTab={() => openLinkedComposeTab()}
                                         onOpenInWindow={() => openComposeWindow(inlineComposeSession, inlineComposeSession.source)}
+                                        onOpenLinkedWindow={() => openComposeWindow(inlineComposeSession, inlineComposeSession.source, true)}
                                         accountEmail={accountEmail}
                                         accountId={accountId}
                                         showTopDiscard={true}
                                     />
                                 ) : importPreview ? (
-                                    <div className="db-mail-content">
+                                    <div className="db-mail-content" style={readingSettings.style}>
+                                        <MailReadingControls settings={readingSettings} />
                                         <div className="db-mail-content-header">
                                             <div className="db-mail-content-subject">
                                                 {importPreview?.content?.subject || importPreview?.mail?.subject || importPreview?.fileName || '(Imported mail)'}
@@ -8241,6 +8752,8 @@ function MailSection({
                                                                 <span className="db-attachments__name">{at.filename}</span>
                                                                 <span className="db-attachments__meta">{at.content_type} · {formatBytes(at.size)}</span>
                                                             </div>
+                                                            <OfficeAttachmentPreview name={at.filename} base64={at.data_base64} href={undefined} />
+                                                            <CalendarInvitation attachment={at} href={undefined} accountId={accountId} email={accountEmail} />
                                                             {at.data_base64 ? (
                                                                 <button
                                                                     type="button"
@@ -8264,7 +8777,8 @@ function MailSection({
                                 ) : loadingContent ? (
                                     <div className="db-loading" style={{ paddingTop: 60 }}><div className="db-spinner" />Loading content...</div>
                                 ) : (
-                                    <div className="db-mail-content">
+                                    <div className="db-mail-content" style={readingSettings.style}>
+                                        <MailReadingControls settings={readingSettings} />
 	                                        <div className="db-mail-content-header">
 	                                            <div className="db-mail-content-subject">
 	                                                {(showThreadReader && selectedThread)
@@ -8404,6 +8918,8 @@ function MailSection({
                                                                             <span className="db-attachments__name">{at.filename}</span>
                                                                             <span className="db-attachments__meta">{at.content_type} · {formatBytes(at.size)}</span>
                                                                         </div>
+                                                                        <OfficeAttachmentPreview name={at.filename} base64={at.data_base64} href={attachmentUrl(accountId, mailContent.id, at.id, selectedMail?.mailbox || selectedFolder || 'INBOX', canUseRemoteMail, selectedMail?.uid_validity)} />
+                                                                        <CalendarInvitation attachment={at} href={attachmentUrl(accountId, mailContent.id, at.id, selectedMail?.mailbox || selectedFolder || 'INBOX', canUseRemoteMail, selectedMail?.uid_validity)} accountId={accountId} email={accountEmail} />
                                                                         <a
                                                                             className="db-attachments__link"
                                                                             href={attachmentUrl(accountId, mailContent.id, at.id, selectedMail?.mailbox || selectedFolder || 'INBOX', canUseRemoteMail, selectedMail?.uid_validity)}
@@ -8429,7 +8945,9 @@ function MailSection({
     const finalCenterPlane = (
         <React.Fragment>
             {backdropNode}
-            {activeTabId ? centerPlaneTabNode : centerPlanePanelNode}
+            {linkedComposeTab ? (
+                <div className="db-linked-compose">{centerPlanePanelNode}{centerPlaneTabNode}</div>
+            ) : activeTabId ? centerPlaneTabNode : centerPlanePanelNode}
         </React.Fragment>
     );
 
@@ -8450,6 +8968,24 @@ function MailSection({
                     />
                 </LayoutFrame>
             </LayoutFrame>
+            {snoozeDraft && snoozeDraft.accountId === accountId && (
+                <dialog ref={snoozeDialog} className="db-compose-exit-panel" aria-label={t('Snooze message')}
+                    onCancel={(event) => { event.preventDefault(); setSnoozeDraft(null) }}>
+                    <form onSubmit={saveSnooze}>
+                        <div className="db-compose-exit-panel__body">
+                            <label>
+                                {t('Snooze until')}{' '}
+                                <input type="datetime-local" required value={snoozeDraft.date}
+                                    onChange={(event) => setSnoozeDraft({ ...snoozeDraft, date: event.target.value })} />
+                            </label>
+                        </div>
+                        <div className="db-compose-exit-panel__actions">
+                            <button type="submit" className="db-advanced-search-btn">{t('Snooze message')}</button>
+                            <button type="button" className="db-advanced-search-btn" onClick={() => setSnoozeDraft(null)}>{t('Cancel')}</button>
+                        </div>
+                    </form>
+                </dialog>
+            )}
             {composeExitPrompt && (
                 <div className="db-advanced-search-modal" onMouseDown={() => handleComposeExitAction('cancel')}>
                     <div

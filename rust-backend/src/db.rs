@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::keystore::{self, KeyStoreError};
 use crate::models::TransferSnapshot;
 
+type WorkspaceSyncLocks = HashMap<(i64, &'static str), Arc<Mutex<()>>>;
 type UserDbPools = HashMap<i64, Arc<OnceCell<SqlitePool>>>;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct AppState {
     pub encryption_enabled: bool,
     pub transfer_progress: Arc<Mutex<HashMap<i64, TransferSnapshot>>>,
     user_db_pools: Arc<Mutex<UserDbPools>>,
+    workspace_sync: Arc<Mutex<WorkspaceSyncLocks>>,
     inner: Arc<RwLock<Option<Arc<AppStateInner>>>>,
     // Prevent concurrent initialization which can cause duplicate keyring prompts
     init_lock: Arc<Mutex<()>>,
@@ -125,9 +127,14 @@ impl AppState {
             encryption_enabled,
             transfer_progress: Arc::new(Mutex::new(HashMap::new())),
             user_db_pools: Arc::new(Mutex::new(HashMap::new())),
+            workspace_sync: Default::default(),
             inner: Arc::new(RwLock::new(inner)),
             init_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub(crate) async fn workspace_sync_lock(&self, account: i64, workspace: &'static str) -> Arc<Mutex<()>> {
+        self.workspace_sync.lock().await.entry((account, workspace)).or_default().clone()
     }
 
     pub async fn ready_or_none(&self) -> Option<Arc<AppStateInner>> {
@@ -158,6 +165,15 @@ impl AppState {
         let raw = match keystore::load_master_key(crate::crypto::KEYRING_PROMPT).await {
             Ok(raw) => raw,
             Err(KeyStoreError::NotFound) => {
+                let general_db_path = self.databases_dir.join("general.db");
+                let existing = tokio::fs::metadata(&general_db_path).await
+                    .is_ok_and(|metadata| metadata.len() > 0);
+                if existing && !is_plaintext_sqlite(&general_db_path).await {
+                    return Err(AppError::KeyringUnavailable(
+                        "The key for the existing encrypted databases is missing from the OS keychain.".into(),
+                    ));
+                }
+
                 if !create_if_missing {
                     return Err(AppError::KeyringUnavailable(
                         "Encryption key not initialized. Complete setup to create the key."
@@ -628,6 +644,12 @@ async fn init_general_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    crate::spam_filter::init(pool).await?;
+    crate::carddav_sync::init_books(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS google_task_subtasks (
+        list_id TEXT NOT NULL, task_id TEXT NOT NULL, children TEXT NOT NULL,
+        PRIMARY KEY (list_id, task_id)
+    )").execute(pool).await?;
     let emails_schema = r#"
         CREATE TABLE IF NOT EXISTS emails (
             local_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1090,6 +1112,42 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await;
 
+    let mut search_tx = pool.begin().await?;
+    let rebuild_search: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'local_mail_fts')",
+    )
+    .fetch_one(&mut *search_tx)
+    .await?;
+    for statement in [
+        r#"CREATE VIRTUAL TABLE IF NOT EXISTS local_mail_fts USING fts5(
+            subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body,
+            content='local_mail_cache', content_rowid='id', tokenize='unicode61'
+            );"#,
+        r#"CREATE TRIGGER IF NOT EXISTS local_mail_fts_insert AFTER INSERT ON local_mail_cache BEGIN
+            INSERT INTO local_mail_fts(rowid, subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body)
+            VALUES (NEW.id, NEW.subject, NEW.sender_name, NEW.sender_address, NEW.recipient_to, NEW.cc_value, NEW.plain_body, NEW.html_body);
+            END;"#,
+        r#"CREATE TRIGGER IF NOT EXISTS local_mail_fts_delete AFTER DELETE ON local_mail_cache BEGIN
+            INSERT INTO local_mail_fts(local_mail_fts, rowid, subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body)
+            VALUES ('delete', OLD.id, OLD.subject, OLD.sender_name, OLD.sender_address, OLD.recipient_to, OLD.cc_value, OLD.plain_body, OLD.html_body);
+            END;"#,
+        r#"CREATE TRIGGER IF NOT EXISTS local_mail_fts_update
+            AFTER UPDATE OF subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body ON local_mail_cache BEGIN
+            INSERT INTO local_mail_fts(local_mail_fts, rowid, subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body)
+            VALUES ('delete', OLD.id, OLD.subject, OLD.sender_name, OLD.sender_address, OLD.recipient_to, OLD.cc_value, OLD.plain_body, OLD.html_body);
+            INSERT INTO local_mail_fts(rowid, subject, sender_name, sender_address, recipient_to, cc_value, plain_body, html_body)
+            VALUES (NEW.id, NEW.subject, NEW.sender_name, NEW.sender_address, NEW.recipient_to, NEW.cc_value, NEW.plain_body, NEW.html_body);
+            END;"#,
+    ] {
+        sqlx::query(statement).execute(&mut *search_tx).await?;
+    }
+    if rebuild_search {
+        sqlx::query("INSERT INTO local_mail_fts(local_mail_fts) VALUES ('rebuild')")
+            .execute(&mut *search_tx)
+            .await?;
+    }
+    search_tx.commit().await?;
+
     sqlx::raw_sql(r#"
         CREATE TABLE IF NOT EXISTS mailbox_list_revision (
             folder TEXT PRIMARY KEY, revision INTEGER NOT NULL
@@ -1255,6 +1313,31 @@ async fn init_user_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS calendar_occurrence_moves (
+            event_id INTEGER NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+            occurrence_start INTEGER NOT NULL,
+            start_ms INTEGER NOT NULL,
+            end_ms INTEGER NOT NULL,
+            override_json TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (event_id, occurrence_start)
+        )",
+    ).execute(pool).await?;
+
+    for migration in [
+        "ALTER TABLE calendar_occurrence_moves ADD COLUMN override_json TEXT",
+        "ALTER TABLE calendar_occurrence_moves ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE calendar_occurrence_moves ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    ] {
+        if let Err(error) = sqlx::query(migration).execute(pool).await {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error.into());
+            }
+        }
+    }
 
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ms)")
         .execute(pool)
@@ -1435,6 +1518,24 @@ mod tests {
             "SELECT server_uid, uid_validity, folder_id FROM emails ORDER BY local_id",
         ).fetch_all(&pool).await.unwrap();
         assert_eq!(rows, [(42, 7, 9), (42, 7, 10), (42, 8, 9)]);
+    }
+
+    #[tokio::test]
+    async fn mail_full_text_index_follows_cached_message_changes() {
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        init_user_db(&pool).await.unwrap();
+        let query = "SELECT COUNT(*) FROM local_mail_fts WHERE local_mail_fts MATCH ?";
+        sqlx::query("INSERT INTO local_mail_cache (uid, folder, plain_body) VALUES ('7', 'INBOX', 'Quarterly Budget')")
+            .execute(&pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>(query)
+            .bind(r#""quarterly budget""#).fetch_one(&pool).await.unwrap(), 1);
+        sqlx::query("UPDATE local_mail_cache SET plain_body = 'Revised plan' WHERE uid = '7'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>(query).bind("quarterly").fetch_one(&pool).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>(query).bind("revised").fetch_one(&pool).await.unwrap(), 1);
+        sqlx::query("DELETE FROM local_mail_cache WHERE uid = '7'").execute(&pool).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>(query).bind("revised").fetch_one(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

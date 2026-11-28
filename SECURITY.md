@@ -44,16 +44,11 @@ about the current code, not an aspiration.
 
 **Not covered — read this before trusting the encryption claim.**
 
-- **The master key is stored unprotected in the user's profile**, at
-  `<local app data>/com.guvercin.app/master.key`. It is not wrapped by the OS
-  keychain and not protected by a passphrase. On Unix the file is mode 0600, so
-  other local users cannot read it; on Windows it inherits the per-user ACL of
-  the local app data directory. Anything running *as that user* — including
-  malware in the user's session — can read the key and decrypt every database.
-  If you need protection against a stolen unlocked machine or a compromised
-  user session, SQLCipher here does not give it to you. Full-disk encryption
-  (FileVault, BitLocker, LUKS) is still your responsibility. Moving the key
-  into the platform keychain is open work.
+- **The master key is held by the OS credential store.** Existing key files
+  migrate after the new credential has been read back and verified. Software
+  running in the user's session can request the credential under the OS access
+  policy. Full-disk encryption provides additional protection for a locked
+  device.
 - **The shipped Google OAuth client secret is public.** It is compiled into the
   binary (`rust-backend/src/oauth.rs`) because an installed desktop app has
   nowhere to hide it; Google's desktop client type is designed on that
@@ -73,8 +68,8 @@ about the current code, not an aspiration.
   and attributes rather than allowing only known-safe ones. A gap in that
   filter means script execution in the app's origin. This is the highest-value
   place to look for a bug, and reports here are especially welcome.
-- Deleting `master.key` destroys access to every existing database. There is no
-  recovery path and no escrow. This is by design and is not a bug.
+- Deleting the OS master-key credential destroys access to the encrypted databases.
+  Recovery requires a backed-up copy of the key.
 
 ## Changes that need review
 

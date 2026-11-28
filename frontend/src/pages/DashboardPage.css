@@ -2867,8 +2867,27 @@ body.resizing * {
   flex-shrink: 0;
 }
 
+.db-mail-body,
+.db-mail-body-html {
+  zoom: var(--mail-reading-zoom, 1);
+}
+
+.db-mail-reading-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.db-mail-reading-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+}
+
 .db-mail-body {
-  font-size: 15px;
+  font-size: var(--mail-reading-font-size, 15px);
   color: var(--c-text-1);
   line-height: 1.78;
   white-space: pre-wrap;
@@ -3965,4 +3984,99 @@ body.resizing * {
 .dashboard-page :is(button, a, input, select, textarea, [role="button"], [tabindex]):focus-visible {
     outline: 2px solid var(--c-primary, #4f46e5);
     outline-offset: 2px;
+}
+
+.db-mailbox-display {
+  padding: 6px 8px;
+  font-size: 0.85em;
+}
+
+.db-mailbox-display summary { cursor: pointer; }
+
+.db-mailbox-display label,
+.db-mailbox-display__color {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+
+.db-label-color-dot {
+  inline-size: 8px;
+  block-size: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+}
+
+.db-unified-inbox {
+  padding: 18px;
+  height: 100%;
+  overflow: auto;
+}
+
+.db-unified-inbox header,
+.db-unified-inbox li button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.db-unified-inbox ul {
+  list-style: none;
+  padding: 0;
+}
+
+.db-unified-inbox li button {
+  width: 100%;
+  text-align: start;
+  padding: 8px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--c-border-1);
+}
+
+.db-unified-inbox li button:hover,
+.db-unified-inbox li button:focus-visible {
+  background: var(--c-bg-hover);
+}
+
+.db-unified-inbox li strong {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.db-unified-actions,
+.db-unified-inbox li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.db-unified-actions {
+  flex-wrap: wrap;
+}
+
+.db-unified-inbox li button > :nth-child(2) {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.db-linked-compose {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+
+.db-linked-compose > .db-right-panel,
+.db-linked-compose > .mail-tab-content {
+  flex: 1 0 0;
+  min-width: 300px;
+}
+
+.db-linked-compose > .mail-tab-content {
+  border-inline-start: 1px solid var(--c-border-1);
 }

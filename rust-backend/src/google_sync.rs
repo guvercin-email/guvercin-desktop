@@ -18,7 +18,7 @@ use axum::{
 };
 use chrono::{Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use reqwest::{Method, StatusCode, Url};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 
@@ -322,6 +322,8 @@ struct GEvent {
     recurrence: Option<Vec<String>>,
     #[serde(default, rename = "recurringEventId")]
     recurring_event_id: Option<String>,
+    #[serde(default, rename = "originalStartTime")]
+    original_start_time: Option<GTime>,
     #[serde(default)]
     attendees: Option<Vec<GAttendee>>,
 }
@@ -331,6 +333,8 @@ struct GTime {
     date: Option<String>,
     #[serde(default, rename = "dateTime")]
     date_time: Option<String>,
+    #[serde(default, rename = "timeZone")]
+    time_zone: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct GAttendee {
@@ -350,7 +354,12 @@ fn gtime_to_iso(g: &GTime) -> Option<(String, bool)> {
     }
     if let Some(dt) = &g.date_time {
         let parsed = chrono::DateTime::parse_from_rfc3339(dt.trim()).ok()?;
-        return Some((parsed.with_timezone(&Local).format("%Y-%m-%dT%H:%M").to_string(), false));
+        let wall = if g.time_zone.as_deref().is_some_and(|zone| !zone.is_empty()) {
+            parsed.naive_local()
+        } else {
+            parsed.naive_utc()
+        };
+        return Some((wall.format("%Y-%m-%dT%H:%M").to_string(), false));
     }
     None
 }
@@ -376,6 +385,10 @@ fn map_event(g: &GEvent, calendar_id: i64) -> Option<cal::EventCard> {
         };
     } else {
         card.end = end_iso.unwrap_or_else(|| card.start.clone());
+        card.time_zone = start.time_zone.clone().filter(|zone| !zone.is_empty()).unwrap_or_else(|| "UTC".into());
+        if let Some(end) = &g.end {
+            card.end_time_zone = end.time_zone.clone().filter(|zone| !zone.is_empty()).unwrap_or_else(|| "UTC".into());
+        }
     }
     card.status = match g.status.as_deref() {
         Some("tentative") => "tentative",
@@ -418,9 +431,18 @@ fn event_to_google(card: &cal::EventCard) -> Value {
         obj["start"] = json!({ "date": start });
         obj["end"] = json!({ "date": plus_one_day_date(&end_inclusive) });
     } else {
-        obj["start"] = json!({ "dateTime": local_rfc3339(&card.start) });
-        let end = if card.end.trim().is_empty() { card.start.clone() } else { card.end.clone() };
-        obj["end"] = json!({ "dateTime": local_rfc3339(&end) });
+        let as_google_time = |wall: &str, zone: &str| {
+            if zone.is_empty() {
+                json!({ "dateTime": local_rfc3339(wall) })
+            } else {
+                let wall = if wall.len() == 16 { format!("{wall}:00") } else { wall.to_owned() };
+                json!({ "dateTime": wall, "timeZone": zone })
+            }
+        };
+        let end = if card.end.trim().is_empty() { &card.start } else { &card.end };
+        let end_zone = if card.end_time_zone.is_empty() { &card.time_zone } else { &card.end_time_zone };
+        obj["start"] = as_google_time(&card.start, &card.time_zone);
+        obj["end"] = as_google_time(end, end_zone);
     }
     if let Some(rrule) = cal::build_rrule(card) {
         obj["recurrence"] = json!([format!("RRULE:{rrule}")]);
@@ -486,10 +508,91 @@ fn events_url(gcal: &str, event: Option<&str>) -> String {
     url.to_string()
 }
 
+fn original_occurrence_key(original: &GTime, master: &cal::EventCard) -> Option<i64> {
+    if let Some(date) = &original.date {
+        return cal::occurrence_key(date);
+    }
+    let date = chrono::DateTime::parse_from_rfc3339(original.date_time.as_deref()?).ok()?;
+    let wall = if master.time_zone.is_empty() {
+        date.with_timezone(&Local).naive_local()
+    } else if master.time_zone == "UTC" {
+        date.naive_utc()
+    } else {
+        date.naive_local()
+    };
+    Some(wall.and_utc().timestamp_millis())
+}
+
+async fn sync_event_occurrences(
+    http: &reqwest::Client,
+    token: &str,
+    pool: &SqlitePool,
+    local_id: i64,
+    gcal: &str,
+    event_id: &str,
+    master: &cal::EventCard,
+    remote: &[GEvent],
+) -> Result<usize, AppError> {
+    if !master.recurrence.is_active() {
+        return Ok(0);
+    }
+    let changes: Vec<_> = remote.iter().filter_map(|instance| {
+        let original = original_occurrence_key(instance.original_start_time.as_ref()?, master)?;
+        let override_card = if instance.status.as_deref() == Some("cancelled") {
+            None
+        } else {
+            Some(map_event(instance, master.calendar_id.unwrap_or_default())?)
+        };
+        cal::OccurrenceChange::from_remote(master, original, override_card)
+    }).collect();
+    cal::receive_occurrences(pool, local_id, &changes, false).await?;
+    let edits = cal::occurrence_changes(pool, local_id, master).await?;
+    let mut count = 0;
+    for change in edits.iter().filter(|change| change.revision != 0) {
+        let mut target = remote.iter().find(|event| event.original_start_time.as_ref()
+            .and_then(|original| original_occurrence_key(original, master)) == Some(change.occurrence_start));
+        let mut instances = Vec::new();
+        if target.is_none() {
+            let mut url = Url::parse(&events_url(gcal, Some(event_id))).expect("Google events URL is valid");
+            url.path_segments_mut().expect("Google events URL is hierarchical").push("instances");
+            let original = chrono::DateTime::from_timestamp_millis(change.occurrence_start)
+                .ok_or_else(|| AppError::BadRequest("Invalid occurrence date".into()))?;
+            let from = (original - Duration::days(2)).to_rfc3339();
+            let to = (original + Duration::days(2)).to_rfc3339();
+            let mut query = vec![("timeMin", from.as_str()), ("timeMax", to.as_str()), ("showDeleted", "true")];
+            if !master.time_zone.is_empty() {
+                query.push(("timeZone", master.time_zone.as_str()));
+            }
+            instances.extend(google_pages::<GEvent>(http, token, url.as_str(), &query, 10).await?);
+            target = instances.iter().find(|event| event.original_start_time.as_ref()
+                .and_then(|original| original_occurrence_key(original, master)) == Some(change.occurrence_start));
+        }
+        let Some(instance) = target.filter(|event| !event.id.is_empty()) else {
+            // The provider may have changed the series since the edit was made.
+            continue;
+        };
+        let url = events_url(gcal, Some(&instance.id));
+        if change.is_deleted {
+            google_delete(http, &url, token).await?;
+        } else {
+            let mut body = event_to_google(&change.card(master));
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("recurrence");
+            }
+            let _: Value = google_send(http, Method::PATCH, &url, token, Some(&body)).await?;
+        }
+        cal::mark_occurrence_pushed(pool, local_id, change).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 pub async fn sync_calendar(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "calendar").await;
+    let _guard = lock.lock().await;
     let token = gmail_token(&state, account_id).await?;
     let pool = db::get_user_db_pool(&state, account_id).await?;
     let http = reqwest::Client::new();
@@ -518,19 +621,23 @@ pub async fn sync_calendar(
 
     // 2. Fetch all remote events (per calendar), remember which gcal each came from.
     let mut remote: Vec<(String, GEvent)> = Vec::new();
+    let mut exceptions: HashMap<(String, String), Vec<GEvent>> = HashMap::new();
     for gcal in gcal_to_local.keys() {
         let events = google_pages::<GEvent>(
             &http, &token, &events_url(gcal, None),
             &[
                 ("timeMin", &time_min), ("timeMax", &time_max),
-                ("singleEvents", "false"), ("maxResults", "2500"), ("showDeleted", "false"),
+                ("singleEvents", "false"), ("maxResults", "2500"), ("showDeleted", "true"),
             ],
             20,
         ).await?;
-        remote.extend(events.into_iter()
-            .filter(|event| event.recurring_event_id.is_none() && event.status.as_deref() != Some("cancelled"))
-            .map(|event| (gcal.clone(), event)));
-
+        for event in events {
+            if let Some(master) = &event.recurring_event_id {
+                exceptions.entry((gcal.clone(), master.clone())).or_default().push(event);
+            } else if event.status.as_deref() != Some("cancelled") {
+                remote.push((gcal.clone(), event));
+            }
+        }
     }
 
     // 3. Load local events.
@@ -570,6 +677,8 @@ pub async fn sync_calendar(
     let mut pushed = 0i64;
     let mut deleted_remote = 0i64;
 
+    let mut occurrence_parents = Vec::new();
+
     // 4. Reconcile each remote event against local.
     for (gcal, gev) in &remote {
         let local_cal = *gcal_to_local.get(gcal).unwrap_or(&0);
@@ -578,16 +687,20 @@ pub async fn sync_calendar(
         let idx = by_remote.get(&gev.id).or_else(|| by_uid.get(&format!("google-{}", gev.id))).copied();
         match idx {
             None => {
-                cal::sync_write_event(&pool, None, &card, &gev.id, gev.etag.as_deref(), remote_ms).await?;
+                let local_id = cal::sync_write_event(&pool, None, &card, &gev.id, gev.etag.as_deref(), remote_ms).await?;
+                occurrence_parents.push((local_id, gcal.clone(), gev.id.clone(), card));
                 pulled += 1;
             }
             Some(i) => {
                 seen.insert(i);
                 let local = &locals[i];
                 match reconcile_matched(local.state, remote_ms) {
-                    MatchAction::Noop => {}
+                    MatchAction::Noop => {
+                        occurrence_parents.push((local.id, gcal.clone(), gev.id.clone(), card));
+                    }
                     MatchAction::PullOverwrite => {
                         cal::sync_write_event(&pool, Some(local.id), &card, &gev.id, gev.etag.as_deref(), remote_ms).await?;
+                        occurrence_parents.push((local.id, gcal.clone(), gev.id.clone(), card));
                         pulled += 1;
                     }
                     MatchAction::UpdateRemote => {
@@ -596,6 +709,7 @@ pub async fn sync_calendar(
                             let resp: Value = google_send(&http, Method::PUT, &events_url(gcal, Some(&gev.id)), &token, Some(&body)).await?;
                             let ms = rfc3339_to_ms(&v_str(&resp, "updated"));
                             cal::sync_mark_pushed(&pool, "events", "event_id", local.id, &gev.id, resp.get("etag").and_then(|x| x.as_str()), ms).await?;
+                            occurrence_parents.push((local.id, gcal.clone(), gev.id.clone(), lcard));
                             pushed += 1;
                         }
                     }
@@ -632,6 +746,7 @@ pub async fn sync_calendar(
                     let ms = rfc3339_to_ms(&v_str(&resp, "updated"));
                     if !id.is_empty() {
                         cal::sync_mark_pushed(&pool, "events", "event_id", local.id, &id, resp.get("etag").and_then(|x| x.as_str()), ms).await?;
+                        occurrence_parents.push((local.id, gcal, id, lcard));
                         pushed += 1;
                     }
                 }
@@ -639,7 +754,102 @@ pub async fn sync_calendar(
         }
     }
 
+    for (local_id, calendar, event, card) in occurrence_parents {
+        let instances = exceptions.remove(&(calendar.clone(), event.clone())).unwrap_or_default();
+        pushed += sync_event_occurrences(&http, &token, &pool, local_id, &calendar, &event, &card, &instances).await? as i64;
+    }
     Ok(Json(json!({ "pulled": pulled, "pushed": pushed, "deletedRemote": deleted_remote })))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct GoogleAclRule {
+    id: String,
+    role: String,
+    scope: GoogleAclScope,
+}
+
+#[derive(Deserialize, Serialize)]
+struct GoogleAclScope {
+    #[serde(rename = "type")]
+    scope_type: String,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CalendarGrant {
+    email: String,
+    role: String,
+}
+
+async fn google_acl_target(state: &Arc<AppState>, account_id: i64, calendar_id: i64) -> Result<(String, String), AppError> {
+    let token = gmail_token(state, account_id).await?;
+    let pool = db::get_user_db_pool(state, account_id).await?;
+    let remote: Option<String> = sqlx::query_scalar("SELECT remote_id FROM calendars WHERE calendar_id = ?")
+        .bind(calendar_id).fetch_optional(&pool).await?.flatten();
+    let remote = remote.filter(|id| !id.is_empty() && !id.contains("://"))
+        .ok_or_else(|| AppError::BadRequest("This is not a Google calendar.".into()))?;
+    Ok((token, remote))
+}
+
+fn acl_url(calendar: &str, rule: Option<&str>) -> Url {
+    let mut url = Url::parse("https://www.googleapis.com").expect("Google API URL is valid");
+    let mut path = url.path_segments_mut().expect("Google API URL is hierarchical");
+    path.extend(["calendar", "v3", "calendars", calendar, "acl"]);
+    if let Some(rule) = rule { path.push(rule); }
+    drop(path);
+    url
+}
+
+pub async fn list_calendar_access(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, calendar_id)): Path<(i64, i64)>,
+) -> Result<Json<Vec<GoogleAclRule>>, AppError> {
+    let (token, calendar) = google_acl_target(&state, account_id, calendar_id).await?;
+    let rules = google_pages(&reqwest::Client::new(), &token, acl_url(&calendar, None).as_str(), &[], 10).await?;
+    Ok(Json(rules))
+}
+
+pub async fn grant_calendar_access(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, calendar_id)): Path<(i64, i64)>,
+    Json(grant): Json<CalendarGrant>,
+) -> Result<Json<GoogleAclRule>, AppError> {
+    let email = grant.email.trim();
+    if email.parse::<lettre::Address>().is_err() || !matches!(grant.role.as_str(), "freeBusyReader" | "reader" | "writer") {
+        return Err(AppError::BadRequest("Invalid calendar recipient or access level.".into()));
+    }
+    let (token, calendar) = google_acl_target(&state, account_id, calendar_id).await?;
+    let http = reqwest::Client::new();
+    let mut list_url = acl_url(&calendar, None);
+    let rules: Vec<GoogleAclRule> = google_pages(&http, &token, list_url.as_str(), &[], 10).await?;
+    let existing = rules.iter().find(|rule| rule.scope.scope_type == "user"
+        && rule.scope.value.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(email)));
+    let (method, url, body) = if let Some(rule) = existing {
+        if rule.role == "owner" {
+            return Err(AppError::BadRequest("Owner access cannot be changed here.".into()));
+        }
+        (Method::PATCH, acl_url(&calendar, Some(&rule.id)), json!({ "role": grant.role }))
+    } else {
+        list_url.query_pairs_mut().append_pair("sendNotifications", "true");
+        (Method::POST, list_url, json!({ "role": grant.role, "scope": { "type": "user", "value": email } }))
+    };
+    Ok(Json(google_send(&http, method, url.as_str(), &token, Some(&body)).await?))
+}
+
+pub async fn revoke_calendar_access(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, calendar_id, rule_id)): Path<(i64, i64, String)>,
+) -> Result<Json<Value>, AppError> {
+    let (token, calendar) = google_acl_target(&state, account_id, calendar_id).await?;
+    let http = reqwest::Client::new();
+    let url = acl_url(&calendar, Some(&rule_id));
+    let rule: GoogleAclRule = google_get(&http, url.as_str(), &token).await?;
+    if rule.role == "owner" || rule.scope.scope_type != "user" {
+        return Err(AppError::BadRequest("This calendar rule cannot be removed here.".into()));
+    }
+    google_delete(&http, url.as_str(), &token).await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ─────────────────────────── Contacts (People) ───────────────────────────
@@ -799,6 +1009,8 @@ pub async fn sync_contacts(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "contacts").await;
+    let _guard = lock.lock().await;
     let token = gmail_token(&state, account_id).await?;
     let pool = db::get_user_db_pool(&state, account_id).await?;
     let http = reqwest::Client::new();
@@ -931,6 +1143,20 @@ struct GTask {
     status: Option<String>,
     #[serde(default)]
     due: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    position: Option<String>,
+}
+
+const TASK_NOTE_METADATA: &str = "\n\n[Guvercin task metadata v1]\n";
+
+#[derive(Deserialize, Serialize)]
+struct TaskNoteMetadata {
+    priority: String,
+    starred: bool,
+    subtasks: Vec<todo::Subtask>,
+    due_time: Option<String>,
 }
 
 fn map_task(g: &GTask, list_id: i64) -> Option<todo::TaskCard> {
@@ -947,24 +1173,56 @@ fn map_task(g: &GTask, list_id: i64) -> Option<todo::TaskCard> {
         ..Default::default()
     };
     if let Some(due) = &g.due {
-        if due.len() >= 10 {
-            card.due = due[..10].to_string();
+        if let Some(date) = due.get(..10) {
+            card.due = date.to_owned();
+        }
+    }
+    if let Some((notes, metadata)) = card.notes.rsplit_once(TASK_NOTE_METADATA) {
+        if let Ok(metadata) = serde_json::from_str::<TaskNoteMetadata>(metadata) {
+            card.notes = notes.to_owned();
+            card.priority = metadata.priority;
+            card.starred = metadata.starred;
+            card.subtasks = metadata.subtasks;
+            if let Some(time) = metadata.due_time.filter(|time| chrono::NaiveTime::parse_from_str(time, "%H:%M").is_ok()) {
+                if !card.due.is_empty() {
+                    card.due.push('T');
+                    card.due.push_str(&time);
+                    card.has_due_time = true;
+                }
+            }
         }
     }
     Some(card)
 }
 
-fn task_to_google(card: &todo::TaskCard) -> Value {
+fn task_to_google(card: &todo::TaskCard) -> Result<Value, AppError> {
+    let pending_subtasks = if has_native_tasks(&card.subtasks) { Vec::new() } else { card.subtasks.clone() };
+    let due_time = if card.has_due_time { card.due.get(11..16).map(str::to_owned) } else { None };
+    let mut notes = card.notes.clone();
+    if !matches!(card.priority.as_str(), "" | "none") || card.starred || !pending_subtasks.is_empty() || due_time.is_some() {
+        let metadata = TaskNoteMetadata {
+            priority: card.priority.clone(),
+            starred: card.starred,
+            subtasks: pending_subtasks,
+            due_time,
+        };
+        notes.push_str(TASK_NOTE_METADATA);
+        notes.push_str(&serde_json::to_string(&metadata)
+            .map_err(|error| AppError::BadRequest(error.to_string()))?);
+    }
+    if notes.encode_utf16().count() > 8192 {
+        return Err(AppError::BadRequest("Task notes and Guvercin metadata exceed the Google Tasks limit.".into()));
+    }
     let mut obj = json!({
         "title": card.title,
-        "notes": card.notes,
+        "notes": notes,
         "status": if card.completed { "completed" } else { "needsAction" },
     });
     let date = card.due.get(0..10).unwrap_or("");
     if !date.is_empty() {
         obj["due"] = json!(format!("{date}T00:00:00.000Z"));
     }
-    obj
+    Ok(obj)
 }
 
 fn tasks_url(tasklist: &str, task: Option<&str>) -> String {
@@ -991,10 +1249,161 @@ async fn target_tasklist(pool: &SqlitePool, list_id: i64) -> String {
         .unwrap_or_else(|| "@default".to_string())
 }
 
+fn native_children(parent: &str, tasks: &[GTask], depth: usize) -> (Vec<todo::Subtask>, i64) {
+    if depth >= 20 {
+        return (Vec::new(), 0);
+    }
+    let mut children: Vec<&GTask> = tasks.iter().filter(|task| task.parent.as_deref() == Some(parent)).collect();
+    children.sort_by(|a, b| a.position.cmp(&b.position));
+    let mut updated = 0;
+    let cards = children.into_iter().map(|child| {
+        let (children, latest) = native_children(&child.id, tasks, depth + 1);
+        updated = updated.max(latest).max(child.updated.as_deref().map(rfc3339_to_ms).unwrap_or(0));
+        todo::Subtask {
+            title: child.title.clone().unwrap_or_default(),
+            done: child.status.as_deref() == Some("completed"),
+            children,
+            google_id: Some(child.id.clone()),
+        }
+    }).collect();
+    (cards, updated)
+}
+
+fn merge_legacy_children(native: &mut Vec<todo::Subtask>, legacy: Vec<todo::Subtask>) {
+    let mut used = HashSet::new();
+    for entry in legacy {
+        let matching = native.iter().enumerate().position(|(index, subtask)| {
+            !used.contains(&index) && (entry.google_id.as_ref().is_some_and(|id| subtask.google_id.as_ref() == Some(id))
+                || (entry.google_id.is_none() && subtask.title == entry.title && subtask.done == entry.done))
+        });
+        if let Some(index) = matching {
+            used.insert(index);
+            merge_legacy_children(&mut native[index].children, entry.children);
+        } else if entry.google_id.is_none() {
+            let _ = used.insert(native.len());
+            native.push(entry);
+        }
+    }
+}
+
+fn collect_child_ids(children: &[todo::Subtask], ids: &mut HashSet<String>) {
+    for child in children {
+        if let Some(id) = &child.google_id {
+            ids.insert(id.clone());
+        }
+        collect_child_ids(&child.children, ids);
+    }
+}
+
+struct GoogleChildSync<'a> {
+    http: &'a reqwest::Client,
+    token: &'a str,
+    list: &'a str,
+    remote: &'a [GTask],
+}
+
+impl GoogleChildSync<'_> {
+    fn push<'a>(
+        &'a self, parent: &'a str, children: &'a mut [todo::Subtask], depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            if depth >= 20 {
+                return Err(AppError::BadRequest("Google task nesting is too deep".into()));
+            }
+            let mut siblings: Vec<&GTask> = self.remote.iter()
+                .filter(|task| task.parent.as_deref() == Some(parent)).collect();
+            siblings.sort_by(|a, b| a.position.cmp(&b.position));
+            let mut order: Vec<_> = siblings.iter().map(|task| task.id.clone()).collect();
+            let mut previous: Option<String> = None;
+            let mut handled = HashSet::new();
+            for (position, child) in children.iter_mut().enumerate() {
+                if child.title.trim().is_empty() {
+                    continue;
+                }
+                use sha2::{Digest, Sha256};
+                let marker = format!("[Guvercin subtask {}]", hex::encode(Sha256::digest(
+                    format!("{parent}:{position}:{}", child.title).as_bytes()
+                )));
+                let candidate = siblings.iter().copied().find(|remote| !handled.contains(&remote.id)
+                    && (child.google_id.as_deref() == Some(remote.id.as_str()) || remote.notes.as_deref() == Some(&marker)));
+                let mut payload = json!({
+                    "title": child.title,
+                    "status": if child.done { "completed" } else { "needsAction" },
+                });
+                let id = if let Some(existing) = candidate {
+                    let url = tasks_url(self.list, Some(&existing.id));
+                    if existing.title.as_deref() != Some(child.title.as_str())
+                        || (existing.status.as_deref() == Some("completed")) != child.done
+                    {
+                        let _: Value = google_send(self.http, Method::PATCH, &url, self.token, Some(&payload)).await?;
+                    }
+                    let existing_position = order.iter().position(|id| id == &existing.id).unwrap_or_default();
+                    let predecessor = existing_position.checked_sub(1).map(|index| order[index].as_str());
+                    if predecessor != previous.as_deref() {
+                        let mut url = Url::parse(&url).expect("Google task URL is valid");
+                        url.path_segments_mut().expect("Google task URL is hierarchical").push("move");
+                        url.query_pairs_mut().append_pair("parent", parent);
+                        if let Some(previous) = &previous {
+                            url.query_pairs_mut().append_pair("previous", previous);
+                        }
+                        let _: Value = google_send(self.http, Method::POST, url.as_str(), self.token, None).await?;
+                    }
+                    existing.id.clone()
+                } else {
+                    let mut url = Url::parse(&tasks_url(self.list, None)).expect("Google task URL is valid");
+                    url.query_pairs_mut().append_pair("parent", parent);
+                    if let Some(previous) = &previous {
+                        url.query_pairs_mut().append_pair("previous", previous);
+                    }
+                    payload["notes"] = json!(marker);
+                    let response: GTask = google_send(self.http, Method::POST, url.as_str(), self.token, Some(&payload)).await?;
+                    if response.id.is_empty() {
+                        return Err(AppError::BadRequest("Google did not return a subtask identifier".into()));
+                    }
+                    response.id
+                };
+                order.retain(|entry| entry != &id);
+                let next = previous.as_deref().and_then(|previous|
+                    order.iter().position(|entry| entry == previous).map(|index| index + 1)).unwrap_or(0);
+                order.insert(next, id.clone());
+                child.google_id = Some(id.clone());
+                handled.insert(id.clone());
+                if !child.children.is_empty() {
+                    self.push(&id, &mut child.children, depth + 1).await?;
+                }
+                previous = Some(id);
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn task_child_ids(pool: &SqlitePool, list: &str, root: &str) -> Result<HashSet<String>, AppError> {
+    let saved: Option<String> = sqlx::query_scalar(
+        "SELECT children FROM google_task_subtasks WHERE list_id = ? AND task_id = ?",
+    ).bind(list).bind(root).fetch_optional(pool).await?;
+    Ok(saved.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
+}
+
+async fn remember_task_children(pool: &SqlitePool, list: &str, root: &str, children: &[todo::Subtask]) -> Result<(), AppError> {
+    let mut ids = HashSet::new();
+    collect_child_ids(children, &mut ids);
+    sqlx::query("INSERT OR REPLACE INTO google_task_subtasks (list_id, task_id, children) VALUES (?, ?, ?)")
+        .bind(list).bind(root).bind(serde_json::to_string(&ids).expect("string set is serializable"))
+        .execute(pool).await?;
+    Ok(())
+}
+
+fn has_native_tasks(children: &[todo::Subtask]) -> bool {
+    children.iter().all(|child| child.google_id.is_some() && has_native_tasks(&child.children))
+}
+
 pub async fn sync_tasks(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "tasks").await;
+    let _guard = lock.lock().await;
     let token = gmail_token(&state, account_id).await?;
     let pool = db::get_user_db_pool(&state, account_id).await?;
     let http = reqwest::Client::new();
@@ -1010,13 +1419,13 @@ pub async fn sync_tasks(
     }
 
     // 2. Fetch all remote tasks.
-    let mut remote: Vec<(String, GTask)> = Vec::new();
+    let mut remote: HashMap<String, Vec<GTask>> = HashMap::new();
     for gl in gl_to_local.keys() {
         let tasks = google_pages::<GTask>(
             &http, &token, &tasks_url(gl, None),
             &[("showCompleted", "true"), ("showHidden", "true"), ("maxResults", "100")], 20,
         ).await?;
-        remote.extend(tasks.into_iter().map(|task| (gl.clone(), task)));
+        remote.insert(gl.clone(), tasks);
 
     }
 
@@ -1054,39 +1463,75 @@ pub async fn sync_tasks(
     let mut seen: HashSet<usize> = HashSet::new();
     let (mut pulled, mut pushed, mut deleted_remote) = (0i64, 0i64, 0i64);
 
-    // 4. Reconcile remote → local.
-    for (gl, gt) in &remote {
+    // Only top-level tasks have their own local rows. Children use Google's
+    // parent relation and are projected into the local task tree.
+    for (gl, tasks) in &remote {
         let local_list = *gl_to_local.get(gl).unwrap_or(&0);
-        let Some(card) = map_task(gt, local_list) else { continue };
-        let remote_ms = gt.updated.as_deref().map(rfc3339_to_ms).unwrap_or(0);
-        let idx = by_remote.get(&gt.id).or_else(|| by_uid.get(&format!("gtasks-{}", gt.id))).copied();
-        match idx {
-            None => {
-                todo::sync_write_task(&pool, None, &card, &gt.id, gt.etag.as_deref(), remote_ms).await?;
-                pulled += 1;
+        let child_sync = GoogleChildSync { http: &http, token: &token, list: gl, remote: tasks };
+        for gt in tasks {
+            let idx = by_remote.get(&gt.id).or_else(|| by_uid.get(&format!("gtasks-{}", gt.id))).copied();
+            if let Some(index) = idx {
+                seen.insert(index);
             }
-            Some(i) => {
-                seen.insert(i);
-                let local = &locals[i];
-                match reconcile_matched(local.state, remote_ms) {
-                    MatchAction::Noop => {}
-                    MatchAction::PullOverwrite => {
-                        todo::sync_write_task(&pool, Some(local.id), &card, &gt.id, gt.etag.as_deref(), remote_ms).await?;
-                        pulled += 1;
+            if gt.parent.is_some() {
+                if let Some(index) = idx {
+                    let legacy = &locals[index];
+                    if !legacy.state.dirty {
+                        cal::sync_hard_delete(&pool, "tasks", "task_id", legacy.id).await?;
                     }
-                    MatchAction::UpdateRemote => {
-                        if let Ok(lcard) = serde_json::from_str::<todo::TaskCard>(&local.card_json) {
-                            let body = task_to_google(&lcard);
-                            let resp: Value = google_send(&http, Method::PATCH, &tasks_url(gl, Some(&gt.id)), &token, Some(&body)).await?;
-                            let ms = rfc3339_to_ms(&v_str(&resp, "updated"));
-                            todo::sync_write_task(&pool, Some(local.id), &lcard, &gt.id, resp.get("etag").and_then(|x| x.as_str()), ms).await?;
-                            pushed += 1;
+                }
+                continue;
+            }
+            let Some(mut card) = map_task(gt, local_list) else { continue };
+            let (mut children, child_updated) = native_children(&gt.id, tasks, 0);
+            merge_legacy_children(&mut children, std::mem::take(&mut card.subtasks));
+            card.subtasks = children;
+            let remote_ms = gt.updated.as_deref().map(rfc3339_to_ms).unwrap_or(0).max(child_updated);
+
+            let Some(local) = idx.map(|i| &locals[i]) else {
+                todo::sync_write_task(&pool, None, &card, &gt.id, gt.etag.as_deref(), remote_ms).await?;
+                remember_task_children(&pool, gl, &gt.id, &card.subtasks).await?;
+                pulled += 1;
+                continue;
+            };
+            let local_card = serde_json::from_str::<todo::TaskCard>(&local.card_json).ok();
+            let needs_child_migration = !has_native_tasks(&card.subtasks);
+            match reconcile_matched(local.state, remote_ms) {
+                MatchAction::DeleteRemote => {
+                    google_delete(&http, &tasks_url(gl, Some(&gt.id)), &token).await?;
+                    sqlx::query("DELETE FROM google_task_subtasks WHERE list_id = ? AND task_id = ?")
+                        .bind(gl).bind(&gt.id).execute(&pool).await?;
+                    cal::sync_hard_delete(&pool, "tasks", "task_id", local.id).await?;
+                    deleted_remote += 1;
+                }
+                action => {
+                    if action == MatchAction::UpdateRemote || needs_child_migration {
+                        let mut desired = if action == MatchAction::UpdateRemote {
+                            local_card.unwrap_or_else(|| card.clone())
+                        } else {
+                            card.clone()
+                        };
+                        let known = task_child_ids(&pool, gl, &gt.id).await?;
+                        let mut extant = HashSet::new();
+                        collect_child_ids(&card.subtasks, &mut extant);
+                        child_sync.push(&gt.id, &mut desired.subtasks, 0).await?;
+                        let mut retained = HashSet::new();
+                        collect_child_ids(&desired.subtasks, &mut retained);
+                        for id in known.difference(&retained).filter(|id| extant.contains(*id)) {
+                            google_delete(&http, &tasks_url(gl, Some(id)), &token).await?;
                         }
-                    }
-                    MatchAction::DeleteRemote => {
-                        google_delete(&http, &tasks_url(gl, Some(&gt.id)), &token).await?;
-                        cal::sync_hard_delete(&pool, "tasks", "task_id", local.id).await?;
-                        deleted_remote += 1;
+                        let body = task_to_google(&desired)?;
+                        let response: GTask = google_send(&http, Method::PATCH, &tasks_url(gl, Some(&gt.id)), &token, Some(&body)).await?;
+                        let updated = response.updated.as_deref().map(rfc3339_to_ms).unwrap_or(remote_ms);
+                        todo::sync_write_task(&pool, Some(local.id), &desired, &gt.id, response.etag.as_deref(), updated).await?;
+                        remember_task_children(&pool, gl, &gt.id, &desired.subtasks).await?;
+                        pushed += 1;
+                    } else if action == MatchAction::PullOverwrite
+                        || local_card.as_ref().is_some_and(|local| local.subtasks != card.subtasks)
+                    {
+                        todo::sync_write_task(&pool, Some(local.id), &card, &gt.id, gt.etag.as_deref(), remote_ms).await?;
+                        remember_task_children(&pool, gl, &gt.id, &card.subtasks).await?;
+                        pulled += 1;
                     }
                 }
             }
@@ -1108,7 +1553,7 @@ pub async fn sync_tasks(
             OrphanAction::CreateRemote | OrphanAction::RecreateRemote => {
                 if let Ok(lcard) = serde_json::from_str::<todo::TaskCard>(&local.card_json) {
                     let tasklist = target_tasklist(&pool, local.aux).await;
-                    let body = task_to_google(&lcard);
+                    let body = task_to_google(&lcard)?;
                     let resp: Value = google_send(&http, Method::POST, &tasks_url(&tasklist, None), &token, Some(&body)).await?;
                     let id = v_str(&resp, "id");
                     let ms = rfc3339_to_ms(&v_str(&resp, "updated"));
@@ -1128,6 +1573,46 @@ pub async fn sync_tasks(
 mod tests {
     use super::*;
     use axum::{extract::Query, routing::get, Router};
+
+    #[test]
+    fn native_google_subtasks_keep_their_identity_and_sibling_order() {
+        let tasks: Vec<GTask> = serde_json::from_value(json!([
+            {"id": "third", "parent": "root", "position": "003", "title": "Third"},
+            {"id": "first", "parent": "root", "position": "001", "title": "First", "status": "completed"},
+            {"id": "nested", "parent": "first", "title": "Nested"},
+            {"id": "other", "parent": "unrelated", "title": "Other"},
+        ])).unwrap();
+        let (mut children, _) = native_children("root", &tasks, 0);
+        assert_eq!(children.iter().map(|child| child.title.as_str()).collect::<Vec<_>>(), ["First", "Third"]);
+        assert!(children[0].done);
+        assert_eq!(children[0].children[0].google_id.as_deref(), Some("nested"));
+        merge_legacy_children(&mut children, vec![todo::Subtask { title: "First".into(), done: true, ..Default::default() }]);
+        assert_eq!(children.len(), 2);
+        let card = todo::TaskCard { title: "Root".into(), subtasks: children, ..Default::default() };
+        assert_eq!(task_to_google(&card).unwrap()["notes"], "");
+    }
+
+    #[test]
+    fn google_task_notes_round_trip_guvercin_fields() {
+        let local = todo::TaskCard {
+            title: "Review".into(),
+            notes: "Keep the user's notes".into(),
+            due: "2026-11-29T16:45".into(),
+            has_due_time: true,
+            priority: "high".into(),
+            starred: true,
+            subtasks: vec![todo::Subtask { title: "Read".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let body = task_to_google(&local).unwrap();
+        let remote: GTask = serde_json::from_value(body).unwrap();
+        let restored = map_task(&remote, 1).unwrap();
+        assert_eq!(restored.notes, local.notes);
+        assert_eq!(restored.due, local.due);
+        assert_eq!(restored.priority, local.priority);
+        assert!(restored.starred && restored.has_due_time);
+        assert_eq!(restored.subtasks[0].title, "Read");
+    }
 
     #[tokio::test]
     async fn incomplete_google_pages_never_return_a_partial_snapshot() {

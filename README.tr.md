@@ -232,7 +232,7 @@ ona karşılık gelen `VITE_API_URL` değerlerini ayarlayın.
 | | |
 | --- | --- |
 | veritabanları | `~/.guvercin/databases/` — `general.db` artı hesap başına bir `<account_id>.db` |
-| ana anahtar | `<yerel uygulama verisi>/com.guvercin.app/master.key` |
+| ana anahtar | İşletim sistemi anahtarlığında `com.guvercin.app / database-master-key` |
 
 her sqlite dosyası, sıfırlanan bellekte tutulan 256 bitlik bir ana anahtardan
 veritabanı başına türetilen bir anahtarla sqlcipher üzerinden açılır. diskte
@@ -243,21 +243,16 @@ tarafından değiş tokuş edilir ve arayüzden hiç geçmez.
 
 hesap başına veritabanı demek, bir hesabı silmenin tek bir dosyayı silmek olması
 demek. hepsini başka bir yere — harici bir diske de — taşımak için `DATABASE_DIR`
-ayarla. `master.key` dosyasını silmek her veritabanını kalıcı olarak okunamaz
-yapar; geri dönüş yolu yoktur.
+ayarla. Anahtarlık kaydı silinirse şifreli veri tabanları okunamaz.
 
 ### şifreleme gerçekte neyi koruyor
 
-ana anahtar, kullanıcı profilinde **düz bir dosya olarak** durur. işletim sistemi
-anahtarlığıyla sarmalanmaz ve bir parola ile korunmaz. unix'te 0600 kipiyle
-yazılır, yani aynı makinedeki diğer yerel kullanıcılar okuyamaz; windows'ta yerel
-uygulama verisi dizininin kullanıcı başına acl'sini devralır.
+Anahtar macOS’ta Keychain, Windows’ta Credential Manager, Linux’ta çalışan bir
+Secret Service içinde saklanır. Eski `master.key` dosyası varsa aynı anahtar
+anahtarlığa kaydedilir. Uygulama, kaydı okuyup doğruladıktan sonra dosyayı siler.
 
-yani: sqlcipher postanı aynı makinedeki başka bir hesaptan ve o anahtar olmadan
-diski okuyan birinden korur. **senin olarak çalışan hiçbir şeye karşı korumaz** —
-kendi oturumundaki zararlı yazılım dahil — çünkü o şey anahtarı okuyabilir. tam
-disk şifrelemesi hâlâ senin işin. anahtarı platform anahtarlığına taşımak açık bir
-iş kalemi.
+Açık kullanıcı oturumundaki yazılımların anahtara erişimi işletim sisteminin
+kimlik bilgisi politikasına bağlıdır.
 
 bilmeye değer bir şey daha: **pakete gömülü google oauth istemci parolası
 herkese açıktır.** kurulu bir masaüstü uygulamasının onu saklayacak yeri olmadığı

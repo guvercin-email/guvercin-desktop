@@ -12,7 +12,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use mailparse::MailHeaderMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
@@ -608,6 +608,56 @@ fn literal_search_pattern(value: &str) -> String {
     format!("%{escaped}%")
 }
 
+fn push_keyword_expression(qb: &mut QueryBuilder<'_, Sqlite>, expression: crate::search_expression::SearchExpression) {
+    use crate::search_expression::{Field, SearchExpression::*};
+    match expression {
+        Term(Field::IndexedText, text) => {
+            let phrase = format!("\"{}\"", text.replace('"', "\"\""));
+            qb.push("local_mail_cache.id IN (SELECT rowid FROM local_mail_fts WHERE local_mail_fts MATCH ")
+                .push_bind(phrase)
+                .push(")");
+        }
+        Term(field, text) => {
+            let columns: &[&str] = match field {
+                Field::From => &["sender_address", "sender_name"],
+                Field::To => &["recipient_to"],
+                Field::Cc => &["cc_value"],
+                Field::Subject => &["subject"],
+                Field::Text | Field::IndexedText => &["plain_body", "html_body", "subject", "sender_address",
+                                 "sender_name", "recipient_to", "cc_value"],
+            };
+            qb.push("(");
+            let mut terms = qb.separated(" OR ");
+            for column in columns {
+                terms.push(format!("LOWER(COALESCE({column}, '')) LIKE LOWER("))
+                    .push_bind_unseparated(literal_search_pattern(&text))
+                    .push_unseparated(") ESCAPE '!'");
+            }
+            qb.push(")");
+        }
+        Not(inner) => {
+            qb.push("NOT (");
+            push_keyword_expression(qb, *inner);
+            qb.push(")");
+        }
+        And(left, right) => push_boolean_keywords(qb, *left, *right, " AND "),
+        Or(left, right) => push_boolean_keywords(qb, *left, *right, " OR "),
+    }
+}
+
+fn push_boolean_keywords(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    left: crate::search_expression::SearchExpression,
+    right: crate::search_expression::SearchExpression,
+    operator: &'static str,
+) {
+    qb.push("(");
+    push_keyword_expression(qb, left);
+    qb.push(operator);
+    push_keyword_expression(qb, right);
+    qb.push(")");
+}
+
 fn apply_advanced_search_filters(
     qb: &mut QueryBuilder<Sqlite>,
     req: &AdvancedSearchRequest,
@@ -663,22 +713,8 @@ fn apply_advanced_search_filters(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        let pattern = literal_search_pattern(value);
-        qb.push(" AND (LOWER(COALESCE(plain_body, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(html_body, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(subject, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(sender_address, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(sender_name, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(recipient_to, '')) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") ESCAPE '!' OR LOWER(COALESCE(cc_value, '')) LIKE LOWER(")
-            .push_bind(pattern)
-            .push(") ESCAPE '!')");
+        qb.push(" AND ");
+        push_keyword_expression(qb, crate::search_expression::keywords(value));
     }
 
     if let Some(date) = req
@@ -1071,117 +1107,66 @@ pub async fn sync_mailbox(
 
     let sync_lock = state.account_sync_lock(account_id).await;
     let _guard = sync_lock.lock().await;
+    ensure_imap_connected(&state._db, &state.imap, account_id).await?;
+    let processed = refresh_mailbox(&state, account_id, &mailbox, q.per_page, q.force_all.unwrap_or(false)).await?;
+    Ok(Json(SyncNowResponse { status: "ok", processed, failed: 0 }))
+}
 
-    // Ensure IMAP connected
-    let _ = ensure_imap_connected(&state._db, &state.imap, account_id).await;
-
+// The UID snapshot stays stable even when sequence numbers shift during FETCH.
+async fn refresh_mailbox(
+    state: &Arc<MailAppState>,
+    account_id: i64,
+    mailbox: &str,
+    batch_size: usize,
+    refresh_flags: bool,
+) -> Result<usize, AppError> {
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
-
-    // Use a large per-page size for efficient batching. We always sync ALL pages so the
-    // full mail list is visible regardless of by_days or any other download policy.
-    // Body download is handled separately by the background incremental sync (sync_now).
-    let per_page = q.per_page.max(50);
-    let force_all = q.force_all.unwrap_or(false);
-
-    let mut processed = 0usize;
-    let mut failed = 0usize;
-
-    // Fetch page 1 first to discover the total message count for this mailbox.
-    let imap_session::MailboxPage { generation, total, previews: first_previews } = tokio::task::spawn_blocking({
-        let imap_state = state.imap.clone();
-        let mailbox = mailbox.clone();
-        move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, 1, per_page, None)
-    })
-    .await
-    .map_err(|error| AppError::BadRequest(error.to_string()))?
-    .map_err(AppError::BadRequest)?;
-    record_mailbox_generation(&pool, &mailbox, generation).await?;
-
-    if total == 0 {
-        let _ = touch_last_sync_time(&state._db, account_id).await;
-        return Ok(Json(SyncNowResponse {
-            status: "ok",
-            processed: 0,
-            failed: 0,
-        }));
-    }
-
-    // Determine how many pages exist in this mailbox.
-    let total_pages = total.div_ceil(per_page);
-
-    // Inner function: write a batch of previews into local_mail_cache (headers only, no body).
-    async fn insert_previews(
-        pool: &SqlitePool,
-        mailbox: &str,
-        previews: Vec<crate::mail_models::MailPreview>,
-        force_all: bool,
-    ) -> (usize, usize) {
-        let mut ok = 0usize;
-        let mut fail = 0usize;
-        for preview in previews {
-            let uid = preview.id.clone();
-            let exists: bool = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM local_mail_cache WHERE uid = ? AND folder = ? AND uid_validity IS ? LIMIT 1",
-            )
-            .bind(&uid)
-            .bind(mailbox)
-            .bind(preview.uid_validity)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-
-            if exists && !force_all {
-                continue;
-            }
-
-            match cache_mail_preview(pool, mailbox, &preview).await {
-                Ok(_) => ok += 1,
-                Err(e) => {
-                    tracing::warn!("sync_mailbox: cache preview failed uid={uid}: {e}");
-                    fail += 1;
-                }
-            }
-        }
-        (ok, fail)
-    }
-
-    // Process page 1 that we already fetched.
-    let (p, f) = insert_previews(&pool, &mailbox, first_previews, force_all).await;
-    processed += p;
-    failed += f;
-
-    // Fetch and process remaining pages (2..=total_pages).
-    for page_i in 2..=total_pages {
-        let imap_session::MailboxPage { total: pg_total, previews, .. } = tokio::task::spawn_blocking({
-            let imap_state = state.imap.clone();
-            let mailbox = mailbox.clone();
-            move || imap_session::fetch_mail_list(&imap_state, account_id, &mailbox, page_i, per_page, Some(generation))
-        })
-        .await
-        .map_err(|error| AppError::BadRequest(error.to_string()))?
+    let (generation, _, server_uids) = tokio::task::spawn_blocking({
+        let imap = state.imap.clone();
+        let mailbox = mailbox.to_owned();
+        move || imap_session::fetch_new_uids_since(&imap, account_id, &mailbox, (0, 0))
+    }).await.map_err(|error| AppError::BadRequest(error.to_string()))?
         .map_err(AppError::BadRequest)?;
+    record_mailbox_generation(&pool, mailbox, generation).await?;
+    upsert_folder_metadata(&pool, mailbox).await?;
 
-        let (p, f) = insert_previews(&pool, &mailbox, previews, force_all).await;
-        processed += p;
-        failed += f;
+    let cached: Vec<String> = sqlx::query_scalar(
+        "SELECT uid FROM local_mail_cache WHERE folder = ? AND uid_validity = ?",
+    ).bind(mailbox).bind(generation).fetch_all(&pool).await?;
+    let server_ids: std::collections::HashSet<_> = server_uids.iter().copied().collect();
+    let cached_ids: std::collections::HashSet<_> = cached.iter()
+        .filter_map(|uid| uid.parse::<u32>().ok()).collect();
+    let mut tx = pool.begin().await?;
+    for uid in cached.iter().filter(|uid| uid.parse::<u32>().is_ok_and(|uid| !server_ids.contains(&uid))) {
+        remove_cached_source(&mut tx, uid, mailbox, Some(generation)).await?;
+    }
+    tx.commit().await?;
 
-        if pg_total == 0 {
-            break;
+    let fetch_uids: Vec<_> = server_uids.into_iter()
+        .filter(|uid| refresh_flags || !cached_ids.contains(uid)).collect();
+    let mut processed = 0;
+    for chunk in fetch_uids.chunks(batch_size.clamp(50, 250)) {
+        let previews = tokio::task::spawn_blocking({
+            let imap = state.imap.clone();
+            let mailbox = mailbox.to_owned();
+            let uids = chunk.to_vec();
+            move || imap_session::fetch_headers_for_uids(&imap, account_id, &mailbox, &uids, generation)
+        }).await.map_err(|error| AppError::BadRequest(error.to_string()))?;
+        if align_previews_to_uids(chunk, &previews).len() != chunk.len() {
+            return Err(AppError::BadRequest("The mailbox changed during refresh. Try again.".into()));
+        }
+        for preview in previews {
+            cache_mail_preview(&pool, mailbox, &preview).await?;
+            processed += 1;
         }
     }
-
-    tracing::info!("sync_mailbox: {mailbox} total={total} pages={total_pages} processed={processed} failed={failed}");
-
-    // Update last sync time
-    let _ = touch_last_sync_time(&state._db, account_id).await;
-
-    Ok(Json(SyncNowResponse {
-        status: "ok",
-        processed,
-        failed,
-    }))
+    if mailbox == "INBOX" {
+        if let Err(error) = crate::spam_filter::scan_inbox(state, &pool, account_id, generation).await {
+            tracing::debug!(account_id, %error, "Automatic spam classification failed");
+        }
+    }
+    touch_last_sync_time(&state._db, account_id).await?;
+    Ok(processed)
 }
 
 pub async fn search_advanced(
@@ -2053,6 +2038,73 @@ pub async fn get_offline_status(
     }))
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+pub struct OutboxEntry {
+    id: i64,
+    subject: Option<String>,
+    recipients: Option<String>,
+    status: String,
+    attempt_count: i64,
+    next_retry_at: Option<String>,
+    last_error: Option<String>,
+    retryable: bool,
+    scheduled_at: Option<String>,
+    can_cancel: bool,
+}
+
+pub async fn get_outbox(
+    State(state): State<Arc<MailAppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Vec<OutboxEntry>>, AppError> {
+    let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    let rows = sqlx::query_as(
+        "SELECT o.id, o.subject, o.to_addrs AS recipients, o.status, o.attempt_count,
+                CAST(o.next_retry_at AS TEXT) AS next_retry_at, o.last_error,
+                COALESCE(q.manual_retry = 1 AND q.status IN ('failed', 'dead'), 0) AS retryable,
+                json_extract(CASE WHEN json_valid(q.payload_json) THEN q.payload_json ELSE '{}' END,
+                             '$.scheduled_send_at') AS scheduled_at,
+                COALESCE(q.status IN ('pending', 'failed')
+                    AND json_type(CASE WHEN json_valid(q.payload_json) THEN q.payload_json ELSE '{}' END,
+                                  '$.scheduled_send_at') = 'text', 0) AS can_cancel
+         FROM outbox_mails AS o
+         LEFT JOIN offline_sync_queue AS q ON q.id = o.queue_id
+         WHERE o.status != 'done'
+         ORDER BY o.created_at DESC, o.id DESC",
+    )
+    .fetch_all(&pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+pub async fn cancel_scheduled_send(
+    State(state): State<Arc<MailAppState>>,
+    Path((account_id, outbox_id)): Path<(i64, i64)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let sync_lock = state.account_sync_lock(account_id).await;
+    let _guard = sync_lock.lock().await;
+    let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
+        "DELETE FROM offline_sync_queue
+         WHERE id = (SELECT queue_id FROM outbox_mails WHERE id = ?)
+           AND action_type = 'send' AND status IN ('pending', 'failed')
+           AND json_type(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,
+                         '$.scheduled_send_at') = 'text'",
+    )
+    .bind(outbox_id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::BadRequest("This scheduled message can no longer be cancelled.".into()));
+    }
+    sqlx::query("DELETE FROM outbox_mails WHERE id = ?")
+        .bind(outbox_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "cancelled": true })))
+}
+
 pub async fn retry_offline_actions(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
@@ -2068,6 +2120,60 @@ pub async fn retry_offline_actions(
     Ok(Json(json!({ "retried": result.rows_affected() })))
 }
 
+#[derive(Deserialize)]
+struct BulkForwardTarget {
+    uid: String,
+    mailbox: String,
+    uid_validity: u32,
+}
+
+async fn queue_bulk_forward(
+    pool: &SqlitePool,
+    mut payload: serde_json::Value,
+) -> Result<OfflineActionResponse, AppError> {
+    let targets = payload.as_object_mut().and_then(|object| object.remove("targets"))
+        .ok_or_else(|| AppError::BadRequest("Forward targets are required.".into()))?;
+    let targets: Vec<BulkForwardTarget> = serde_json::from_value(targets)
+        .map_err(|_| AppError::BadRequest("Invalid forward targets. Refresh the source mailbox.".into()))?;
+    if !(2..=50).contains(&targets.len()) {
+        return Err(AppError::BadRequest("Select between 2 and 50 messages.".into()));
+    }
+    let mut identities = std::collections::HashSet::new();
+    for target in &targets {
+        let valid_uid = target.uid.parse::<u32>().is_ok_and(|uid| uid > 0);
+        if !valid_uid || target.mailbox.trim().is_empty() || target.uid_validity == 0
+            || !identities.insert((&target.uid, crate::mail_models::mailbox_identity(&target.mailbox), target.uid_validity))
+        {
+            return Err(AppError::BadRequest("Invalid or duplicate forward target.".into()));
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    let content = payload.to_string();
+    let mut queued_id = 0;
+    for target in &targets {
+        let row = sqlx::query(
+            "INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity)
+             VALUES ('forward', ?, ?, ?, ?)",
+        )
+        .bind(&target.uid)
+        .bind(&target.mailbox)
+        .bind(&content)
+        .bind(target.uid_validity)
+        .execute(&mut *tx)
+        .await?;
+        queued_id = row.last_insert_rowid();
+    }
+    tx.commit().await?;
+    Ok(OfflineActionResponse {
+        status: "queued",
+        queued_id,
+        draft_id: None,
+        draft_mailbox: None,
+        draft_uid_validity: None,
+    })
+}
+
 pub async fn post_offline_action(
     State(state): State<Arc<MailAppState>>,
     Path(account_id): Path<i64>,
@@ -2075,6 +2181,9 @@ pub async fn post_offline_action(
 ) -> Result<Json<OfflineActionResponse>, AppError> {
     validate_offline_action_type(&payload.action_type)?;
     let pool = db::get_user_db_pool(&state._db, account_id).await?;
+    if payload.action_type == "forward_many" {
+        return Ok(Json(queue_bulk_forward(&pool, payload.payload.unwrap_or_default()).await?));
+    }
     let payload_json = payload
         .payload
         .as_ref()
@@ -2325,6 +2434,15 @@ pub async fn post_offline_action(
     } else {
         (payload.target_uid.as_deref(), payload.target_folder.as_deref())
     };
+    let scheduled_send_at = match payload_value.get("scheduled_send_at") {
+        Some(value) if payload.action_type == "send" => {
+            let date = value.as_str().and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .ok_or_else(|| AppError::BadRequest("Invalid scheduled sending time.".into()))?
+                .with_timezone(&Utc);
+            Some(date.format("%Y-%m-%d %H:%M:%S").to_string())
+        }
+        _ => None,
+    };
     let uid_validity = payload.uid_validity;
     if requires_queued_uid(&payload.action_type) && uid_validity.filter(|value| *value > 0).is_none() {
         return Err(AppError::BadRequest(
@@ -2334,8 +2452,8 @@ pub async fn post_offline_action(
 
     let res = sqlx::query(
         r#"
-        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO offline_sync_queue (action_type, target_uid, target_folder, payload_json, uid_validity, status, next_retry_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         "#,
     )
     .bind(&payload.action_type)
@@ -2343,12 +2461,14 @@ pub async fn post_offline_action(
     .bind(&payload.target_folder)
     .bind(payload_json)
     .bind(uid_validity)
+    .bind(&scheduled_send_at)
     .execute(&mut *tx)
     .await?;
 
     if let Some(outbox_id) = outbox_id {
-        sqlx::query("UPDATE outbox_mails SET queue_id = ? WHERE id = ?")
+        sqlx::query("UPDATE outbox_mails SET queue_id = ?, next_retry_at = ? WHERE id = ?")
             .bind(res.last_insert_rowid())
+            .bind(&scheduled_send_at)
             .bind(outbox_id)
             .execute(&mut *tx)
             .await?;
@@ -2431,7 +2551,7 @@ async fn recover_interrupted_queue(pool: &SqlitePool) -> Result<(), sqlx::Error>
         r#"
         UPDATE offline_sync_queue
         SET status = CASE
-                WHEN action_type IN ('mark_read', 'mark_unread', 'label_remove') THEN 'pending'
+                WHEN action_type IN ('mark_read', 'mark_unread', 'star', 'unstar', 'label_remove') THEN 'pending'
                 ELSE 'dead'
             END,
             last_error = 'Synchronization interrupted; remote outcome not confirmed.',
@@ -2452,7 +2572,7 @@ async fn discard_superseded_mail_actions(pool: &SqlitePool) -> Result<(), sqlx::
         SET status = 'done', last_error = NULL, next_retry_at = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE older.status IN ('pending', 'failed')
-          AND older.action_type IN ('mark_read', 'mark_unread', 'label_add', 'label_remove', 'move')
+          AND older.action_type IN ('mark_read', 'mark_unread', 'star', 'unstar', 'label_add', 'label_remove', 'move')
           AND EXISTS (
               SELECT 1 FROM offline_sync_queue AS newer
               WHERE newer.id > older.id
@@ -2462,6 +2582,9 @@ async fn discard_superseded_mail_actions(pool: &SqlitePool) -> Result<(), sqlx::
                 AND (
                     (older.action_type IN ('mark_read', 'mark_unread')
                      AND newer.action_type IN ('mark_read', 'mark_unread'))
+                    OR
+                    (older.action_type IN ('star', 'unstar')
+                     AND newer.action_type IN ('star', 'unstar'))
                     OR
                     (older.action_type = 'move' AND newer.action_type IN ('move', 'delete')
                      AND newer.status IN ('pending', 'failed', 'done'))
@@ -2486,7 +2609,7 @@ async fn discard_superseded_mail_actions(pool: &SqlitePool) -> Result<(), sqlx::
 }
 
 fn requires_queued_uid(action: &str) -> bool {
-    matches!(action, "mark_read" | "mark_unread" | "delete" | "move" | "label_add" | "label_remove" | "forward")
+    matches!(action, "mark_read" | "mark_unread" | "star" | "unstar" | "delete" | "move" | "label_add" | "label_remove" | "forward")
 }
 
 async fn process_queue_once(
@@ -2502,8 +2625,8 @@ async fn process_queue_once(
         r#"
         SELECT id, action_type, target_uid, target_folder, payload_json, attempt_count, uid_validity
         FROM offline_sync_queue
-        WHERE (status = 'pending'
-           OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)))
+        WHERE status IN ('pending', 'failed')
+          AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
           AND (? OR action_type = 'send')
         ORDER BY created_at ASC, id ASC
         LIMIT ?
@@ -2579,6 +2702,7 @@ async fn process_queue_once(
         use imap_session::QueuedMailAction;
         let uid_validity = row.try_get::<Option<u32>, _>("uid_validity")?;
         let mut remote_outcome_uncertain = false;
+        let mut smtp_unavailable = false;
         let apply = |action: QueuedMailAction| {
             let imap = state.imap.clone();
             let folder = target_folder.clone();
@@ -2607,6 +2731,8 @@ async fn process_queue_once(
             match action_type.as_str() {
                 "mark_read" => apply(QueuedMailAction::Seen(true)).await.map_err(&mut classify_imap_error),
                 "mark_unread" => apply(QueuedMailAction::Seen(false)).await.map_err(&mut classify_imap_error),
+                "star" | "unstar" => apply(QueuedMailAction::Flagged(action_type == "star"))
+                    .await.map_err(&mut classify_imap_error),
                 "delete" => apply(QueuedMailAction::Delete).await.map_err(&mut classify_imap_error),
                 "move" => {
                     let destination = parsed.get("destination").and_then(|value| value.as_str())
@@ -2707,7 +2833,13 @@ async fn process_queue_once(
                                 .unwrap_or_default();
                             let attachments = parse_send_attachments(&parsed);
 
-                            let headers = parse_payload_headers(&parsed);
+                            let mut headers = parse_payload_headers(&parsed);
+                            if parsed.get("request_read_receipt").and_then(|value| value.as_bool()) == Some(true)
+                                && !from.is_empty() && !from.contains(['\r', '\n'])
+                            {
+                                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Disposition-Notification-To"));
+                                headers.push(("Disposition-Notification-To".into(), from.to_owned()));
+                            }
                             let provider_type = row
                                 .try_get::<Option<String>, _>("provider_type")
                                 .ok()
@@ -2723,7 +2855,7 @@ async fn process_queue_once(
                             {
                                 Err(e) => Err(e),
                                 Ok((send_secret, use_xoauth2)) => {
-                                    match crate::smtp_send::send_mail(
+                                    match crate::smtp_send::send_mail_with_delivery_receipt(
                                         crate::smtp_send::SmtpServer {
                                             host: &smtp_host,
                                             port: smtp_port,
@@ -2744,6 +2876,7 @@ async fn process_queue_once(
                                             attachments: &attachments,
                                             raw_headers: &headers,
                                         },
+                                        parsed.get("request_delivery_receipt").and_then(|value| value.as_bool()) == Some(true),
                                     )
                                     .await
                                     {
@@ -2766,6 +2899,7 @@ async fn process_queue_once(
                                         }
                                         Err(err) => {
                                             remote_outcome_uncertain = err.delivery_uncertain;
+                                            smtp_unavailable = err.connection_unavailable;
                                             Err(err.message)
                                         }
                                     }
@@ -3324,6 +3458,14 @@ async fn process_queue_once(
             }
         }
 
+        if smtp_unavailable {
+            if let Err(error) = &result {
+                sqlx::query("UPDATE offline_sync_queue SET status = 'pending', last_error = ?,
+                    next_retry_at = DATETIME('now', '+1 minute'), updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+                    .bind(error).bind(id).execute(&pool).await?;
+                continue;
+            }
+        }
         match result {
             Ok(_) => {
                 let mut tx = pool.begin().await?;
@@ -3476,6 +3618,180 @@ async fn load_account_imap_settings(
             .flatten()
             .unwrap_or_default(),
     }))
+}
+
+/// Process durable queues for all unlocked accounts, independent of the selected window.
+pub(crate) async fn run_mail_workers(state: Arc<MailAppState>) {
+    use std::collections::{HashMap, HashSet};
+    let mut workers: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        let accounts = match state._db.ready_or_none().await {
+            Some(db) => sqlx::query_scalar::<_, i64>("SELECT account_id FROM accounts")
+                .fetch_all(&db.general_pool).await,
+            None => Ok(Vec::new()),
+        };
+        let Ok(accounts) = accounts else { continue };
+        let active: HashSet<_> = accounts.into_iter().collect();
+        workers.retain(|id, worker| {
+            if !active.contains(id) {
+                worker.abort();
+                return false;
+            }
+            !worker.is_finished()
+        });
+        for id in active {
+            workers.entry(id).or_insert_with(|| tokio::spawn(run_account_worker(state.clone(), id)));
+        }
+    }
+}
+
+async fn run_account_worker(state: Arc<MailAppState>, account_id: i64) {
+    use std::{collections::{HashMap, HashSet}, time::Duration};
+    let mut watchers = tokio::task::JoinSet::new();
+    let mut active_watches = HashSet::new();
+    let mut folders = Vec::new();
+    let mut poll_cursor = 0;
+    let mut watch_cursor = 0;
+    let mut watch_attempts = HashMap::new();
+    let mut cycle = 0u32;
+    let mut last_refresh = HashMap::new();
+    let mut timer = tokio::time::interval(Duration::from_secs(10));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        while let Some(finished) = watchers.try_join_next() {
+            if let Ok(mailbox) = finished {
+                active_watches.remove(&mailbox);
+            }
+        }
+        let Ok(pool) = db::get_user_db_pool(&state._db, account_id).await else { continue };
+        let sync_lock = state.account_sync_lock(account_id).await;
+        let Ok(_guard) = sync_lock.try_lock() else { continue };
+        let due: (bool, bool) = sqlx::query_as(
+            "SELECT COALESCE(MAX(action_type = 'send'), 0), COALESCE(MAX(action_type != 'send'), 0)
+             FROM offline_sync_queue WHERE status = 'processing' OR
+              (status IN ('pending', 'failed') AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP))",
+        ).fetch_one(&pool).await.unwrap_or_default();
+        if due.0 {
+            let result = process_queue_once(&state, account_id, 50, false).await;
+            set_transfer_sending(&state._db, account_id, None).await;
+            if let Err(error) = result {
+                tracing::warn!(account_id, %error, "Background send queue failed");
+            }
+        }
+        let discover = cycle % 12 == 0;
+        cycle = cycle.wrapping_add(1);
+        if (due.1 || discover || !folders.is_empty())
+            && ensure_imap_connected(&state._db, &state.imap, account_id).await.is_ok()
+        {
+            if due.1 {
+                let result = process_queue_once(&state, account_id, 100, true).await;
+                set_transfer_sending(&state._db, account_id, None).await;
+                if let Err(error) = result {
+                    tracing::warn!(account_id, %error, "Background IMAP queue failed");
+                }
+            }
+            if discover {
+                let imap = state.imap.clone();
+                if let Ok(entries) = tokio::task::spawn_blocking(move ||
+                    imap_session::list_mailboxes_detailed(&imap, account_id)).await
+                {
+                    let mut next: Vec<_> = entries.into_iter().filter(|entry| entry.selectable)
+                        .map(|entry| crate::mail_models::mailbox_identity(&entry.name).to_owned()).collect();
+                    next.sort_by_key(|mailbox| (mailbox != "INBOX", mailbox.clone()));
+                    next.dedup();
+                    if !next.is_empty() && folders != next {
+                        watchers.abort_all();
+                        while watchers.join_next().await.is_some() {}
+                        active_watches.clear();
+                        folders = next;
+                        poll_cursor = 0;
+                        watch_cursor = 0;
+                        watch_attempts.clear();
+                    }
+                }
+            }
+            // Keep a connection for INBOX and rotate the remaining slots on
+            // servers with many folders. The command session is separate.
+            const IDLE_SLOTS: usize = 8;
+            let has_inbox = folders.first().is_some_and(|mailbox| mailbox == "INBOX");
+            let other_folders = &folders[usize::from(has_inbox)..];
+            let rotate = folders.len() > IDLE_SLOTS;
+            let active_count = watchers.len();
+            let mut start_watch = |mailbox: &String| {
+                if !active_watches.contains(mailbox)
+                    && watch_attempts.get(mailbox).map_or(true, |attempt: &std::time::Instant| attempt.elapsed() >= Duration::from_secs(120))
+                {
+                    active_watches.insert(mailbox.clone());
+                    watch_attempts.insert(mailbox.clone(), std::time::Instant::now());
+                    let (state, mailbox) = (state.clone(), mailbox.clone());
+                    let rotate_mailbox = rotate && mailbox != "INBOX";
+                    watchers.spawn(async move {
+                        watch_mailbox(&state, account_id, &mailbox, rotate_mailbox).await;
+                        mailbox
+                    });
+                    true
+                } else {
+                    false
+                }
+            };
+            let mut free_slots = IDLE_SLOTS.saturating_sub(active_count);
+            if has_inbox && free_slots > 0 && start_watch(&folders[0]) {
+                free_slots = free_slots.saturating_sub(1);
+            }
+            for _ in 0..other_folders.len() {
+                if free_slots == 0 { break; }
+                let mailbox = &other_folders[watch_cursor % other_folders.len()];
+                watch_cursor = watch_cursor.wrapping_add(1);
+                if start_watch(mailbox) { free_slots -= 1; }
+            }
+            // Poll even when a provider disables IDLE or limits connections.
+            if !folders.is_empty() {
+                let mailbox = &folders[poll_cursor % folders.len()];
+                poll_cursor = poll_cursor.wrapping_add(1);
+                if last_refresh.get(mailbox).map_or(true, |last: &std::time::Instant| last.elapsed() >= Duration::from_secs(120)) {
+                    if let Err(error) = refresh_mailbox(&state, account_id, mailbox, 250, false).await {
+                        tracing::debug!(account_id, %mailbox, %error, "Background mailbox poll failed");
+                    }
+                    last_refresh.insert(mailbox.clone(), std::time::Instant::now());
+                }
+            }
+        }
+    }
+}
+
+async fn watch_mailbox(state: &Arc<MailAppState>, account_id: i64, mailbox: &str, rotate: bool) {
+    // IDLE owns the socket while waiting. Keep it off the command connection.
+    let watcher = Arc::new(ImapState::new());
+    if ensure_imap_connected(&state._db, &watcher, account_id).await.is_err() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while !rotate || started.elapsed() < std::time::Duration::from_secs(90) {
+        let result = tokio::task::spawn_blocking({
+            let watcher = watcher.clone();
+            let mailbox = mailbox.to_owned();
+            move || imap_session::wait_for_mailbox_change(&watcher, account_id, &mailbox)
+        }).await;
+        match result {
+            Ok(Ok(Some(false))) => (),
+            Ok(Ok(Some(true))) => {
+                let lock = state.account_sync_lock(account_id).await;
+                let _guard = lock.lock().await;
+                if ensure_imap_connected(&state._db, &state.imap, account_id).await.is_err()
+                    || refresh_mailbox(state, account_id, mailbox, 250, true).await.is_err()
+                {
+                    break;
+                }
+                // Yield when a server immediately delivers repeated unsolicited responses.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            _ => break,
+        }
+    }
 }
 
 async fn ensure_imap_connected(
@@ -3979,6 +4295,16 @@ async fn apply_local_action_side_effects(
             sqlx::query(
                 "UPDATE local_mail_cache SET seen = 0, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
             )
+            .bind(uid)
+            .bind(folder)
+            .execute(&mut *db)
+            .await?;
+        }
+        "star" | "unstar" => {
+            sqlx::query(
+                "UPDATE local_mail_cache SET flagged = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ? AND folder = ?",
+            )
+            .bind(action_type == "star")
             .bind(uid)
             .bind(folder)
             .execute(&mut *db)
@@ -4558,8 +4884,14 @@ pub(crate) async fn cache_mail_preview(
             sender_address = excluded.sender_address,
             recipient_to = excluded.recipient_to,
             subject = excluded.subject,
-            seen = excluded.seen,
-            flagged = excluded.flagged,
+            seen = CASE WHEN EXISTS (SELECT 1 FROM offline_sync_queue q
+                WHERE q.target_uid = excluded.uid AND q.target_folder = excluded.folder
+                AND q.uid_validity = excluded.uid_validity AND q.status IN ('pending', 'processing', 'failed')
+                AND q.action_type IN ('mark_read', 'mark_unread')) THEN local_mail_cache.seen ELSE excluded.seen END,
+            flagged = CASE WHEN EXISTS (SELECT 1 FROM offline_sync_queue q
+                WHERE q.target_uid = excluded.uid AND q.target_folder = excluded.folder
+                AND q.uid_validity = excluded.uid_validity AND q.status IN ('pending', 'processing', 'failed')
+                AND q.action_type IN ('star', 'unstar')) THEN local_mail_cache.flagged ELSE excluded.flagged END,
             date_value = excluded.date_value,
             date_ms = excluded.date_ms,
             size_bytes = excluded.size_bytes,
@@ -4909,6 +5241,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn due_sends_run_for_an_account_without_an_active_imap_session() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = std::env::temp_dir().join(format!("guvercin-worker-{}", rand::random::<u64>()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        tokio::fs::create_dir(&directory).await.unwrap();
+        tokio::fs::write(directory.join("security_settings.json"), r#"{"data_encrypted":false}"#).await.unwrap();
+        let database = Arc::new(AppState::initialize(Some(directory)).await.unwrap());
+        let general = database.require_general_pool().await.unwrap();
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        sqlx::query("INSERT INTO accounts (account_id, email_address, smtp_host, smtp_port, auth_token, ssl_mode)
+                     VALUES (17, 'sender@example.test', '127.0.0.1', ?, 'test-secret', 'NONE')")
+            .bind(port).execute(&general).await.unwrap();
+        let state = Arc::new(MailAppState { _db: database.clone(), imap: Arc::new(ImapState::new()), sync_locks: Default::default() });
+        let account_pool = db::get_user_db_pool(&database, 17).await.unwrap();
+
+        for (subject, due) in [("Send this", "2000-01-01T00:00:00Z"), ("Keep queued", "2099-01-01T00:00:00Z")] {
+            let request = serde_json::from_value(json!({
+                "action_type": "send",
+                "payload": { "to": ["recipient@example.test"], "subject": subject, "body_text": "Message", "scheduled_send_at": due },
+            })).unwrap();
+            let _ = post_offline_action(State(state.clone()), Path(17), Json(request)).await.unwrap();
+        }
+
+        let fixture = tokio::spawn(async move {
+            let (session, _) = socket.accept().await.unwrap();
+            let (reader, mut writer) = session.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            writer.write_all(b"220 localhost SMTP\r\n").await.unwrap();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let response = match line.split_whitespace().next().unwrap_or_default() {
+                    "EHLO" => "250-localhost\r\n250 AUTH PLAIN\r\n",
+                    "AUTH" => "235 authenticated\r\n",
+                    "MAIL" | "RCPT" => "250 OK\r\n",
+                    "DATA" => {
+                        writer.write_all(b"354 Continue\r\n").await.unwrap();
+                        let mut subject = String::new();
+                        while let Some(line) = lines.next_line().await.unwrap() {
+                            if line == "." { break; }
+                            if line.starts_with("Subject: ") { subject = line; }
+                        }
+                        writer.write_all(b"250 Message accepted\r\n").await.unwrap();
+                        return subject;
+                    }
+                    _ => panic!("unexpected SMTP command"),
+                };
+                writer.write_all(response.as_bytes()).await.unwrap();
+            }
+            panic!("SMTP session finished before delivery");
+        });
+        let worker = tokio::spawn(run_mail_workers(state.clone()));
+        let subject = tokio::time::timeout(std::time::Duration::from_secs(5), fixture).await.unwrap().unwrap();
+        assert_eq!(subject, "Subject: Send this");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM offline_sync_queue ORDER BY id")
+                    .fetch_all(&account_pool).await.unwrap();
+                if statuses == ["done", "pending"] { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("worker must confirm the due send and leave the future send pending");
+        worker.abort();
+    }
+
     #[test]
     fn align_previews_uses_uid_match_when_available() {
         let chunk = vec![101, 102, 103];
@@ -4935,6 +5337,31 @@ mod tests {
         max_uid = bump_max_uid_synced(max_uid, 150);
 
         assert_eq!(max_uid, 150);
+    }
+
+    #[tokio::test]
+    async fn bulk_forward_queues_every_distinct_source_in_one_batch() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE offline_sync_queue (
+            id INTEGER PRIMARY KEY, action_type TEXT, target_uid TEXT,
+            target_folder TEXT, payload_json TEXT, uid_validity INTEGER
+        )").execute(&pool).await.unwrap();
+
+        let mut payload = json!({
+            "to": ["recipient@example.com"],
+            "targets": [
+                { "uid": "42", "mailbox": "INBOX", "uid_validity": 5 },
+                { "uid": "42", "mailbox": "Archive", "uid_validity": 9 }
+            ]
+        });
+        let response = queue_bulk_forward(&pool, payload.clone()).await.unwrap();
+        assert_eq!(response.queued_id, 2);
+        payload["targets"][1] = payload["targets"][0].clone();
+        assert!(queue_bulk_forward(&pool, payload).await.is_err());
+        let sources: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT target_folder, uid_validity FROM offline_sync_queue ORDER BY id"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(sources, vec![("INBOX".into(), 5), ("Archive".into(), 9)]);
     }
 
     #[test]

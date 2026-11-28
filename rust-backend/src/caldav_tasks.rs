@@ -288,6 +288,8 @@ pub async fn sync_caldav_tasks(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "tasks").await;
+    let _guard = lock.lock().await;
     let Some(cfg) = caldav_sync::load_config(&state, account_id).await? else {
         return Err(AppError::BadRequest(
             "CalDAV is not configured for this account.".into(),
@@ -457,8 +459,8 @@ mod tests {
             completed: false,
             starred: true,
             subtasks: vec![
-                todo::Subtask { title: "semi; comma,".into(), done: true },
-                todo::Subtask { title: "second".into(), done: false },
+                todo::Subtask { title: "semi; comma,".into(), done: true, ..Default::default() },
+                todo::Subtask { title: "second".into(), done: false, ..Default::default() },
             ],
         }
     }

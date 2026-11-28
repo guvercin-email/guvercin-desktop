@@ -23,12 +23,16 @@ use crate::{db, db::AppState, error::AppError};
 
 const DAY_MS: i64 = 86_400_000;
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
 pub struct Subtask {
     #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub done: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Subtask>,
+    #[serde(default, rename = "googleId", skip_serializing_if = "Option::is_none")]
+    pub google_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -94,6 +98,7 @@ impl TaskCard {
 #[derive(Serialize)]
 pub struct TaskRecord {
     pub id: i64,
+    pub position: i64,
     pub card: TaskCard,
     #[serde(rename = "createdAt")]
     pub created_at: Option<String>,
@@ -146,6 +151,7 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> TaskRecord {
     }
     TaskRecord {
         id,
+        position: row.try_get("position").unwrap_or_default(),
         card,
         created_at: row.try_get("created_at").ok().flatten(),
         updated_at: row.try_get("updated_at").ok().flatten(),
@@ -388,6 +394,39 @@ pub struct ListQuery {
     pub starred: Option<bool>,
     #[serde(default)]
     pub search: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ReorderTask {
+    source: i64,
+    before: i64,
+}
+
+pub async fn reorder_task(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, list_id)): Path<(i64, i64)>,
+    Json(order): Json<ReorderTask>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pool = db::get_user_db_pool(&state, account_id).await?;
+    let mut tx = pool.begin().await?;
+    let mut ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT task_id FROM tasks WHERE list_id = ? AND deleted = 0 AND completed = 0
+         ORDER BY position, task_id",
+    ).bind(list_id).fetch_all(&mut *tx).await?;
+    if !ids.contains(&order.source) || !ids.contains(&order.before) || order.source == order.before {
+        return Err(AppError::BadRequest("Select two open tasks in the same list.".into()));
+    }
+    ids.retain(|id| *id != order.source);
+    let target = ids.iter().position(|id| *id == order.before).unwrap_or(ids.len());
+    ids.insert(target, order.source);
+    for (position, id) in ids.into_iter().enumerate() {
+        sqlx::query("UPDATE tasks SET position = ? WHERE task_id = ?")
+            .bind(position as i64)
+            .bind(id)
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn list_tasks(

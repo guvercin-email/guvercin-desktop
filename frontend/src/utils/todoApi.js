@@ -73,6 +73,15 @@ export async function createTask(accountId, card) {
   return jsonOrThrow(res)
 }
 
+export async function reorderTask(accountId, listId, source, before) {
+  const response = await fetch(apiUrl(`/api/tasks/${accountId}/lists/${listId}/reorder`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, before }),
+  })
+  return jsonOrThrow(response)
+}
+
 export async function updateTask(accountId, id, card) {
   const res = await fetch(apiUrl(`/api/tasks/${accountId}/${id}`), {
     method: 'PUT',

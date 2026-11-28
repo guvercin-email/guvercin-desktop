@@ -80,7 +80,7 @@ impl Default for Recurrence {
 }
 
 impl Recurrence {
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         matches!(
             self.freq.as_str(),
             "daily" | "weekly" | "monthly" | "yearly"
@@ -89,6 +89,13 @@ impl Recurrence {
     fn step(&self) -> i64 {
         self.interval.max(1)
     }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct ZoneObservance {
+    onset: String,
+    from: i32,
+    to: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -105,6 +112,16 @@ pub struct EventCard {
     pub description: String,
     #[serde(default, rename = "allDay")]
     pub all_day: bool,
+    #[serde(default, rename = "timeZone")]
+    pub time_zone: String,
+    #[serde(default, rename = "endTimeZone")]
+    pub end_time_zone: String,
+    #[serde(default, rename = "zoneObservances", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) zone_observances: std::collections::BTreeMap<String, Vec<ZoneObservance>>,
+    #[serde(skip)]
+    pub(crate) recurrence_id: Option<i64>,
+    #[serde(skip)]
+    pub(crate) exclusions: Vec<i64>,
     /// ISO local start: "YYYY-MM-DDTHH:MM" (timed) or "YYYY-MM-DD" (all-day).
     #[serde(default)]
     pub start: String,
@@ -137,6 +154,11 @@ impl Default for EventCard {
             location: String::new(),
             description: String::new(),
             all_day: false,
+            time_zone: String::new(),
+            end_time_zone: String::new(),
+            zone_observances: std::collections::BTreeMap::new(),
+            recurrence_id: None,
+            exclusions: Vec::new(),
             start: String::new(),
             end: String::new(),
             color: String::new(),
@@ -183,6 +205,8 @@ pub struct CalendarSummary {
     pub is_visible: bool,
     #[serde(rename = "isDefault")]
     pub is_default: bool,
+    #[serde(rename = "googleCalendar")]
+    pub google_calendar: bool,
     pub count: i64,
 }
 
@@ -590,7 +614,9 @@ pub async fn list_events(
     // Overlap for one-off events, or a live recurrence that could reach the window.
     sql.push_str(
         "((recurs = 0 AND start_ms < ? AND end_ms > ?) \
-          OR (recurs = 1 AND start_ms < ? AND (recur_until_ms IS NULL OR recur_until_ms >= ?)))",
+          OR (recurs = 1 AND start_ms < ? AND (recur_until_ms IS NULL OR recur_until_ms >= ?))
+          OR (recurs = 1 AND EXISTS (SELECT 1 FROM calendar_occurrence_moves AS moved
+              WHERE moved.event_id = events.event_id AND moved.start_ms < ? AND moved.end_ms > ?)))",
     );
     if !cal_ids.is_empty() {
         let placeholders = cal_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -603,7 +629,7 @@ pub async fn list_events(
     }
     sql.push_str(" ORDER BY start_ms ASC");
 
-    let mut query = sqlx::query(&sql).bind(to).bind(from).bind(to).bind(from);
+    let mut query = sqlx::query(&sql).bind(to).bind(from).bind(to).bind(from).bind(to).bind(from);
     for id in &cal_ids {
         query = query.bind(id);
     }
@@ -615,6 +641,25 @@ pub async fn list_events(
     let rows = query.fetch_all(&pool).await?;
     let cals = calendar_lookup(&pool).await;
 
+    #[derive(sqlx::FromRow)]
+    struct OccurrenceOverride {
+        event_id: i64,
+        occurrence_start: i64,
+        start_ms: i64,
+        end_ms: i64,
+        override_json: Option<String>,
+        is_deleted: bool,
+    }
+    let moves: Vec<OccurrenceOverride> = sqlx::query_as(
+        "SELECT event_id, occurrence_start, start_ms, end_ms, override_json, is_deleted
+         FROM calendar_occurrence_moves
+         WHERE (start_ms < ? AND end_ms > ?) OR occurrence_start < ?",
+    ).bind(to).bind(from).bind(to).fetch_all(&pool).await?;
+    let mut moves_by_event = std::collections::HashMap::<i64, Vec<OccurrenceOverride>>::new();
+    for entry in moves {
+        moves_by_event.entry(entry.event_id).or_default().push(entry);
+    }
+
     let mut out: Vec<EventInstance> = Vec::new();
     for row in &rows {
         let (id, card) = row_to_card(row);
@@ -623,15 +668,32 @@ pub async fn list_events(
             .and_then(|cid| cals.get(&cid).cloned())
             .unwrap_or_else(|| (String::new(), "#246bce".to_string()));
         let is_recurring = card.recurrence.is_active();
-        for (occ_start, occ_end) in expand_occurrences(&card, from, to) {
-            let mut inst_card = card.clone();
-            if card.all_day {
+        let moved = moves_by_event.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let mut occurrences: Vec<_> = expand_occurrences(&card, from, to).into_iter()
+            .filter(|(start, _)| !is_recurring || !moved.iter().any(|entry| entry.occurrence_start == *start))
+            .map(|(start, end)| (start, start, end, None)).collect();
+        if is_recurring {
+            occurrences.extend(moved.iter().filter(|entry| {
+                !entry.is_deleted && entry.start_ms < to && entry.end_ms > from
+                    && occurrence_exists(&card, entry.occurrence_start)
+            }).map(|entry| (entry.occurrence_start, entry.start_ms, entry.end_ms, entry.override_json.as_deref())));
+        }
+        for (original, occ_start, occ_end, override_json) in occurrences {
+            let mut inst_card = override_json.and_then(|value| serde_json::from_str::<EventCard>(value).ok())
+                .unwrap_or_else(|| card.clone());
+            inst_card.calendar_id = card.calendar_id;
+            inst_card.zone_observances.clear();
+            if inst_card.all_day {
                 inst_card.start = iso_date(occ_start);
                 // stored end is inclusive last day → subtract the exclusive day
                 inst_card.end = iso_date((occ_end - 1).max(occ_start));
             } else {
-                inst_card.start = iso_datetime(occ_start);
-                inst_card.end = iso_datetime(occ_end);
+                if (is_recurring && override_json.is_none()) || parse_iso_ms(&inst_card.start).is_none() {
+                    inst_card.start = iso_datetime(occ_start);
+                }
+                if (is_recurring && override_json.is_none()) || parse_iso_ms(&inst_card.end).is_none() {
+                    inst_card.end = iso_datetime(occ_end);
+                }
             }
             out.push(EventInstance {
                 id,
@@ -642,7 +704,7 @@ pub async fn list_events(
                 start_ms: occ_start,
                 end_ms: occ_end,
                 is_recurring,
-                instance_key: format!("{id}@{occ_start}"),
+                instance_key: format!("{id}@{original}"),
             });
         }
     }
@@ -724,6 +786,170 @@ pub async fn update_event(
     card.calendar_id = Some(resolve_calendar_id(&pool, card.calendar_id).await?);
     upsert_event(&pool, Some(event_id), &card).await?;
     load_instance(&pool, event_id).await
+}
+
+#[derive(Clone, sqlx::FromRow)]
+pub(crate) struct OccurrenceChange {
+    pub occurrence_start: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub override_json: Option<String>,
+    pub is_deleted: bool,
+    pub revision: i64,
+}
+
+impl OccurrenceChange {
+    pub(crate) fn from_remote(master: &EventCard, original: i64, card: Option<EventCard>) -> Option<Self> {
+        if !master.recurrence.is_active() || !occurrence_exists(master, original) {
+            return None;
+        }
+        let (start_ms, end_ms, override_json, is_deleted) = match card {
+            Some(mut card) => {
+                card.uid = master.uid.clone();
+                card.calendar_id = master.calendar_id;
+                card.recurrence = Recurrence::default();
+                let (start, end) = compute_bounds(&card);
+                (start, end, Some(serde_json::to_string(&card).ok()?), false)
+            }
+            None => (original, original, None, true),
+        };
+        Some(Self { occurrence_start: original, start_ms, end_ms, override_json, is_deleted, revision: 0 })
+    }
+
+    pub(crate) fn card(&self, master: &EventCard) -> EventCard {
+        let mut card: EventCard = self.override_json.as_deref().and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| master.clone());
+        card.uid = master.uid.clone();
+        card.recurrence = Recurrence::default();
+        if self.override_json.is_none() {
+            card.start = if card.all_day { iso_date(self.start_ms) } else { iso_datetime(self.start_ms) };
+            card.end = if card.all_day { iso_date(self.end_ms - 1) } else { iso_datetime(self.end_ms) };
+        }
+        card
+    }
+}
+
+pub(crate) async fn occurrence_changes(pool: &SqlitePool, event_id: i64, master: &EventCard) -> Result<Vec<OccurrenceChange>, AppError> {
+    let mut rows: Vec<OccurrenceChange> = sqlx::query_as(
+        "SELECT occurrence_start, start_ms, end_ms, override_json, is_deleted, revision
+         FROM calendar_occurrence_moves WHERE event_id = ? ORDER BY occurrence_start",
+    ).bind(event_id).fetch_all(pool).await?;
+    rows.retain(|change| master.recurrence.is_active() && occurrence_exists(master, change.occurrence_start));
+    Ok(rows)
+}
+
+pub(crate) async fn receive_occurrences(
+    pool: &SqlitePool, event_id: i64, changes: &[OccurrenceChange], replace: bool,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    if replace {
+        sqlx::query("DELETE FROM calendar_occurrence_moves WHERE event_id = ? AND revision = 0")
+            .bind(event_id).execute(&mut *tx).await?;
+    }
+    for change in changes {
+        sqlx::query(
+            "INSERT INTO calendar_occurrence_moves (event_id, occurrence_start, start_ms, end_ms, override_json, is_deleted, revision)
+             VALUES (?, ?, ?, ?, ?, ?, 0) ON CONFLICT(event_id, occurrence_start)
+             DO UPDATE SET start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                           override_json = excluded.override_json, is_deleted = excluded.is_deleted
+             WHERE calendar_occurrence_moves.revision = 0",
+        ).bind(event_id).bind(change.occurrence_start).bind(change.start_ms).bind(change.end_ms)
+            .bind(&change.override_json).bind(change.is_deleted).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn mark_occurrence_pushed(pool: &SqlitePool, event_id: i64, change: &OccurrenceChange) -> Result<(), AppError> {
+    sqlx::query("UPDATE calendar_occurrence_moves SET revision = 0 WHERE event_id = ? AND occurrence_start = ? AND revision = ?")
+        .bind(event_id).bind(change.occurrence_start).bind(change.revision).execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) fn occurrence_key(value: &str) -> Option<i64> {
+    parse_iso_ms(value)
+}
+
+fn occurrence_exists(card: &EventCard, original: i64) -> bool {
+    expand_occurrences(card, original, original.saturating_add(1))
+        .iter().any(|(start, _)| *start == original)
+}
+
+#[derive(Deserialize)]
+pub struct MoveOccurrence {
+    original: i64,
+    start: String,
+    end: String,
+}
+
+pub async fn move_occurrence(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, event_id)): Path<(i64, i64)>,
+    Json(change): Json<MoveOccurrence>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pool = db::get_user_db_pool(&state, account_id).await?;
+    let mut card = fetch_card(&pool, event_id).await?
+        .map(|(_, card)| card)
+        .ok_or_else(|| AppError::BadRequest("Event not found".into()))?;
+    if !card.recurrence.is_active() || !occurrence_exists(&card, change.original) {
+        return Err(AppError::BadRequest("The event occurrence is no longer available.".into()));
+    }
+    if parse_iso_ms(&change.start).is_none() || parse_iso_ms(&change.end).is_none() {
+        return Err(AppError::BadRequest("Invalid occurrence dates.".into()));
+    }
+    card.start = change.start;
+    card.end = change.end;
+    let (start, end) = compute_bounds(&card);
+    sqlx::query(
+        "INSERT INTO calendar_occurrence_moves (event_id, occurrence_start, start_ms, end_ms)
+         VALUES (?, ?, ?, ?) ON CONFLICT(event_id, occurrence_start)
+         DO UPDATE SET start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                       revision = calendar_occurrence_moves.revision + 1
+         WHERE calendar_occurrence_moves.is_deleted = 0",
+    ).bind(event_id).bind(change.original).bind(start).bind(end).execute(&pool).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeOccurrence {
+    original: i64,
+    card: Option<EventCard>,
+}
+
+pub async fn change_occurrence(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, event_id)): Path<(i64, i64)>,
+    Json(change): Json<ChangeOccurrence>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pool = db::get_user_db_pool(&state, account_id).await?;
+    let master = fetch_card(&pool, event_id).await?.map(|(_, card)| card)
+        .ok_or_else(|| AppError::BadRequest("Event not found".into()))?;
+    if !master.recurrence.is_active() || !occurrence_exists(&master, change.original) {
+        return Err(AppError::BadRequest("The event occurrence is no longer available.".into()));
+    }
+    let (start, end, json, deleted) = match change.card {
+        Some(mut card) => {
+            if parse_iso_ms(&card.start).is_none() || parse_iso_ms(&card.end).is_none() {
+                return Err(AppError::BadRequest("Invalid occurrence dates.".into()));
+            }
+            card.calendar_id = master.calendar_id;
+            card.uid = master.uid;
+            card.recurrence = Recurrence::default();
+            let (start, end) = compute_bounds(&card);
+            let json = serde_json::to_string(&card).map_err(|error| AppError::BadRequest(error.to_string()))?;
+            (start, end, Some(json), false)
+        }
+        None => (change.original, change.original, None, true),
+    };
+    sqlx::query(
+        "INSERT INTO calendar_occurrence_moves (event_id, occurrence_start, start_ms, end_ms, override_json, is_deleted)
+         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(event_id, occurrence_start)
+         DO UPDATE SET start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                       override_json = excluded.override_json, is_deleted = excluded.is_deleted,
+                       revision = calendar_occurrence_moves.revision + 1",
+    ).bind(event_id).bind(change.original).bind(start).bind(end).bind(json).bind(deleted)
+      .execute(&pool).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn load_instance(pool: &SqlitePool, id: i64) -> Result<Json<EventInstance>, AppError> {
@@ -920,7 +1146,7 @@ pub async fn get_calendars(
 
     let rows = sqlx::query(
         r#"
-        SELECT c.calendar_id, c.name, c.color, c.is_visible, c.is_default,
+        SELECT c.calendar_id, c.name, c.color, c.is_visible, c.is_default, c.remote_id,
                (SELECT COUNT(*) FROM events e WHERE e.calendar_id = c.calendar_id) AS cnt
         FROM calendars c
         ORDER BY c.is_default DESC, c.sort_order ASC, LOWER(c.name) ASC
@@ -940,6 +1166,8 @@ pub async fn get_calendars(
             color: r.try_get("color").unwrap_or_default(),
             is_visible: r.try_get::<i64, _>("is_visible").unwrap_or(1) != 0,
             is_default: r.try_get::<i64, _>("is_default").unwrap_or(0) != 0,
+            google_calendar: r.try_get::<Option<String>, _>("remote_id").ok().flatten()
+                .is_some_and(|id| !id.is_empty() && !id.contains("://")),
             count: cnt,
         });
     }
@@ -981,6 +1209,7 @@ pub async fn create_calendar(
         color,
         is_visible: true,
         is_default: false,
+        google_calendar: false,
         count: 0,
     }))
 }
@@ -1089,7 +1318,7 @@ pub async fn import_events(
     }
     let mut imported = 0i64;
     let mut skipped = 0i64;
-    for mut card in cards {
+    for mut card in cards.iter().filter(|card| card.recurrence_id.is_none()).cloned() {
         if card.start.trim().is_empty() {
             skipped += 1;
             continue;
@@ -1098,7 +1327,12 @@ pub async fn import_events(
             card.uid = new_uid();
         }
         card.calendar_id = Some(target);
-        upsert_event(&pool, None, &card).await?;
+        let id = upsert_event(&pool, None, &card).await?;
+        receive_occurrences(&pool, id, &ics_occurrences(&card, &cards), false).await?;
+        if card.recurrence.is_active() {
+            sqlx::query("UPDATE calendar_occurrence_moves SET revision = 1 WHERE event_id = ?")
+                .bind(id).execute(&pool).await?;
+        }
         imported += 1;
     }
     Ok(Json(json!({ "imported": imported, "skipped": skipped })))
@@ -1142,8 +1376,15 @@ pub async fn export_events(
     sql.push_str(" ORDER BY start_ms ASC");
 
     let rows = sqlx::query(&sql).fetch_all(&pool).await?;
-    let cards: Vec<EventCard> = rows.iter().map(|r| row_to_card(r).1).collect();
-    let ics = build_ics(&cards);
+    let mut ics = ics_header();
+    let mut zones = std::collections::HashSet::new();
+    for row in &rows {
+        let (id, card) = row_to_card(row);
+        let changes = occurrence_changes(&pool, id, &card).await?;
+        push_series_zones(&mut ics, &card, &changes, &mut zones);
+        push_series(&mut ics, &card, &changes);
+    }
+    ics.push_str("END:VCALENDAR\r\n");
 
     let mut resp = Response::new(ics.into());
     resp.headers_mut()
@@ -1157,27 +1398,224 @@ pub async fn export_events(
 
 // ── ICS writing ──
 
-pub fn build_ics(cards: &[EventCard]) -> String {
-    let mut out = String::new();
-    out.push_str("BEGIN:VCALENDAR\r\n");
-    out.push_str("VERSION:2.0\r\n");
-    out.push_str("PRODID:-//guvercin//Calendar//EN\r\n");
-    out.push_str("CALSCALE:GREGORIAN\r\n");
+fn ics_header() -> String {
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//guvercin//Calendar//EN\r\nCALSCALE:GREGORIAN\r\n".into()
+}
+
+pub(crate) fn build_ics_series(card: &EventCard, changes: &[OccurrenceChange]) -> String {
+    let mut out = ics_header();
+    push_series_zones(&mut out, card, changes, &mut std::collections::HashSet::new());
+    push_series(&mut out, card, changes);
+    out.push_str("END:VCALENDAR\r\n");
+    out
+}
+
+/// Apply instance changes to the server's original resource so organizer
+/// data, custom properties, timezone definitions, and other exceptions survive.
+pub(crate) fn patch_ics_occurrences(
+    source: &str, master: &EventCard, changes: &[OccurrenceChange],
+) -> Option<String> {
+    let edits: std::collections::BTreeMap<_, _> = changes.iter()
+        .filter(|change| change.revision != 0).map(|change| (change.occurrence_start, change)).collect();
+    let lines = ics_unfold(source);
+    let mut zones: std::collections::HashSet<_> = lines.iter().filter_map(|line| {
+        let prop = parse_prop(line)?;
+        (prop.name == "TZID").then_some(prop.value)
+    }).collect();
+    let original_property = |property: &str, original: i64| {
+        if master.all_day {
+            format!("{property};VALUE=DATE:{}", ics_date(original))
+        } else {
+            time_property(property, original, &master.time_zone)
+        }
+    };
+    let key = |value: &str| parse_ics_datetime(value, master.all_day).and_then(|(iso, _)| parse_iso_ms(&iso));
+    let mut output = String::new();
+    let mut event = Vec::new();
+    let mut keep = Vec::new();
+    let (mut in_event, mut master_found, mut wrote_calendar_end) = (false, false, false);
+    for line in &lines {
+        if line.eq_ignore_ascii_case("BEGIN:VEVENT") {
+            in_event = true;
+            event.clear();
+        }
+        if in_event {
+            event.push(line.as_str());
+            if !line.eq_ignore_ascii_case("END:VEVENT") { continue; }
+            in_event = false;
+            let properties: Vec<_> = event.iter().filter_map(|line| parse_prop(line)).collect();
+            let matches = properties.iter().any(|prop| prop.name == "UID" && unescape_text(&prop.value) == master.uid);
+            let recurrence_id = properties.iter().find(|prop| prop.name == "RECURRENCE-ID");
+            if matches && recurrence_id.is_some_and(|prop| key(&prop.value).is_some_and(|id| edits.contains_key(&id))) {
+                continue;
+            }
+            if matches && recurrence_id.is_none() {
+                master_found = true;
+                for line in &event {
+                    match parse_prop(line).as_ref().map(|prop| prop.name.as_str()) {
+                        Some("EXDATE") => {
+                            let prop = parse_prop(line)?;
+                            let values = prop.value.split(',').filter(|value| !key(value).is_some_and(|id| edits.contains_key(&id)))
+                                .collect::<Vec<_>>();
+                            if !values.is_empty() {
+                                let head = line.split_once(':')?.0;
+                                fold_line(&mut output, &format!("{head}:{}", values.join(",")));
+                            }
+                        }
+                        Some("ORGANIZER" | "SEQUENCE") => {
+                            keep.push((*line).to_owned());
+                            fold_line(&mut output, line);
+                        }
+                        _ => {
+                            if line.eq_ignore_ascii_case("END:VEVENT") {
+                                for change in edits.values().filter(|change| change.is_deleted) {
+                                    fold_line(&mut output, &original_property("EXDATE", change.occurrence_start));
+                                }
+                            }
+                            fold_line(&mut output, line);
+                        }
+                    }
+                }
+            } else {
+                for line in &event { fold_line(&mut output, line); }
+            }
+            continue;
+        }
+        if line.eq_ignore_ascii_case("END:VCALENDAR") {
+            for change in edits.values().filter(|change| !change.is_deleted) {
+                let card = change.card(master);
+                push_zones(&mut output, &card, &mut zones);
+                let mut extra = vec![original_property("RECURRENCE-ID", change.occurrence_start)];
+                extra.extend(keep.iter().cloned());
+                push_vevent(&mut output, &card, &extra);
+            }
+            wrote_calendar_end = true;
+        }
+        fold_line(&mut output, line);
+    }
+    (master_found && wrote_calendar_end).then_some(output)
+}
+
+fn push_series_zones(
+    out: &mut String, master: &EventCard, changes: &[OccurrenceChange],
+    written: &mut std::collections::HashSet<String>,
+) {
+    push_zones(out, master, written);
+    for change in changes.iter().filter(|change| !change.is_deleted && change.override_json.is_some()) {
+        push_zones(out, &change.card(master), written);
+    }
+}
+
+fn push_zones(out: &mut String, card: &EventCard, written: &mut std::collections::HashSet<String>) {
+    if card.all_day { return; }
+    for zone in [&card.time_zone, &card.end_time_zone] {
+        if zone == "UTC" || !valid_zone_id(zone) || written.contains(zone) { continue; }
+        let Some(observances) = card.zone_observances.get(zone) else { continue };
+        let mut lines = Vec::new();
+        for rule in observances.iter().take(128) {
+            let Some(onset) = parse_iso_ms(&rule.onset) else { continue };
+            let (Some(from), Some(to)) = (ical_offset(rule.from), ical_offset(rule.to)) else { continue };
+            let kind = if rule.to > rule.from { "DAYLIGHT" } else { "STANDARD" };
+            lines.extend([format!("BEGIN:{kind}"), format!("DTSTART:{}", ics_datetime(onset)),
+                format!("TZOFFSETFROM:{from}"), format!("TZOFFSETTO:{to}"), format!("END:{kind}")]);
+        }
+        if lines.is_empty() { continue; }
+        written.insert(zone.clone());
+        fold_line(out, "BEGIN:VTIMEZONE");
+        fold_line(out, &format!("TZID:{zone}"));
+        for line in &lines { fold_line(out, line); }
+        fold_line(out, "END:VTIMEZONE");
+    }
+}
+
+fn ical_offset(minutes: i32) -> Option<String> {
+    if !(-1439..=1439).contains(&minutes) { return None; }
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let absolute = minutes.abs();
+    Some(format!("{sign}{:02}{:02}", absolute / 60, absolute % 60))
+}
+
+fn push_series(out: &mut String, master: &EventCard, changes: &[OccurrenceChange]) {
+    let original_property = |property: &str, original: i64| {
+        if master.all_day {
+            format!("{property};VALUE=DATE:{}", ics_date(original))
+        } else {
+            time_property(property, original, &master.time_zone)
+        }
+    };
+    let mut master_extra = Vec::new();
+    for change in changes.iter().filter(|change| change.is_deleted) {
+        master_extra.push(original_property("EXDATE", change.occurrence_start));
+    }
+    push_vevent(out, master, &master_extra);
+    for change in changes.iter().filter(|change| !change.is_deleted) {
+        push_vevent(out, &change.card(master), &[original_property("RECURRENCE-ID", change.occurrence_start)]);
+    }
+}
+
+pub(crate) fn ics_occurrences(master: &EventCard, cards: &[EventCard]) -> Vec<OccurrenceChange> {
+    let mut changes = std::collections::BTreeMap::new();
+    for original in &master.exclusions {
+        if let Some(change) = OccurrenceChange::from_remote(master, *original, None) {
+            changes.insert(*original, change);
+        }
+    }
+    for card in cards.iter().filter(|card| card.uid == master.uid) {
+        if let Some(original) = card.recurrence_id {
+            let override_card = (card.status != "cancelled" && !card.start.is_empty()).then(|| card.clone());
+            if let Some(change) = OccurrenceChange::from_remote(master, original, override_card) {
+                changes.insert(original, change);
+            }
+        }
+    }
+    changes.into_values().collect()
+}
+
+#[cfg(test)]
+fn build_ics(cards: &[EventCard]) -> String {
+    let mut out = ics_header();
     for card in cards {
-        push_vevent(&mut out, card);
+        push_vevent(&mut out, card, &[]);
     }
     out.push_str("END:VCALENDAR\r\n");
     out
 }
 
-fn push_vevent(out: &mut String, card: &EventCard) {
+fn valid_zone_id(zone: &str) -> bool {
+    !zone.is_empty() && zone.len() <= 128 && zone.bytes().all(|byte|
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'+' | b'.'))
+}
+
+fn time_property(property: &str, ms: i64, zone: &str) -> String {
+    let date = ics_datetime(ms);
+    if zone == "UTC" {
+        format!("{property}:{date}Z")
+    } else if valid_zone_id(zone) {
+        format!("{property};TZID={zone}:{date}")
+    } else {
+        format!("{property}:{date}")
+    }
+}
+
+fn prop_time_zone(prop: &IcsProp) -> String {
+    if prop.value.ends_with('Z') {
+        return "UTC".into();
+    }
+    prop.params.iter().find(|(name, _)| name == "TZID").map(|(_, zone)| zone.trim_matches('"'))
+        .filter(|zone| valid_zone_id(zone)).unwrap_or_default().to_owned()
+}
+
+fn push_vevent(out: &mut String, card: &EventCard, extra: &[String]) {
     out.push_str("BEGIN:VEVENT\r\n");
     let uid = if card.uid.trim().is_empty() {
         new_uid()
     } else {
         card.uid.clone()
     };
-    fold_line(out, &format!("UID:{uid}"));
+    fold_line(out, &format!("UID:{}", escape_text(&uid)));
+    for property in extra {
+        fold_line(out, property);
+    }
     fold_line(out, &format!("DTSTAMP:{}", ics_utc_now()));
 
     let (start_ms, end_ms) = compute_bounds(card);
@@ -1186,8 +1624,10 @@ fn push_vevent(out: &mut String, card: &EventCard) {
         // ICS all-day DTEND is exclusive — our end_ms is already exclusive.
         fold_line(out, &format!("DTEND;VALUE=DATE:{}", ics_date(end_ms)));
     } else {
-        fold_line(out, &format!("DTSTART:{}", ics_datetime(start_ms)));
-        fold_line(out, &format!("DTEND:{}", ics_datetime(end_ms)));
+        let end_zone = if card.end_time_zone.is_empty() { &card.time_zone } else { &card.end_time_zone };
+        fold_line(out, &time_property("DTSTART", start_ms, &card.time_zone));
+        let end = if end_zone != &card.time_zone { parse_iso_ms(&card.end).unwrap_or(end_ms) } else { end_ms };
+        fold_line(out, &time_property("DTEND", end, end_zone));
     }
     if !card.title.trim().is_empty() {
         fold_line(out, &format!("SUMMARY:{}", escape_text(&card.title)));
@@ -1234,7 +1674,20 @@ pub fn build_rrule(card: &EventCard) -> Option<String> {
     }
     if !r.until.trim().is_empty() {
         if let Some(ms) = parse_iso_ms(r.until.trim()) {
-            parts.push(format!("UNTIL={}", ics_date(ms)));
+            let end = ms.saturating_add(DAY_MS - 1000);
+            let until = if card.all_day {
+                ics_date(ms)
+            } else if card.time_zone == "UTC" {
+                format!("{}Z", ics_datetime(end))
+            } else if let Some(offset) = card.zone_observances.get(&card.time_zone).and_then(|rules|
+                rules.iter().filter_map(|rule| parse_iso_ms(&rule.onset).map(|onset| (onset, rule.to)))
+                    .filter(|(onset, _)| *onset <= end).max_by_key(|(onset, _)| *onset).map(|(_, offset)| offset))
+            {
+                format!("{}Z", ics_datetime(end.saturating_sub(i64::from(offset) * 60000)))
+            } else {
+                ics_datetime(end)
+            };
+            parts.push(format!("UNTIL={until}"));
         }
     }
     if r.freq == "weekly" && !r.by_weekday.is_empty() {
@@ -1443,8 +1896,56 @@ pub fn parse_rrule(value: &str) -> Recurrence {
     r
 }
 
+fn read_zone_observances(lines: &[String]) -> std::collections::BTreeMap<String, Vec<ZoneObservance>> {
+    fn read_offset(value: &str) -> Option<i32> {
+        let sign = match value.as_bytes().first()? { b'-' => -1, b'+' => 1, _ => return None };
+        let digits = value.get(1..)?;
+        if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+        Some(sign * (digits.get(..2)?.parse::<i32>().ok()? * 60 + digits.get(2..)?.parse::<i32>().ok()?))
+    }
+    let mut zones = std::collections::BTreeMap::new();
+    let mut inside = false;
+    let mut zone = String::new();
+    let mut rules = Vec::new();
+    let (mut onset, mut from, mut to) = (None, None, None);
+    let mut simple = true;
+    for line in lines {
+        let Some(prop) = parse_prop(line) else { continue };
+        match (prop.name.as_str(), prop.value.as_str()) {
+            ("BEGIN", "VTIMEZONE") => {
+                inside = true;
+                simple = true;
+                rules.clear();
+                zone.clear();
+            }
+            ("END", "VTIMEZONE") if inside => {
+                inside = false;
+                if simple && valid_zone_id(&zone) && !rules.is_empty() && zones.len() < 128 {
+                    zones.insert(std::mem::take(&mut zone), std::mem::take(&mut rules));
+                }
+            }
+            ("BEGIN", "STANDARD" | "DAYLIGHT") if inside => {
+                (onset, from, to) = (None, None, None);
+            }
+            ("END", "STANDARD" | "DAYLIGHT") if inside && rules.len() < 128 => {
+                if let (Some(onset), Some(from), Some(to)) = (onset.take(), from, to) {
+                    rules.push(ZoneObservance { onset, from, to });
+                }
+            }
+            ("TZID", value) if inside => zone = value.to_owned(),
+            ("DTSTART", value) if inside => onset = parse_ics_datetime(value, false).map(|(iso, _)| iso),
+            ("TZOFFSETFROM", value) if inside => from = read_offset(value),
+            ("TZOFFSETTO", value) if inside => to = read_offset(value),
+            ("RRULE" | "RDATE", _) if inside => simple = false,
+            _ => (),
+        }
+    }
+    zones
+}
+
 pub fn parse_ics(input: &str) -> Vec<EventCard> {
     let lines = ics_unfold(input);
+    let observances = read_zone_observances(&lines);
     let mut cards: Vec<EventCard> = Vec::new();
     let mut cur: Option<EventCard> = None;
     let mut end_is_date = false;
@@ -1472,6 +1973,11 @@ pub fn parse_ics(input: &str) -> Vec<EventCard> {
                         }
                     }
                 }
+                for zone in [&card.time_zone, &card.end_time_zone] {
+                    if let Some(rules) = observances.get(zone) {
+                        card.zone_observances.insert(zone.clone(), rules.clone());
+                    }
+                }
                 cards.push(card);
             }
             continue;
@@ -1483,13 +1989,14 @@ pub fn parse_ics(input: &str) -> Vec<EventCard> {
             .iter()
             .any(|(k, v)| k == "VALUE" && v.eq_ignore_ascii_case("DATE"));
         match prop.name.as_str() {
-            "UID" => card.uid = prop.value.trim().to_string(),
+            "UID" => card.uid = unescape_text(prop.value.trim()),
             "SUMMARY" => card.title = unescape_text(&prop.value),
             "LOCATION" => card.location = unescape_text(&prop.value),
             "DESCRIPTION" => card.description = unescape_text(&prop.value),
             "DTSTART" => {
                 if let Some((iso, is_date)) = parse_ics_datetime(&prop.value, is_date_param) {
                     card.start = iso;
+                    card.time_zone = prop_time_zone(&prop);
                     if is_date {
                         card.all_day = true;
                     }
@@ -1498,6 +2005,7 @@ pub fn parse_ics(input: &str) -> Vec<EventCard> {
             "DTEND" | "DTEND;VALUE=DATE" => {
                 if let Some((iso, is_date)) = parse_ics_datetime(&prop.value, is_date_param) {
                     card.end = iso;
+                    card.end_time_zone = prop_time_zone(&prop);
                     end_is_date = is_date;
                 }
             }
@@ -1510,6 +2018,15 @@ pub fn parse_ics(input: &str) -> Vec<EventCard> {
                 .to_string();
             }
             "RRULE" => card.recurrence = parse_rrule(&prop.value),
+            "RECURRENCE-ID" => {
+                card.recurrence_id = parse_ics_datetime(&prop.value, is_date_param)
+                    .and_then(|(iso, _)| parse_iso_ms(&iso));
+            }
+            "EXDATE" => {
+                card.exclusions.extend(prop.value.split(',')
+                    .filter_map(|value| parse_ics_datetime(value, is_date_param))
+                    .filter_map(|(iso, _)| parse_iso_ms(&iso)));
+            }
             "ATTENDEE" => {
                 let email = prop
                     .value
@@ -1564,6 +2081,41 @@ mod tests {
             all_day,
             ..EventCard::default()
         }
+    }
+
+    #[test]
+    fn series_ics_round_trips_moved_and_cancelled_occurrences() {
+        let master = EventCard {
+            uid: "agenda-42".into(), start: "2026-11-28T09:00".into(), end: "2026-11-28T10:00".into(),
+            time_zone: "Europe/Istanbul".into(),
+            recurrence: Recurrence { freq: "daily".into(), interval: 1, count: 4, ..Default::default() },
+            ..Default::default()
+        };
+        let original = occurrence_key("2026-11-29T09:00").unwrap();
+        let mut modified = master.clone();
+        modified.start = "2026-11-29T13:00".into();
+        modified.end = "2026-11-29T14:00".into();
+        modified.title = "Moved and edited".into();
+        let change = OccurrenceChange::from_remote(&master, original, Some(modified)).unwrap();
+        let cancelled = OccurrenceChange::from_remote(&master, occurrence_key("2026-11-30T09:00").unwrap(), None).unwrap();
+        let ics = build_ics_series(&master, &[change, cancelled]);
+        assert!(ics.contains("RECURRENCE-ID;TZID=Europe/Istanbul:20261129T090000"));
+        assert!(ics.contains("EXDATE;TZID=Europe/Istanbul:20261130T090000"));
+        let cards = parse_ics(&ics);
+        let changes = ics_occurrences(&cards[0], &cards);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].card(&cards[0]).title, "Moved and edited");
+        assert_eq!(changes[0].card(&cards[0]).start, "2026-11-29T13:00");
+        assert!(changes[1].is_deleted);
+
+        let original = build_ics_series(&master, &[]).replace("UID:agenda-42",
+            "UID:agenda-42\r\nORGANIZER:mailto:owner@example.test\r\nX-MEETING-KEY:example");
+        let edits: Vec<_> = changes.into_iter().map(|mut change| { change.revision = 1; change }).collect();
+        let patched = patch_ics_occurrences(&original, &master, &edits).unwrap();
+        assert!(patched.contains("ORGANIZER:mailto:owner@example.test"));
+        assert!(patched.contains("X-MEETING-KEY:example"));
+        let round_trip = parse_ics(&patched);
+        assert_eq!(ics_occurrences(&round_trip[0], &round_trip).len(), 2);
     }
 
     #[test]

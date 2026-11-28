@@ -14,12 +14,9 @@
 //! matching the contacts path in [`crate::google_sync`]: a local edit wins over a
 //! changed remote, a clean local row takes the remote's copy.
 //!
-//! Local contacts have no "which address book" column — they are one flat list, as
-//! the UI presents them. Pulls therefore span every discovered address book (the
-//! href records where each row came from, so later updates go back to the right
-//! place) and brand-new local contacts are pushed to the first one. Deletions only
-//! ever touch rows whose `remote_id` is a DAV href, so a Google-synced address book
-//! on the same account is never disturbed.
+//! Each contact remembers its address book. Reconciliation only writes to
+//! discovered collections and keeps identical UIDs in different books separate.
+
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -205,6 +202,7 @@ pub async fn carddav_put_config(
 
 struct RemoteCard {
     href: String,
+    address_book: String,
     etag: Option<String>,
     vcf: String,
 }
@@ -217,34 +215,91 @@ async fn fetch_cards(
 ) -> Result<Vec<RemoteCard>, AppError> {
     const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><c:address-data/></d:prop></c:addressbook-query>"#;
     let resp = dav::dav_request(http, cfg, dav::report(), collection.as_str(), Some("1"), Some(dav::XML_CT), &[], Some(BODY.to_string())).await?;
-    let mut out = Vec::new();
-    if dav::is_dav_success(resp.status) {
-        collect_cards(&resp.body, collection, &mut out);
+    if dav::is_dav_success(resp.status) && !dav::has_elem(&resp.body, "number-of-matches-within-limits") {
+        return collect_full_snapshot(http, cfg, collection, &resp.body).await;
     }
-    if !out.is_empty() {
-        return Ok(out);
-    }
-    // Some servers answer addressbook-query with an error but happily serve a
-    // plain Depth:1 PROPFIND for the same properties (older Radicale, SabreDAV
-    // behind strict proxies) — try that before giving up on the collection.
+    // A Depth:1 PROPFIND can discover vCard hrefs on servers that reject REPORT.
     const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><c:address-data/></d:prop></d:propfind>"#;
     let fallback = dav::dav_request(http, cfg, dav::propfind(), collection.as_str(), Some("1"), Some(dav::XML_CT), &[], Some(PROPFIND_BODY.to_string())).await?;
-    if dav::is_dav_success(fallback.status) {
-        collect_cards(&fallback.body, collection, &mut out);
+    if !dav::is_dav_success(fallback.status) {
+        return Err(AppError::BadRequest(format!("Could not read CardDAV address book (HTTP {})", fallback.status.as_u16())));
+    }
+    collect_full_snapshot(http, cfg, collection, &fallback.body).await
+}
+
+fn scoped_card_href(response: &str, collection: &Url) -> Option<Url> {
+    let href = dav::elem_text(response, "href")?;
+    let absolute = collection.join(&href).ok()?;
+    belongs_to(collection, &absolute).then_some(absolute)
+}
+
+async fn collect_full_snapshot(
+    http: &reqwest::Client, cfg: &DavConfig, collection: &Url, body: &str,
+) -> Result<Vec<RemoteCard>, AppError> {
+    if !dav::has_elem(body, "multistatus") || dav::has_elem(body, "number-of-matches-within-limits") {
+        return Err(AppError::BadRequest("CardDAV did not return a complete address book".into()));
+    }
+    let mut out = Vec::new();
+    collect_cards(body, collection, &mut out);
+    let found: HashSet<_> = out.iter().map(|card| card.href.clone()).collect();
+    for response in dav::responses(body) {
+        let Some(href) = scoped_card_href(response, collection) else { continue };
+        if found.contains(href.as_str()) {
+            continue;
+        }
+        let resource = dav::dav_request(http, cfg, reqwest::Method::GET, href.as_str(),
+            None, None, &[], None).await?;
+        if !dav::is_dav_success(resource.status) || !resource.body.to_ascii_uppercase().contains("BEGIN:VCARD") {
+            return Err(AppError::BadRequest("A CardDAV contact could not be loaded".into()));
+        }
+        out.push(RemoteCard { href: href.to_string(), address_book: collection.to_string(),
+            etag: resource.etag.or_else(|| dav::elem_text(response, "getetag")), vcf: resource.body });
     }
     Ok(out)
 }
 
 fn collect_cards(body: &str, collection: &Url, out: &mut Vec<RemoteCard>) {
     for r in dav::responses(body) {
-        let Some(href) = dav::elem_text(r, "href").filter(|s| !s.trim().is_empty()) else { continue };
+        let Some(absolute) = scoped_card_href(r, collection) else { continue };
         let vcf = dav::elem_text(r, "address-data").unwrap_or_default();
-        if !vcf.to_uppercase().contains("BEGIN:VCARD") {
-            continue;
+        if vcf.to_uppercase().contains("BEGIN:VCARD") {
+            out.push(RemoteCard { href: absolute.to_string(), address_book: collection.to_string(),
+                etag: dav::elem_text(r, "getetag"), vcf });
         }
-        let abs = collection.join(&href).map(|u| u.to_string()).unwrap_or(href);
-        out.push(RemoteCard { href: abs, etag: dav::elem_text(r, "getetag"), vcf });
     }
+}
+
+fn belongs_to(collection: &Url, item: &Url) -> bool {
+    item.origin() == collection.origin()
+        && item.path().strip_prefix(collection.path().trim_end_matches('/'))
+            .and_then(|rest| rest.strip_prefix('/')).is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+}
+
+pub(crate) async fn init_books(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS carddav_books (href TEXT PRIMARY KEY, name TEXT NOT NULL)")
+        .execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) async fn require_book(pool: &sqlx::SqlitePool, book: Option<&str>) -> Result<(), AppError> {
+    if let Some(book) = book {
+        let available: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM carddav_books WHERE href = ?)")
+            .bind(book).fetch_one(pool).await?;
+        if !available {
+            return Err(AppError::BadRequest("CardDAV address book is unavailable.".into()));
+        }
+    }
+    Ok(())
+}
+
+pub async fn address_books(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let pool = db::get_user_db_pool(&state, account_id).await?;
+    let books: Vec<(String, String)> = sqlx::query_as("SELECT href, name FROM carddav_books ORDER BY name, href")
+        .fetch_all(&pool).await?;
+    Ok(Json(json!(books.into_iter().map(|(href, name)| json!({ "href": href, "name": name })).collect::<Vec<_>>())))
 }
 
 // ─────────────────────────── local rows ───────────────────────────
@@ -256,6 +311,7 @@ struct LocalRow {
     etag: Option<String>,
     state: LocalState,
     card_json: String,
+    address_book: Option<String>,
 }
 
 fn parse_state(row: &sqlx::sqlite::SqliteRow) -> LocalState {
@@ -284,6 +340,8 @@ pub async fn sync_carddav(
     State(state): State<Arc<AppState>>,
     Path(account_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let lock = state.workspace_sync_lock(account_id, "contacts").await;
+    let _guard = lock.lock().await;
     let Some(cfg) = load_config(&state, account_id).await? else {
         return Err(AppError::BadRequest(
             "CardDAV is not configured for this account.".into(),
@@ -313,9 +371,24 @@ async fn run_sync(
         remote.extend(fetch_cards(http, cfg, &book.url).await?);
     }
 
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM carddav_books").execute(&mut *tx).await?;
+    for book in &books {
+        let name = if book.display_name.is_empty() { book.url.path() } else { &book.display_name };
+        sqlx::query("INSERT INTO carddav_books (href, name) VALUES (?, ?)")
+            .bind(book.url.as_str()).bind(name).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE contacts SET card_json = json_set(card_json, '$.addressBook', ?)
+             WHERE json_valid(card_json) AND json_extract(card_json, '$.addressBook') IS NULL
+               AND substr(remote_id, 1, length(?)) = ?",
+        ).bind(book.url.as_str()).bind(book.url.as_str()).bind(book.url.as_str()).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+
     // 2. Load local contacts.
     let rows = sqlx::query(
-        "SELECT contact_id, card_json, uid, remote_id, etag, dirty, deleted, remote_updated_ms, local_updated_ms FROM contacts",
+        "SELECT contact_id, card_json, uid, remote_id, etag, dirty, deleted, remote_updated_ms, local_updated_ms,
+         CASE WHEN json_valid(card_json) THEN json_extract(card_json, '$.addressBook') END AS address_book FROM contacts",
     )
     .fetch_all(pool)
     .await?;
@@ -326,19 +399,21 @@ async fn run_sync(
             remote_id: r.try_get("remote_id").ok().flatten(),
             uid: r.try_get::<Option<String>, _>("uid").ok().flatten().unwrap_or_default(),
             etag: r.try_get("etag").ok().flatten(),
+            address_book: r.try_get("address_book").ok().flatten(),
             state: parse_state(r),
             card_json: r.try_get::<Option<String>, _>("card_json").ok().flatten().unwrap_or_default(),
         })
         .collect();
 
-    let mut by_remote: HashMap<String, usize> = HashMap::new();
-    let mut by_uid: HashMap<String, usize> = HashMap::new();
+    let primary = &books[0].url;
+    let mut by_remote: HashMap<&str, usize> = HashMap::new();
+    let mut by_uid: HashMap<(&str, &str), usize> = HashMap::new();
     for (i, l) in locals.iter().enumerate() {
         if let Some(rid) = l.remote_id.as_deref().filter(|s| !s.is_empty()) {
-            by_remote.insert(rid.to_string(), i);
-        }
-        if !l.uid.is_empty() {
-            by_uid.entry(l.uid.clone()).or_insert(i);
+            by_remote.insert(rid, i);
+        } else if !l.uid.is_empty() {
+            let book = l.address_book.as_deref().unwrap_or_else(|| primary.as_str());
+            by_uid.entry((book, l.uid.as_str())).or_insert(i);
         }
     }
 
@@ -347,12 +422,13 @@ async fn run_sync(
 
     // 3. Reconcile each remote vCard against local (ETag drives change detection).
     for rc in &remote {
-        let Some(card) = con::parse_vcards(&rc.vcf).into_iter().next() else { continue };
+        let Some(mut card) = con::parse_vcards(&rc.vcf).into_iter().next() else { continue };
+        card.address_book = Some(rc.address_book.clone());
         let remote_etag = rc.etag.as_deref();
         let idx = by_remote
-            .get(&rc.href)
-            .or_else(|| if card.uid.trim().is_empty() { None } else { by_uid.get(card.uid.trim()) })
-            .copied();
+            .get(rc.href.as_str()).copied()
+            .or_else(|| by_uid.get(&(rc.address_book.as_str(), card.uid.trim()))
+                .copied().filter(|i| !seen.contains(i)));
         match idx {
             None => {
                 con::sync_write_contact(pool, None, &card, &rc.href, remote_etag, 0).await?;
@@ -371,6 +447,8 @@ async fn run_sync(
                     if let Ok(lcard) = serde_json::from_str::<con::ContactCard>(&local.card_json) {
                         let new_etag = dav::put_resource(http, cfg, &rc.href, dav::VCARD_CT, &con::card_to_vcard(&lcard), remote_etag).await?;
                         cal::sync_mark_pushed(pool, "contacts", "contact_id", local.id, &rc.href, new_etag.as_deref(), 0).await?;
+                        sqlx::query("UPDATE contacts SET card_json = json_set(card_json, '$.addressBook', ?) WHERE contact_id = ?")
+                            .bind(&rc.address_book).bind(local.id).execute(pool).await?;
                         pushed += 1;
                     }
                 } else if local.etag.as_deref() != remote_etag {
@@ -384,16 +462,23 @@ async fn run_sync(
     // 4. Orphans: local contacts with no matching remote card this round. Rows that
     //    belong to another backend (a Google resource name in `remote_id`) are left
     //    strictly alone.
-    let primary = books[0].url.clone();
     for (i, local) in locals.iter().enumerate() {
         if seen.contains(&i) {
             continue;
         }
         let ours = is_dav_href(local.remote_id.as_deref());
-        let foreign = local.state.has_remote_id && !ours;
-        if foreign {
+        if local.state.has_remote_id && !ours {
             continue;
         }
+        let remote_url = local.remote_id.as_deref().and_then(|href| Url::parse(href).ok());
+        let target = if let Some(href) = remote_url {
+            books.iter().find(|book| belongs_to(&book.url, &href)).map(|book| &book.url)
+        } else if let Some(owner) = local.address_book.as_deref() {
+            books.iter().find(|book| book.url.as_str() == owner).map(|book| &book.url)
+        } else {
+            Some(primary)
+        };
+        let Some(target) = target else { continue };
         match reconcile_orphan(local.state, true) {
             OrphanAction::Noop => {}
             OrphanAction::DropLocal | OrphanAction::DeleteLocal => {
@@ -405,9 +490,11 @@ async fn run_sync(
                         lcard.uid = con::new_uid();
                     }
                     let name = dav::sanitize_name(&lcard.uid, "contact");
-                    let Ok(href) = primary.join(&format!("{name}.vcf")) else { continue };
+                    let Ok(href) = target.join(&format!("{name}.vcf")) else { continue };
                     let new_etag = dav::put_resource(http, cfg, href.as_str(), dav::VCARD_CT, &con::card_to_vcard(&lcard), None).await?;
                     cal::sync_mark_pushed(pool, "contacts", "contact_id", local.id, href.as_str(), new_etag.as_deref(), 0).await?;
+                    sqlx::query("UPDATE contacts SET card_json = json_set(card_json, '$.addressBook', ?) WHERE contact_id = ?")
+                        .bind(target.as_str()).bind(local.id).execute(pool).await?;
                     pushed += 1;
                 }
             }
@@ -557,6 +644,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        init_books(&pool).await.unwrap();
         pool
     }
 

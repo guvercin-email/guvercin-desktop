@@ -118,7 +118,7 @@ export function normalizeComposeDraft(draft = {}) {
     ? { uidValidity: value }
     : {}
 
-  const rawForwardTargets = Array.isArray(draft?.forwardTargets)
+  const forwardTargets = Array.isArray(draft?.forwardTargets)
     ? draft.forwardTargets
       .map((target) => ({
         uid: normalizeUid(target?.uid),
@@ -130,8 +130,6 @@ export function normalizeComposeDraft(draft = {}) {
       }))
       .filter((target) => target.uid && target.mailbox)
     : []
-  // Forward All / multi-forward is not supported. Keep at most one forward target.
-  const forwardTargets = rawForwardTargets.slice(0, 1)
   const forwardOptions = forwardTargets.length > 0
     ? {
       subjectPrefix: typeof draft?.forwardOptions?.subjectPrefix === 'string' && draft.forwardOptions.subjectPrefix.trim()
@@ -194,6 +192,9 @@ export function normalizeComposeDraft(draft = {}) {
     ccRecipients,
     bccRecipients,
     subject: typeof draft?.subject === 'string' ? draft.subject : '',
+    requestDeliveryReceipt: draft?.requestDeliveryReceipt === true,
+    requestReadReceipt: draft?.requestReadReceipt === true,
+    scheduledSendAt: typeof draft?.scheduledSendAt === 'string' ? draft.scheduledSendAt : '',
     from: typeof draft?.from === 'string' ? draft.from : '',
     plainBody,
     htmlBody,
@@ -207,6 +208,7 @@ export function normalizeComposeDraft(draft = {}) {
     draftUidValidity: normalizedValidity(draft?.draftUidValidity).uidValidity,
     draftId: typeof draft?.draftId === 'string' && draft.draftId.trim() ? draft.draftId.trim() : undefined,
     source: typeof draft?.source === 'string' && draft.source.trim() ? draft.source.trim() : 'new',
+    syncId: typeof draft?.syncId === 'string' ? draft.syncId : undefined,
     composeSurface: draft?.composeSurface === 'window' || draft?.composeSurface === 'tab' ? draft.composeSurface : 'inline',
     pendingSendNoticeId: Number.isFinite(draft?.pendingSendNoticeId) ? Number(draft.pendingSendNoticeId) : null,
     restorableSource: draft?.restorableSource || null,
@@ -254,6 +256,9 @@ function buildComposePayload(draft = {}, fromAddress = '') {
     format: normalized.format,
     body_text: plainBody,
     body_html: bodyHtml,
+    ...(normalized.requestDeliveryReceipt ? { request_delivery_receipt: true } : {}),
+    ...(normalized.requestReadReceipt ? { request_read_receipt: true } : {}),
+    ...(normalized.scheduledSendAt ? { scheduled_send_at: normalized.scheduledSendAt } : {}),
     attachments: normalized.attachments
       .filter((attachment) => attachment.base64 && attachment.name)
       .map((attachment) => ({
@@ -336,6 +341,7 @@ function composeDraftSignature(draft = {}) {
     forwardTargets: (normalized.forwardTargets || []).map((target) => ({ uid: target.uid, mailbox: target.mailbox })),
     forwardOptions: normalized.forwardOptions || null,
     format: normalized.format,
+    from: normalized.from,
     toRecipients: normalized.toRecipients,
     ccRecipients: normalized.ccRecipients,
     bccRecipients: normalized.bccRecipients,
@@ -362,4 +368,11 @@ export function ensureHtmlDraftSeed(draft = {}) {
     htmlBody: seedHtmlFromPlainText(normalized.plainBody),
     htmlSeededFromPlain: true,
   }
+}
+
+export function closeLinkedDraftEditors(accountId, syncId) {
+  if (!accountId || !syncId || typeof BroadcastChannel !== 'function') return
+  const channel = new BroadcastChannel(`guvercin-compose-${accountId}`)
+  channel.postMessage({ type: 'close', syncId })
+  channel.close()
 }

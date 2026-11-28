@@ -3,10 +3,88 @@ import { useTranslation } from 'react-i18next'
 import Editor from '@monaco-editor/react'
 import ComposeEditor from './ComposeEditor.jsx'
 import ComposeIcon from './ComposeIcon.jsx'
+import { OfficeAttachmentContents } from './OfficeAttachmentPreview.jsx'
+import { canPreviewOffice } from '../utils/officePreview.js'
 import { buildComposePreviewDocument, escapeHtml, seedHtmlFromPlainText } from '../utils/composeHtml.js'
 import { composeRecipientsToString, ensureHtmlDraftSeed } from '../utils/compose.js'
 import { fetchContacts, displayNameOf } from '../utils/contactsApi.js'
 import './ComposeView.css'
+
+// The queue accepts 32 MiB JSON. Base64 expands attachments by roughly 4/3.
+const ATTACHMENT_LIMIT = 20 * 1024 * 1024
+const PREVIEW_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif'])
+
+function readSnippets(accountId, kind) {
+    try {
+        const entries = JSON.parse(localStorage.getItem(`compose_${kind}_${accountId}`) || '[]')
+        return Array.isArray(entries) ? entries : []
+    } catch {
+        return []
+    }
+}
+
+function ComposeSnippets({ accountId, draft, onApply }) {
+    const { t } = useTranslation()
+    const [banks, setBanks] = useState(() => ({
+        templates: readSnippets(accountId, 'templates'),
+        signatures: readSnippets(accountId, 'signatures'),
+    }))
+
+    const writeBank = (kind, entries) => {
+        try {
+            localStorage.setItem(`compose_${kind}_${accountId}`, JSON.stringify(entries))
+            setBanks((previous) => ({ ...previous, [kind]: entries }))
+        } catch {
+            window.alert(t('Could not save the text.'))
+        }
+    }
+
+    const save = (kind) => {
+        const name = window.prompt(t(kind === 'templates' ? 'Template name' : 'Signature name'))?.trim()
+        if (!name) return
+        const signature = kind === 'signatures' ? window.prompt(t('Signature text')) : null
+        if (kind === 'signatures' && !signature?.trim()) return
+        const entry = kind === 'templates'
+            ? { name, subject: draft?.subject || '', plainBody: draft?.plainBody || '', htmlBody: (draft?.htmlBody || '').replace(/<img\b[^>]*\bsrc=["']cid:[^"']+["'][^>]*>/gi, '') }
+            : { name, plainBody: signature }
+        if (banks[kind].some((item) => item.name === name) && !window.confirm(t('Replace the existing item?'))) return
+        writeBank(kind, [...banks[kind].filter((item) => item.name !== name), entry])
+    }
+
+    return (
+        <div className="cv-snippets">
+            {!!banks.templates.length && (
+                <select value="" aria-label={t('Insert quick reply')} onChange={(event) => {
+                    const entry = banks.templates[Number(event.target.value)]
+                    if (entry) onApply(entry, 'quick_reply')
+                }}>
+                    <option value="" disabled>{t('Insert quick reply')}</option>
+                    {banks.templates.map((entry, index) => <option key={entry.name} value={index}>{entry.name}</option>)}
+                </select>
+            )}
+            {Object.entries(banks).map(([kind, entries]) => (
+                <div key={kind} className="cv-snippets__group">
+                    <select value="" aria-label={t(kind === 'templates' ? 'Templates' : 'Signatures')} onChange={(event) => {
+                        const entry = entries[Number(event.target.value)]
+                        if (entry) onApply(entry, kind)
+                    }}>
+                        <option value="" disabled>{t(kind === 'templates' ? 'Templates' : 'Signatures')}</option>
+                        {entries.map((entry, index) => <option key={entry.name} value={index}>{entry.name}</option>)}
+                    </select>
+                    <button type="button" onClick={() => save(kind)}>
+                        {t(kind === 'templates' ? 'Save as template' : 'New signature')}
+                    </button>
+                    {!!entries.length && <button type="button" onClick={() => {
+                        const name = window.prompt(t(kind === 'templates' ? 'Template name' : 'Signature name'))?.trim()
+                        if (name && entries.some((entry) => entry.name === name) && window.confirm(t('Delete the saved item?'))) {
+                            writeBank(kind, entries.filter((entry) => entry.name !== name))
+                        }
+                    }}>{t(kind === 'templates' ? 'Delete template' : 'Delete signature')}</button>}
+                </div>
+            ))}
+        </div>
+    )
+}
 
 function createClientId(prefix) {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -49,8 +127,95 @@ function SegmentSwitch({ value, options, onChange }) {
     )
 }
 
+const PREVIEW_TEXT_TYPES = new Set(['application/json', 'application/xml', 'application/x-yaml', 'application/yaml'])
+const isTextPreview = (type) => type?.startsWith('text/') || PREVIEW_TEXT_TYPES.has(type)
+const canPreviewAttachment = ({ base64, mimeType, name }) => base64 &&
+    (PREVIEW_IMAGE_TYPES.has(mimeType) || mimeType === 'application/pdf' || isTextPreview(mimeType) || canPreviewOffice(name))
+
+function AttachmentPreview({ attachment }) {
+    const { t } = useTranslation()
+    const [pdfUrl, setPdfUrl] = useState('')
+    const { base64, mimeType, name } = attachment
+    useEffect(() => {
+        if (mimeType !== 'application/pdf') return
+        let url
+        try {
+            const bytes = Uint8Array.from(atob(base64), (value) => value.charCodeAt(0))
+            url = URL.createObjectURL(new Blob([bytes], { type: mimeType }))
+            setPdfUrl(url)
+        } catch { /* The error message below handles invalid attachments. */ }
+        return () => { if (url) URL.revokeObjectURL(url) }
+    }, [base64, mimeType])
+
+    if (PREVIEW_IMAGE_TYPES.has(mimeType)) {
+        return <img className="cv-attachments__preview" src={`data:${mimeType};base64,${base64}`} alt={name} />
+    }
+    if (mimeType === 'application/pdf' && pdfUrl) {
+        return (
+            <div className="cv-attachments__preview-document">
+                <iframe title={name} src={pdfUrl} sandbox="" />
+                <a href={pdfUrl} download={name}>{t('Download PDF')}</a>
+            </div>
+        )
+    }
+    if (canPreviewOffice(name)) return <OfficeAttachmentContents name={name} base64={base64} />
+    if (isTextPreview(mimeType)) {
+        let text
+        try {
+            const sample = atob(base64.slice(0, 131072))
+            text = new TextDecoder().decode(Uint8Array.from(sample, (value) => value.charCodeAt(0)))
+        } catch { /* The error message below handles invalid attachments. */ }
+        if (text != null) {
+            return <pre className="cv-attachments__preview-document">{text}{base64.length > 131072 ? '\n…' : ''}</pre>
+        }
+    }
+    return <div role="status">{t('Preview unavailable.')}</div>
+}
+
+function SenderAliases({ accountId, accountEmail, value, onChange }) {
+    const { t } = useTranslation()
+    const key = `compose_sender_aliases_${accountId}`
+    const [aliases, setAliases] = useState(() => readSnippets(accountId, 'sender_aliases')
+        .filter((entry) => typeof entry === 'string'))
+    const save = (next) => {
+        try {
+            localStorage.setItem(key, JSON.stringify(next))
+            setAliases(next)
+        } catch {
+            window.alert(t('Could not save the sender address.'))
+        }
+    }
+    const current = (value || '').trim()
+    const existing = aliases.find((address) => address.toLowerCase() === current.toLowerCase())
+    const alternate = current && current.toLowerCase() !== (accountEmail || '').toLowerCase()
+    return (
+        <div className="cv-snippets__group">
+            <input className="cv-input" type="email" aria-label={t('From')}
+                title={t('Use an address authorized by your mail provider.')}
+                placeholder={accountEmail || ''} value={value || ''} onChange={(event) => onChange(event.target.value)} />
+            {!!aliases.length && <select aria-label={t('Saved sender addresses')} value={existing || (alternate ? '' : 'default')}
+                onChange={(event) => onChange(event.target.value === 'default' ? accountEmail || '' : event.target.value)}>
+                <option value="" disabled>{t('Saved sender addresses')}</option>
+                <option value="default">{accountEmail || t('Default sender')}</option>
+                {aliases.map((address) => <option key={address} value={address}>{address}</option>)}
+            </select>}
+            {alternate && !existing && <button type="button" onClick={() => {
+                if (!/^[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+$/.test(current)) {
+                    window.alert(t('Check the sender address.'))
+                    return
+                }
+                save([...aliases, current])
+            }}>{t('Save sender address')}</button>}
+            {existing && <button type="button" onClick={() => save(aliases.filter((address) => address !== existing))}>
+                {t('Remove saved sender')}
+            </button>}
+        </div>
+    )
+}
+
 function ComposeAttachmentList({ attachments, onRemove }) {
     const { t } = useTranslation()
+    const [previewId, setPreviewId] = useState(null)
     if (attachments.length === 0) return null
 
     return (
@@ -65,6 +230,13 @@ function ComposeAttachmentList({ attachments, onRemove }) {
                                 {attachment.mimeType} · {attachment.size || 0} B
                             </div>
                         </div>
+                        {canPreviewAttachment(attachment) && (
+                            <button type="button" className="cv-attachments__remove"
+                                aria-expanded={previewId === attachment.id}
+                                onClick={() => setPreviewId(previewId === attachment.id ? null : attachment.id)}>
+                                {t('Preview')}
+                            </button>
+                        )}
                         <button
                             type="button"
                             className="cv-attachments__remove"
@@ -72,6 +244,9 @@ function ComposeAttachmentList({ attachments, onRemove }) {
                         >
                             {t('Remove')}
                         </button>
+                        {previewId === attachment.id && canPreviewAttachment(attachment) && (
+                            <AttachmentPreview attachment={attachment} />
+                        )}
                     </div>
                 ))}
             </div>
@@ -236,7 +411,7 @@ function RecipientField({ label, recipients, onChange, placeholder, trailingActi
     )
 }
 
-export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, accountEmail, accountId, sending = false }) {
+export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, accountEmail, accountId, sending = false, linkedEditor = false, linkedTab = false }) {
     const { t } = useTranslation()
     const [addressSuggestions, setAddressSuggestions] = useState([])
     useEffect(() => {
@@ -292,8 +467,26 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
         patchDraft(patch)
     }, [draft?.showBcc, draft?.showCc, patchDraft])
 
+    const [scheduleDate, setScheduleDate] = useState('')
+    const [requestReceipt, setRequestReceipt] = useState(false)
+    const [requestDeliveryReceipt, setRequestDeliveryReceipt] = useState(false)
     const handleSend = useCallback(async () => {
+        const scheduled = scheduleDate && !isBulkReplyMode && !isForwardMode ? new Date(scheduleDate) : null
+        if (scheduled && !(scheduled.getTime() > Date.now())) {
+            window.alert(t('Choose a future sending time.'))
+            return
+        }
+        if ((draft?.attachments || []).reduce((total, attachment) =>
+            total + Math.max(attachment.size || 0, (attachment.base64 || '').length * 3 / 4), 0) > ATTACHMENT_LIMIT) {
+            window.alert(t('Attachments may total up to 20 MiB.'))
+            return
+        }
         if (!isBulkReplyMode && recipientCount === 0) return
+        const from = !isBulkReplyMode && !isForwardMode ? (draft?.from || '').trim() || accountEmail : accountEmail
+        if (from && !/^[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+$/.test(from)) {
+            window.alert(t('Check the sender address.'))
+            return
+        }
         const invalid = recipients.find((entry) => !/^[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+$/.test(`${entry || ''}`.trim()))
         if (invalid) {
             window.alert(t('Check the recipient address: {{address}}', { address: invalid }))
@@ -307,7 +500,10 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
         if (!(draft?.subject || '').trim() && !window.confirm(t('The subject is empty. Send anyway?'))) return
         const sent = await onSend?.({
             ...draft,
-            from: accountEmail || '',
+            from: from || '',
+            scheduledSendAt: scheduled ? scheduled.toISOString() : '',
+            requestDeliveryReceipt: requestDeliveryReceipt && !isBulkReplyMode && !isForwardMode,
+            requestReadReceipt: requestReceipt && !isBulkReplyMode && !isForwardMode,
         })
         if (sent && accountId) {
             try {
@@ -323,7 +519,7 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                 }).slice(0, 30)))
             } catch { /* recent recipient history is best effort */ }
         }
-    }, [accountEmail, accountId, draft, isBulkReplyMode, onSend, recipientCount, recipients, t])
+    }, [accountEmail, accountId, draft, isBulkReplyMode, isForwardMode, onSend, recipientCount, recipients, requestDeliveryReceipt, requestReceipt, scheduleDate, t])
 
     const previewDocument = useMemo(
         () => buildComposePreviewDocument(draft?.htmlBody || ''),
@@ -378,10 +574,19 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
         patchDraft({ bulkReplyOptions: { ...current, ...patch } })
     }, [draft?.bulkReplyOptions, patchDraft])
 
+    const [attachmentError, setAttachmentError] = useState('')
+
     const handleFilesSelected = useCallback(async (fileList, disposition) => {
         const files = Array.from(fileList || [])
         if (files.length === 0) return
 
+        const totalBytes = (draft?.attachments || []).reduce((total, attachment) =>
+            total + Math.max(attachment.size || 0, (attachment.base64 || '').length * 3 / 4), 0)
+        if (files.reduce((total, file) => total + file.size, totalBytes) > ATTACHMENT_LIMIT) {
+            setAttachmentError(t('Attachments may total up to 20 MiB.'))
+            return
+        }
+        setAttachmentError('')
         const prepared = await Promise.all(files.map(async (file) => {
             const base64 = await readFileAsBase64(file)
             const contentId = disposition === 'inline' ? createClientId('cid') : undefined
@@ -395,7 +600,11 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                 contentId,
                 source: disposition === 'inline' ? 'html-inline' : 'manual',
             }
-        }))
+        })).catch(() => {
+            setAttachmentError(t('Could not read the selected attachments.'))
+            return null
+        })
+        if (!prepared) return
 
         if (disposition !== 'inline') {
             patchDraft((currentDraft) => ({
@@ -430,7 +639,7 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                 ? nextHtmlBody
                 : `${currentDraft?.htmlBody || ''}${currentDraft?.htmlBody ? '\n' : ''}${snippets}`,
         }))
-    }, [patchDraft])
+    }, [draft?.attachments, patchDraft, t])
 
     const handleAttachmentInput = useCallback(async (event, disposition) => {
         const input = event.target
@@ -448,7 +657,19 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
     }, [draft?.attachments, patchDraft])
 
     return (
-        <div className="compose-view">
+        <div className="compose-view"
+            onDragOver={(event) => {
+                if (!event.dataTransfer.types.includes('Files')) return
+                event.preventDefault()
+                event.dataTransfer.dropEffect = 'copy'
+            }}
+            onDrop={(event) => {
+                if (!event.dataTransfer.files.length) return
+                event.preventDefault()
+                event.stopPropagation()
+                void handleFilesSelected(event.dataTransfer.files, 'attachment')
+            }}>
+            {attachmentError && <div role="alert">{attachmentError}</div>}
             <input
                 ref={fileInputRef}
                 type="file"
@@ -510,7 +731,7 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
 
             {isForwardMode && (
                 <div className="cv-banner">
-                <div className="cv-banner__title">{t('Forwarding message')}</div>
+                <div className="cv-banner__title">{forwardCount === 1 ? t('Forwarding message') : t('Forwarding {{count}} messages', { count: forwardCount })}</div>
                     <div className="cv-banner__row">
                         <button
                             type="button"
@@ -582,7 +803,10 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
             <div className="cv-header">
                 <div className="cv-field">
                     <label className="cv-label">{t('From')}</label>
-                    <div className="cv-from-value">{accountEmail || '—'}</div>
+                    {isBulkReplyMode || isForwardMode
+                        ? <div className="cv-from-value">{accountEmail || '—'}</div>
+                        : <SenderAliases key={accountId} accountId={accountId} accountEmail={accountEmail}
+                            value={draft?.from} onChange={(from) => patchDraft({ from })} />}
                 </div>
                 {!isBulkReplyMode && (
                     <>
@@ -637,6 +861,20 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
                 )}
             </div>
 
+            {accountId && <ComposeSnippets key={accountId} accountId={accountId} draft={draft} onApply={(entry, kind) => {
+                const html = entry.htmlBody || seedHtmlFromPlainText(entry.plainBody || '')
+                if (kind === 'templates') {
+                    if ((draft?.subject || draft?.plainBody || draft?.htmlBody) &&
+                        !window.confirm(t('Replace the subject and message body?'))) return
+                    patchDraft({ subject: entry.subject, plainBody: entry.plainBody, htmlBody: html })
+                } else {
+                    patchDraft({
+                        plainBody: [draft?.plainBody, entry.plainBody].filter(Boolean).join('\n\n'),
+                        htmlBody: (draft?.htmlBody || '') + html,
+                    })
+                }
+            }} />}
+
             <div className="cv-editor-wrap">
                 {bodyView === 'rich' ? (
                     <ComposeEditor
@@ -681,25 +919,46 @@ export default function ComposeView({ draft, onDraftChange, onSend, onDiscard, a
             <ComposeAttachmentList attachments={manualAttachments} onRemove={handleRemoveAttachment} />
 
             <div className="cv-actions">
+                {!linkedEditor && !isBulkReplyMode && !isForwardMode && (
+                    <label>
+                        <input type="checkbox" checked={requestReceipt} onChange={(event) => setRequestReceipt(event.target.checked)} />
+                        {t('Request read receipt')}
+                    </label>
+                )}
+                {!linkedEditor && !isBulkReplyMode && !isForwardMode && (
+                    <label>
+                        <input type="checkbox" checked={requestDeliveryReceipt}
+                            onChange={(event) => setRequestDeliveryReceipt(event.target.checked)} />
+                        {t('Request delivery receipt')}
+                    </label>
+                )}
+                {!linkedEditor && !isBulkReplyMode && !isForwardMode && (
+                    <label>
+                        {t('Schedule send')}
+                        {' '}
+                        <input type="datetime-local" value={scheduleDate}
+                            onChange={(event) => setScheduleDate(event.target.value)} />
+                    </label>
+                )}
                 <button
                     type="button"
                     className="cv-send-btn"
                     onClick={handleSend}
-                    disabled={sending || (!isBulkReplyMode && recipientCount === 0)}
+                    disabled={linkedEditor || sending || (!isBulkReplyMode && recipientCount === 0)}
                 >
                     {sending ? <><ComposeIcon name="clock" /> {t('Sending...')}</>
                         : isBulkReplyMode
                             ? <><ComposeIcon name="reply" /> {t('Send replies ({{count}})', { count: bulkReplyCount })}</>
                             : isForwardMode
                                 ? <><ComposeIcon name="forward" /> {t('Forward')}</>
-                                : <><ComposeIcon name="send" /> {t('Send')}</>}
+                                : <><ComposeIcon name="send" /> {t(scheduleDate ? 'Schedule send' : 'Send')}</>}
                 </button>
                 <button
                     type="button"
                     className="cv-discard-btn"
                     onClick={onDiscard}
                 >
-                    <ComposeIcon name="discard" /> {t('Discard')}
+                    <ComposeIcon name="discard" /> {t(linkedTab ? 'Close linked tab' : linkedEditor ? 'Close linked window' : 'Discard')}
                 </button>
             </div>
         </div>

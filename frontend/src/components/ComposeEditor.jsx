@@ -6,7 +6,7 @@ import { Schema, DOMParser as PmDOMParser, DOMSerializer } from 'prosemirror-mod
 import { schema as basicSchema } from 'prosemirror-schema-basic'
 import { addListNodes } from 'prosemirror-schema-list'
 import { keymap } from 'prosemirror-keymap'
-import { baseKeymap, toggleMark, wrapIn } from 'prosemirror-commands'
+import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
 import { inputRules, wrappingInputRule, smartQuotes, emDash, ellipsis } from 'prosemirror-inputrules'
 import { gapCursor } from 'prosemirror-gapcursor'
@@ -128,7 +128,33 @@ function buildSchema() {
             },
         })
 
-    const withList = addListNodes(baseNodes, 'paragraph block*', 'block')
+    const withTable = baseNodes.append({
+        table: {
+            group: 'block',
+            content: 'table_row+',
+            isolating: true,
+            parseDOM: [{ tag: 'table' }],
+            toDOM: () => ['table', { style: 'border-collapse: collapse' }, ['tbody', 0]],
+        },
+        table_row: {
+            content: '(table_cell | table_header)+',
+            parseDOM: [{ tag: 'tr' }],
+            toDOM: () => ['tr', 0],
+        },
+        table_cell: {
+            content: 'block+',
+            isolating: true,
+            parseDOM: [{ tag: 'td' }],
+            toDOM: () => ['td', { style: 'border: 1px solid #888; padding: 4px' }, 0],
+        },
+        table_header: {
+            content: 'block+',
+            isolating: true,
+            parseDOM: [{ tag: 'th' }],
+            toDOM: () => ['th', { style: 'border: 1px solid #888; padding: 4px' }, 0],
+        },
+    })
+    const withList = addListNodes(withTable, 'paragraph block*', 'block')
 
     return new Schema({ nodes: withList, marks })
 }
@@ -492,6 +518,20 @@ export default function ComposeEditor({
         applyMark(schema.marks.highlight, { color: e.target.value })
     }, [schema, applyMark])
 
+    const insertTable = useCallback(() => {
+        exec((state, dispatch) => {
+            const { table, table_row, table_header, table_cell } = state.schema.nodes
+            const header = table_row.create(null, [table_header.createAndFill(), table_header.createAndFill()])
+            const row = table_row.create(null, [table_cell.createAndFill(), table_cell.createAndFill()])
+            const transaction = state.tr.replaceSelectionWith(table.create(null, [header, row]))
+            if (!transaction.docChanged) return false
+            const start = transaction.mapping.map(state.selection.from, -1)
+            dispatch(transaction.setSelection(TextSelection.findFrom(transaction.doc.resolve(start), 1, true)
+                || transaction.selection).scrollIntoView())
+            return true
+        })
+    }, [exec])
+
     const handleAlignment = useCallback((align) => {
         exec((state, dispatch) => setAlignment(state, dispatch, align))
     }, [exec])
@@ -661,6 +701,7 @@ export default function ComposeEditor({
     const registerController = editorCtx?.registerController
     const unregisterController = editorCtx?.unregisterController
     const updateSnapshot = editorCtx?.updateSnapshot
+    const focusController = editorCtx?.focusController
 
     /* Register/unregister the controller with the shared context */
     useEffect(() => {
@@ -672,8 +713,8 @@ export default function ComposeEditor({
     /* Keep the external toolbar's snapshot in sync with the editor state */
     useEffect(() => {
         if (!updateSnapshot) return
-        updateSnapshot(snapshot)
-    }, [updateSnapshot, snapshot])
+        updateSnapshot(controller, snapshot)
+    }, [controller, updateSnapshot, snapshot])
 
     return (
         <div className="compose-editor">
@@ -757,11 +798,37 @@ export default function ComposeEditor({
                     </label>
                 </div>
 
+                <div className="ce-toolbar-group">
+                    <select
+                        aria-label={t('Apply block style')}
+                        value=""
+                        onChange={(e) => {
+                            const style = e.target.value
+                            if (style === 'paragraph' || style === 'code_block') {
+                                exec(setBlockType(schema.nodes[style]))
+                            } else if (style) {
+                                exec(setBlockType(schema.nodes.heading, { level: Number(style) }))
+                            }
+                        }}
+                    >
+                        <option value="" disabled>{t('Block style')}</option>
+                        <option value="paragraph">{t('Paragraph')}</option>
+                        {[1, 2, 3, 4, 5, 6].map((level) => (
+                            <option key={level} value={level}>{t('Heading {{level}}', { level })}</option>
+                        ))}
+                        <option value="code_block">{t('Code block')}</option>
+                    </select>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={insertTable}>
+                        {t('Insert table')}
+                    </button>
+                </div>
+
                 {/* Alignment */}
                 <div className="ce-toolbar-group">
                     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('left')} title={t('Align Left')}><ComposeIcon name="alignLeft" /></button>
                     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('center')} title={t('Center')}><ComposeIcon name="alignCenter" /></button>
                     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('right')} title={t('Align Right')}><ComposeIcon name="alignRight" /></button>
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => handleAlignment('justify')} title={t('Justify')}>{t('Justify')}</button>
                 </div>
 
                 {/* Lists */}
@@ -928,6 +995,7 @@ export default function ComposeEditor({
             <div
                 className="ce-editor-area"
                 style={{ lineHeight: currentLineSpacing }}
+                onFocus={() => focusController?.(controller)}
                 onClick={() => viewRef.current?.focus()}
             >
                 <div ref={editorRef} />

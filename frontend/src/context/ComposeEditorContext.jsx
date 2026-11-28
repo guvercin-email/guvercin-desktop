@@ -5,10 +5,8 @@ import { createContext, useCallback, useContext, useMemo, useRef, useState } fro
  * toolbar that lives elsewhere in the tree (the app ribbon, or a detached
  * compose window's top bar).
  *
- * Only one ComposeEditor is ever mounted/visible at a time (inactive compose
- * tabs are not rendered), so a single-slot registry is enough: whichever editor
- * mounts last registers its controller, and unmount clears it.
- *
+ * The last focused editor owns the ribbon. When that surface closes, the
+ * remaining editor becomes active and restores its own formatting state.
  * `controller` is the imperative command API exposed by ComposeEditor.
  * `snapshot` mirrors the editor's current formatting state so toolbar buttons
  * can render their active/value states and re-render on every selection change.
@@ -17,23 +15,39 @@ const ComposeEditorContext = createContext(null)
 
 export function ComposeEditorProvider({ children }) {
     const controllerRef = useRef(null)
+    const editorsRef = useRef(new Map())
     const [controller, setControllerState] = useState(null)
     const [snapshot, setSnapshot] = useState(null)
 
-    const registerController = useCallback((next) => {
+    const focusController = useCallback((next) => {
+        if (!editorsRef.current.has(next)) return
         controllerRef.current = next
         setControllerState(next)
-        if (!next) setSnapshot(null)
+        setSnapshot(editorsRef.current.get(next))
     }, [])
 
+    const registerController = useCallback((next) => {
+        editorsRef.current.set(next, null)
+        if (!controllerRef.current) focusController(next)
+    }, [focusController])
+
     const unregisterController = useCallback((instance) => {
-        // Only clear if the unmounting editor is still the registered one; a
-        // fast unmount/mount swap must not wipe the newcomer's controller.
-        if (controllerRef.current === instance) {
+        editorsRef.current.delete(instance)
+        if (controllerRef.current !== instance) return
+        const remaining = editorsRef.current.keys().next().value
+        if (remaining) {
+            focusController(remaining)
+        } else {
             controllerRef.current = null
             setControllerState(null)
             setSnapshot(null)
         }
+    }, [focusController])
+
+    const updateSnapshot = useCallback((instance, next) => {
+        if (!editorsRef.current.has(instance)) return
+        editorsRef.current.set(instance, next)
+        if (controllerRef.current === instance) setSnapshot(next)
     }, [])
 
     const value = useMemo(() => ({
@@ -42,8 +56,9 @@ export function ComposeEditorProvider({ children }) {
         hasEditor: !!controller,
         registerController,
         unregisterController,
-        updateSnapshot: setSnapshot,
-    }), [controller, snapshot, registerController, unregisterController])
+        updateSnapshot,
+        focusController,
+    }), [controller, snapshot, registerController, unregisterController, updateSnapshot, focusController])
 
     return (
         <ComposeEditorContext.Provider value={value}>
